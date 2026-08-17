@@ -23,6 +23,15 @@ from typing import cast
 import msgspec
 
 
+class MambaSubStateWireLayout(msgspec.Struct, frozen=True):
+    """Wire-safe byte layout of one Mamba sub-state (``conv`` or ``ssm``)."""
+
+    byte_offset: int
+    byte_length: int
+    dtype_str: str
+    shape: tuple[int, ...]
+
+
 class EngineGroupInfo(msgspec.Struct, frozen=True):
     """One LMCache KV group: layers of one engine group that share a copy kernel.
 
@@ -52,6 +61,13 @@ class EngineGroupInfo(msgspec.Struct, frozen=True):
     sw_size_tokens: int = -1
     """Sliding window size in tokens for the layers of this group.
     ``-1`` means the layers are not sliding-window attention."""
+    cache_category: str = "unknown"
+    """Original engine cache category: ``attention``, ``mamba``, or unknown."""
+
+    mamba_real_layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None = (
+        None
+    )
+    """Real ``(conv, ssm)`` byte layout for a Mamba group, if available."""
 
 
 def num_engine_groups(groups: Sequence[EngineGroupInfo]) -> int:

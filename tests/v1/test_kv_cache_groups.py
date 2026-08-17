@@ -5,6 +5,7 @@ import msgspec
 # First Party
 from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
+    MambaSubStateWireLayout,
     expand_engine_block_ids,
     get_engine_group_indices,
     num_engine_group_infos,
@@ -60,6 +61,26 @@ def test_engine_group_infos_msgspec_round_trip():
     groups = [
         EngineGroupInfo(0, (0, 2)),
         EngineGroupInfo(1, (1, 3), sw_size_tokens=128),
+    ]
+
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(groups), type=list[EngineGroupInfo]
+    )
+
+    assert decoded == groups
+
+
+def test_engine_group_infos_mamba_layout_msgspec_round_trip():
+    groups = [
+        EngineGroupInfo(
+            0,
+            (0,),
+            cache_category="mamba",
+            mamba_real_layout=(
+                MambaSubStateWireLayout(0, 64, "torch.float16", (4, 8)),
+                MambaSubStateWireLayout(64, 120, "torch.float32", (2, 3, 5)),
+            ),
+        )
     ]
 
     decoded = msgspec.msgpack.decode(

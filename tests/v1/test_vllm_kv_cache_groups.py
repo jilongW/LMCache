@@ -57,6 +57,9 @@ class MambaSpec:
 
     block_size: int
     mamba_cache_mode: str = "align"
+    shapes: tuple[tuple[int, ...], ...] = ()
+    dtypes: tuple[torch.dtype, ...] = ()
+    page_size_bytes: int = 0
 
 
 @dataclass
@@ -232,6 +235,32 @@ def test_conversion_mamba_non_align_not_windowed():
     )
 
     assert [group.sw_size_tokens for group in spec] == [-1]
+
+
+def test_conversion_tags_mamba_real_layout():
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((4, 8), (2, 3, 5)),
+        dtypes=(torch.float16, torch.float32),
+        page_size_bytes=4 * 8 * 2 + 2 * 3 * 5 * 4,
+    )
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["layer.0"], FullAttentionSpec(block_size=16)),
+                MockKVCacheGroup(["layer.1"], mamba_spec),
+            ]
+        ),
+        _same_shape_caches(["layer.0", "layer.1"]),
+    )
+
+    assert [group.cache_category for group in spec] == ["attention", "mamba"]
+    assert spec[0].mamba_real_layout is None
+    conv, ssm = spec[1].mamba_real_layout
+    assert conv.byte_length == 4 * 8 * 2
+    assert conv.dtype_str == str(torch.float16)
+    assert ssm.byte_offset == conv.byte_length
+    assert ssm.dtype_str == str(torch.float32)
 
 
 def test_conversion_uniform_type_specs_resolve_per_layer():

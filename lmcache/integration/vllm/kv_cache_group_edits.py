@@ -38,6 +38,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TypeAlias
 
 # Third Party
@@ -73,6 +74,33 @@ _SUBPAGEABLE_ATTENTION_KINDS = frozenset(
         KVCacheSpecKind.SINK_FULL_ATTENTION,
     }
 )
+
+
+@dataclass(frozen=True)
+class MambaSubStateLayout:
+    """Byte extent of one real tensor within a Mamba page."""
+
+    byte_offset: int
+    byte_length: int
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class MambaRealLayout:
+    """Real-data byte layout of a Mamba page, including trailing padding."""
+
+    conv: MambaSubStateLayout
+    ssm: MambaSubStateLayout
+    page_size_bytes: int
+
+    @property
+    def pad_byte_offset(self) -> int:
+        return self.ssm.byte_offset + self.ssm.byte_length
+
+    @property
+    def pad_byte_length(self) -> int:
+        return self.page_size_bytes - self.pad_byte_offset
 
 
 def _declares_slot_compression(spec: KVCacheSpec) -> bool:
@@ -226,6 +254,45 @@ class _MambaPageViewEdit(KVCacheGroupEdit):
         return get_kv_cache_spec_kind(spec) == KVCacheSpecKind.MAMBA and isinstance(
             kv_cache, list
         )
+
+    def real_layout(self, spec: KVCacheSpec) -> MambaRealLayout:
+        """Return the real conv/ssm byte extents declared by a Mamba spec."""
+        shapes = spec.shapes
+        dtypes = spec.dtypes
+        if len(shapes) != 2 or len(dtypes) != 2:
+            raise ValueError(
+                "expected a Mamba spec with exactly 2 sub-states "
+                f"(conv_state, ssm_state), got {len(shapes)} shapes and "
+                f"{len(dtypes)} dtypes"
+            )
+        conv_shape, ssm_shape = shapes
+        conv_dtype, ssm_dtype = dtypes
+        conv_bytes = self._numel(conv_shape) * torch.empty(
+            (), dtype=conv_dtype
+        ).element_size()
+        ssm_bytes = self._numel(ssm_shape) * torch.empty(
+            (), dtype=ssm_dtype
+        ).element_size()
+        if conv_bytes + ssm_bytes > spec.page_size_bytes:
+            raise ValueError(
+                "Mamba conv_state + ssm_state real bytes "
+                f"({conv_bytes + ssm_bytes}) exceed the page size "
+                f"({spec.page_size_bytes} bytes)"
+            )
+        return MambaRealLayout(
+            conv=MambaSubStateLayout(0, conv_bytes, conv_dtype, tuple(conv_shape)),
+            ssm=MambaSubStateLayout(
+                conv_bytes, ssm_bytes, ssm_dtype, tuple(ssm_shape)
+            ),
+            page_size_bytes=spec.page_size_bytes,
+        )
+
+    @staticmethod
+    def _numel(shape: tuple[int, ...]) -> int:
+        result = 1
+        for dim in shape:
+            result *= dim
+        return result
 
     def apply(
         self,

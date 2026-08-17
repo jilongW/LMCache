@@ -12,11 +12,64 @@ if TYPE_CHECKING:
     # First Party
     from lmcache.v1.gpu_connector.utils import LayoutHints
 
+# Third Party
+import torch
+
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.group_view import (
+    EngineGroupInfo,
+    MambaSubStateWireLayout,
+)
 
 logger = init_logger(__name__)
+
+def _cache_spec_category(spec: Any) -> str:
+    """Classify a vLLM KV cache spec into a coarse cache category."""
+    if any(cls.__name__ == "MambaSpec" for cls in type(spec).__mro__):
+        return "mamba"
+    if spec is None:
+        return "unknown"
+    return "attention"
+
+
+def _numel(shape: tuple[int, ...]) -> int:
+    result = 1
+    for dim in shape:
+        result *= dim
+    return result
+
+
+def _mamba_real_layout_wire(
+    spec: Any,
+) -> tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None:
+    """Build the wire-safe real conv/ssm layout for a Mamba spec."""
+    shapes = getattr(spec, "shapes", None)
+    dtypes = getattr(spec, "dtypes", None)
+    if not shapes or not dtypes:
+        return None
+    if len(shapes) != 2 or len(dtypes) != 2:
+        raise ValueError(
+            "expected a Mamba spec with exactly 2 sub-states "
+            f"(conv_state, ssm_state), got {len(shapes)} shapes and "
+            f"{len(dtypes)} dtypes"
+        )
+    conv_shape, ssm_shape = shapes
+    conv_dtype, ssm_dtype = dtypes
+    conv_bytes = _numel(conv_shape) * torch.empty((), dtype=conv_dtype).element_size()
+    ssm_bytes = _numel(ssm_shape) * torch.empty((), dtype=ssm_dtype).element_size()
+    if conv_bytes + ssm_bytes > spec.page_size_bytes:
+        raise ValueError(
+            "Mamba conv_state + ssm_state real bytes "
+            f"({conv_bytes + ssm_bytes}) exceed the page size "
+            f"({spec.page_size_bytes} bytes)"
+        )
+    return (
+        MambaSubStateWireLayout(0, conv_bytes, str(conv_dtype), tuple(conv_shape)),
+        MambaSubStateWireLayout(
+            conv_bytes, ssm_bytes, str(ssm_dtype), tuple(ssm_shape)
+        ),
+    )
 
 
 def _is_sliding_window_spec(spec: Any) -> bool:
@@ -105,6 +158,33 @@ def _merge_layer_sw_sizes(per_layer_sw_size: list[int], indices: list[int]) -> i
     return sw_sizes.pop()
 
 
+def _merge_layer_cache_categories(
+    per_layer_cache_category: list[str], indices: list[int]
+) -> str:
+    categories = {per_layer_cache_category[idx] for idx in indices}
+    if len(categories) != 1:
+        raise ValueError(
+            f"Layers with indices {indices} have different cache categories "
+            f"{categories}, but they are in the same group."
+        )
+    return categories.pop()
+
+
+def _merge_layer_mamba_real_layouts(
+    per_layer_mamba_real_layout: list[
+        tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None
+    ],
+    indices: list[int],
+) -> tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None:
+    layouts = {per_layer_mamba_real_layout[idx] for idx in indices}
+    if len(layouts) != 1:
+        raise ValueError(
+            f"Layers with indices {indices} have different Mamba real layouts, "
+            "but they are in the same group."
+        )
+    return layouts.pop()
+
+
 def create_engine_group_infos_from_vllm(
     kv_cache_config: Any,
     kv_caches: Mapping[str, Any],
@@ -175,6 +255,10 @@ def create_engine_group_infos_from_vllm(
     per_layer_group_idx: list[int] | None = None
     group_tokens_per_block: dict[int, int] = {}
     per_layer_sw_size = [-1] * num_layers
+    per_layer_cache_category = ["unknown"] * num_layers
+    per_layer_mamba_real_layout: list[
+        tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None
+    ] = [None] * num_layers
     if vllm_groups:
         per_layer_group_idx = [EXCLUDED_ENGINE_GROUP] * num_layers
         for engine_group_id, group in enumerate(vllm_groups):
@@ -184,6 +268,16 @@ def create_engine_group_infos_from_vllm(
             group_tokens_per_block[engine_group_id] = group.kv_cache_spec.block_size
             for name in group.layer_names:
                 per_layer_group_idx[layer_to_idx[name]] = engine_group_id
+                per_layer_specs = getattr(group.kv_cache_spec, "kv_cache_specs", None)
+                layer_spec = (
+                    per_layer_specs[name] if per_layer_specs else group.kv_cache_spec
+                )
+                category = _cache_spec_category(layer_spec)
+                per_layer_cache_category[layer_to_idx[name]] = category
+                if category == "mamba":
+                    per_layer_mamba_real_layout[layer_to_idx[name]] = (
+                        _mamba_real_layout_wire(layer_spec)
+                    )
         per_layer_sw_size = _resolve_per_layer_sw_sizes(
             vllm_groups, layer_to_idx, num_layers
         )
@@ -201,6 +295,12 @@ def create_engine_group_infos_from_vllm(
             layer_indices=tuple(indices),
             tokens_per_block=group_tokens_per_block.get(identity.engine_group_idx, 0),
             sw_size_tokens=_merge_layer_sw_sizes(per_layer_sw_size, indices),
+            cache_category=_merge_layer_cache_categories(
+                per_layer_cache_category, indices
+            ),
+            mamba_real_layout=_merge_layer_mamba_real_layouts(
+                per_layer_mamba_real_layout, indices
+            ),
         )
         for identity, indices in group_layers_by_identity(
             normalized_kv_caches,
