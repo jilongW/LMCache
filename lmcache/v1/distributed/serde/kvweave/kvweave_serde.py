@@ -14,6 +14,12 @@ from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.distributed.serde.kvweave.kvweave_config import KVWeaveCodecConfig
+from lmcache.v1.multiprocess.group_view import MambaSubStateWireLayout
+
+try:
+    from kvweave import kvweave_quant
+except ImportError:  # pragma: no cover
+    kvweave_quant = None
 
 logger = init_logger(__name__)
 
@@ -73,6 +79,12 @@ class _KVShape:
     chunk_tokens: int
     hidden_dim: int
     original_ndim: int
+
+
+@dataclass(frozen=True)
+class MambaChunkSplit:
+    conv: torch.Tensor
+    ssm: torch.Tensor
 
 
 class _KVWeaveCodec:
@@ -270,6 +282,244 @@ class _KVWeaveCodec:
     def _scale_count(self, tokens: int, hidden: int, layers: int, method: str) -> int:
         base = tokens if method == "per_token" else self._head_dim(hidden) if method == "per_channel" else 1
         return max(1, base * layers if layers > 1 else base)
+
+    @staticmethod
+    def _mamba_layout(
+        substate: str, shape: tuple[int, ...], method: str
+    ) -> tuple[int, int, int, int]:
+        return KVWeaveCodecConfig.mamba_layout(substate, shape, method)
+
+    @staticmethod
+    def _mamba_precond_pair(size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return KVWeaveCodecConfig().mamba_precond_tensors(size)
+
+    @staticmethod
+    def split_mamba_chunk(
+        raw: torch.Tensor,
+        layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout],
+        block_size: int,
+    ) -> MambaChunkSplit:
+        """Recover real conv/ssm bytes from the opaque synthetic page view."""
+        if raw.dim() != 4 or int(raw.shape[0]) != 2:
+            raise ValueError(
+                f"expected Mamba chunk shape [2,L,T,H], got {tuple(raw.shape)}"
+            )
+        conv_layout, ssm_layout = layout
+        _, layers, tokens, hidden = map(int, raw.shape)
+        if block_size <= 0 or tokens % block_size:
+            raise ValueError(
+                f"chunk_tokens ({tokens}) is not a multiple of "
+                f"block_size ({block_size})"
+            )
+        blocks = tokens // block_size
+        page_bytes = 2 * block_size * hidden * raw.element_size()
+        pages = (
+            raw.permute(1, 0, 2, 3)
+            .reshape(layers, 2, blocks, block_size, hidden)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(layers, blocks, page_bytes // raw.element_size())
+            .contiguous()
+            .view(torch.uint8)
+            .reshape(layers, blocks, page_bytes)
+        )
+
+        def read(desc: MambaSubStateWireLayout) -> torch.Tensor:
+            end = desc.byte_offset + desc.byte_length
+            if desc.byte_offset < 0 or end > page_bytes:
+                raise ValueError("Mamba sub-state byte layout exceeds page size")
+            dtype = KVWeaveCodecConfig.mamba_dtype(desc.dtype_str)
+            return (
+                pages[:, :, desc.byte_offset:end]
+                .contiguous()
+                .view(dtype)
+                .reshape(layers, blocks, *desc.shape)
+            )
+
+        return MambaChunkSplit(read(conv_layout), read(ssm_layout))
+
+    @staticmethod
+    def merge_mamba_chunk(
+        split: MambaChunkSplit,
+        layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout],
+        block_size: int,
+        hidden_dim: int,
+    ) -> torch.Tensor:
+        """Rebuild the opaque page view, zero-filling unused padding bytes."""
+        conv_layout, ssm_layout = layout
+        layers, blocks = map(int, split.conv.shape[:2])
+        if split.ssm.shape[:2] != (layers, blocks):
+            raise ValueError(
+                "conv and ssm chunks have different layer/block dimensions"
+            )
+        page_bytes = 2 * block_size * hidden_dim * split.conv.element_size()
+        pages = torch.zeros(layers, blocks, page_bytes, dtype=torch.uint8)
+        for tensor, desc in (
+            (split.conv, conv_layout),
+            (split.ssm, ssm_layout),
+        ):
+            raw = tensor.contiguous().view(torch.uint8).reshape(layers, blocks, -1)
+            end = desc.byte_offset + desc.byte_length
+            if raw.shape[-1] != desc.byte_length or end > page_bytes:
+                raise ValueError("Mamba sub-state tensor does not match byte layout")
+            pages[:, :, desc.byte_offset:end] = raw
+        return (
+            pages.view(split.conv.dtype)
+            .reshape(layers, blocks, 2, block_size, hidden_dim)
+            .permute(2, 0, 1, 3, 4)
+            .reshape(2, layers, blocks * block_size, hidden_dim)
+            .contiguous()
+        )
+
+    @staticmethod
+    def quantize_mamba_substate_4bit(
+        tensor: torch.Tensor,
+        *,
+        substate: str,
+        scaling_method: str = "per_tensor",
+        rh: bool = False,
+        asym: bool = False,
+    ) -> bytes:
+        """Quantize one real Mamba sub-state with native state kernels."""
+        if kvweave_quant is None:
+            raise RuntimeError("KVWeave native quantization extension is unavailable")
+        if tensor.dtype not in KVWeaveCodecConfig.DTYPE_TO_CODE:
+            raise ValueError(
+                f"unsupported dtype for 4-bit quantization: {tensor.dtype}"
+            )
+        if substate not in KVWeaveCodecConfig.SUBSTATE_TO_CODE:
+            raise ValueError(f"unsupported substate: {substate!r}")
+        if scaling_method not in KVWeaveCodecConfig.SCALING_TO_CODE:
+            raise ValueError(f"unsupported scaling_method: {scaling_method!r}")
+        if tensor.dim() < 2 or (
+            substate == "conv"
+            and rh
+            and scaling_method in {"per_tensor", "per_channel"}
+        ):
+            raise ValueError("invalid Mamba tensor or RH configuration")
+        cpu = tensor.detach().to("cpu").contiguous()
+        shape = tuple(int(dim) for dim in cpu.shape)
+        blocks, heads, head_dim, chunks = _KVWeaveCodec._mamba_layout(
+            substate, shape, scaling_method
+        )
+        signs = perm = None
+        if rh:
+            transform = max(cpu.numel() // shape[0] // chunks, 1)
+            signs, perm = _KVWeaveCodec._mamba_precond_pair(transform)
+        flags = (
+            KVWeaveCodecConfig.MAMBA_FLAG_RH if rh else 0
+        ) | (KVWeaveCodecConfig.MAMBA_FLAG_ASYM if asym else 0)
+        header = KVWeaveCodecConfig.MAMBA_MAGIC + struct.pack(
+            ">BBBBBB" + "i" * len(shape),
+            KVWeaveCodecConfig.MAMBA_QBIT,
+            KVWeaveCodecConfig.DTYPE_TO_CODE[cpu.dtype],
+            flags,
+            KVWeaveCodecConfig.SCALING_TO_CODE[scaling_method],
+            KVWeaveCodecConfig.SUBSTATE_TO_CODE[substate],
+            len(shape),
+            *shape,
+        )
+        return bytes(
+            kvweave_quant.kvweave_serialize_chunk_state(
+                cpu,
+                header,
+                KVWeaveCodecConfig.next_scale_id(),
+                qbit=KVWeaveCodecConfig.MAMBA_QBIT,
+                blocks_num=blocks,
+                block_size=1,
+                head_num=heads,
+                head_dim=head_dim,
+                num_layers=shape[0],
+                rh=rh,
+                asym=asym,
+                scaling_method=scaling_method,
+                signs=signs,
+                perm=perm,
+            )
+        )
+
+    @staticmethod
+    def dequantize_mamba_substate_4bit(payload: bytes) -> torch.Tensor:
+        """Decode a self-describing native Mamba sub-state payload."""
+        if kvweave_quant is None:
+            raise RuntimeError("KVWeave native quantization extension is unavailable")
+        if payload[:4] != KVWeaveCodecConfig.MAMBA_MAGIC:
+            raise ValueError(f"unrecognized payload magic: {payload[:4]!r}")
+        qbit, dtype_code, flags, scaling_code, substate_code, ndim = struct.unpack(
+            ">BBBBBB", payload[4:10]
+        )
+        scaling_map = {
+            value: key for key, value in KVWeaveCodecConfig.SCALING_TO_CODE.items()
+        }
+        substate_map = {
+            value: key for key, value in KVWeaveCodecConfig.SUBSTATE_TO_CODE.items()
+        }
+        if (
+            qbit != KVWeaveCodecConfig.MAMBA_QBIT
+            or dtype_code not in KVWeaveCodecConfig.CODE_TO_DTYPE
+        ):
+            raise ValueError("unsupported qbit or dtype in Mamba payload")
+        if scaling_code not in scaling_map or substate_code not in substate_map:
+            raise ValueError("unsupported scaling method or substate in Mamba payload")
+        offset = 10
+        shape = tuple(
+            struct.unpack(
+                ">" + "i" * ndim,
+                payload[offset : offset + 4 * ndim],
+            )
+        )
+        offset += 4 * ndim
+        scaling = scaling_map[scaling_code]
+        substate = substate_map[substate_code]
+        blocks, heads, head_dim, chunks = _KVWeaveCodec._mamba_layout(
+            substate, shape, scaling
+        )
+        (scale_size,) = struct.unpack(">I", payload[offset : offset + 4])
+        offset += 4
+        scales = payload[offset : offset + scale_size]
+        offset += scale_size
+        q_data = torch.frombuffer(bytearray(payload[offset:]), dtype=torch.int8)
+        signs = perm = None
+        if flags & KVWeaveCodecConfig.MAMBA_FLAG_RH:
+            transform = max(
+                int(torch.tensor(shape).prod().item()) // shape[0] // chunks,
+                1,
+            )
+            signs, perm = _KVWeaveCodec._mamba_precond_pair(transform)
+        tail_numel = max(int(torch.tensor(shape[2:]).prod().item()), 1)
+        restored = kvweave_quant.kvweave_dequantize_chunk_state(
+            q_data,
+            scales,
+            shape[0],
+            blocks,
+            tail_numel,
+            qbit=KVWeaveCodecConfig.MAMBA_QBIT,
+            blocks_num=blocks,
+            block_size=1,
+            head_num=heads,
+            head_dim=head_dim,
+            rh=bool(flags & KVWeaveCodecConfig.MAMBA_FLAG_RH),
+            asym=bool(flags & KVWeaveCodecConfig.MAMBA_FLAG_ASYM),
+            scaling_method=scaling,
+            output_dtype=KVWeaveCodecConfig.CODE_TO_DTYPE[dtype_code],
+            signs=signs,
+            perm=perm,
+        )
+        return restored.reshape(shape)
+
+    @staticmethod
+    def pack_mamba_payloads(conv: bytes, ssm: bytes) -> bytes:
+        """Frame conv and ssm payloads into one stored blob."""
+        return struct.pack(">I", len(conv)) + conv + ssm
+
+    @staticmethod
+    def unpack_mamba_payloads(blob: bytes) -> tuple[bytes, bytes]:
+        """Split a framed Mamba blob back into conv and ssm payloads."""
+        if len(blob) < 4:
+            raise ValueError("Mamba payload bundle is truncated")
+        size = struct.unpack(">I", blob[:4])[0]
+        if size > len(blob) - 4:
+            raise ValueError("Mamba payload bundle is truncated")
+        return blob[4 : 4 + size], blob[4 + size :]
 
 
 KVWeaveCodec = _KVWeaveCodec

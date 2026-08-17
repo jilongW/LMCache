@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import count
 import threading
-from typing import Optional
+from typing import ClassVar, Optional
 
 import numpy as np
+import torch
 
 
 @dataclass
@@ -23,12 +25,74 @@ class KVWeaveCodecConfig:
     num_threads: int = 1
     precond_seed: int = 42
     precond_path: Optional[str] = None
+    MAMBA_MAGIC: ClassVar[bytes] = b"MQ01"
+    MAMBA_QBIT: ClassVar[int] = 4
+    MAMBA_FLAG_RH: ClassVar[int] = 1
+    MAMBA_FLAG_ASYM: ClassVar[int] = 2
+    DTYPE_TO_CODE: ClassVar[dict[torch.dtype, int]] = {
+        torch.float16: 0,
+        torch.bfloat16: 1,
+        torch.float32: 2,
+    }
+    CODE_TO_DTYPE: ClassVar[dict[int, torch.dtype]] = {
+        0: torch.float16,
+        1: torch.bfloat16,
+        2: torch.float32,
+    }
+    SCALING_TO_CODE: ClassVar[dict[str, int]] = {
+        "per_tensor": 0,
+        "per_token": 1,
+        "per_channel": 2,
+    }
+    SUBSTATE_TO_CODE: ClassVar[dict[str, int]] = {"conv": 0, "ssm": 1}
+    SCALE_IDS: ClassVar = count(1)
 
     def __post_init__(self) -> None:
         self._pd_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self._pd_lock = threading.Lock()
         self._pd_file: Optional[dict[str, object]] = None
         self.scaling_method = str(self.scaling_method)
+
+    @classmethod
+    def next_scale_id(cls) -> int:
+        """Allocate a process-wide scale id for native KVWeave state."""
+        return next(cls.SCALE_IDS) & 0xFFFFFFFF
+
+    @classmethod
+    def mamba_dtype(cls, dtype_str: str) -> torch.dtype:
+        dtype = getattr(torch, dtype_str.removeprefix("torch."), None)
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"unsupported Mamba wire dtype: {dtype_str!r}")
+        return dtype
+
+    @staticmethod
+    def mamba_layout(
+        substate: str, shape: tuple[int, ...], scaling_method: str
+    ) -> tuple[int, int, int, int]:
+        blocks = max(int(shape[1]), 1)
+        tail = shape[2:]
+        head_dim = max(int(tail[-1]) if tail else 1, 1)
+        middle = max(int(np.prod(tail[:-1])) if len(tail) > 1 else 1, 1)
+        if scaling_method == "per_channel":
+            return blocks, middle, head_dim, head_dim
+        if scaling_method == "per_token" and substate == "conv":
+            return blocks * middle, 1, head_dim, blocks * middle
+        if scaling_method == "per_token":
+            return blocks, middle, head_dim, blocks
+        return blocks, middle, head_dim, 1
+
+    def mamba_precond_tensors(
+        self, size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if size <= 0 or size & (size - 1):
+            raise ValueError(
+                f"rh requires a power-of-2 transform length, got {size}"
+            )
+        signs, perm = self.get_pd_matrix(size)
+        return (
+            torch.as_tensor(signs, dtype=torch.float32).contiguous(),
+            torch.as_tensor(perm, dtype=torch.int32).contiguous(),
+        )
 
     def get_pd_matrix(
         self, hadamard_size: int
