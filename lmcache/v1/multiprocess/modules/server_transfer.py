@@ -354,7 +354,15 @@ class ShmTransferStrategy(TransferStrategy):
             return PrepareStoreResponse(context={"slots": [], "chunk_indices": []})
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
-            self._pending_writes[transfer_key] = reserved_keys
+            # Multi-group engine-driven prepare_store may call this method
+            # multiple times with the same (instance_id, key) transfer key.
+            # Accumulate per-group reservations so a single commit_store call
+            # can release all of them in one pop (see commit_store).
+            existing = self._pending_writes.get(transfer_key)
+            if existing is None:
+                self._pending_writes[transfer_key] = list(reserved_keys)
+            else:
+                existing.extend(reserved_keys)
         return PrepareStoreResponse(
             context={"slots": slots, "chunk_indices": chunk_indices}
         )
@@ -369,8 +377,14 @@ class ShmTransferStrategy(TransferStrategy):
     ) -> bool:
         """Finalize SHM store write locks or fallback to pickle commit.
 
+        Multi-group prepare_store accumulates every group's reservations
+        under the same transfer key (see ``prepare_store``'s accumulation
+        note), so one commit_store call releases all of them together.
+
         Returns:
-            ``True`` when pending SHM reservation is committed successfully.
+            ``False`` if no ``prepare_store`` reservation is pending for this
+            key (including one that reserved nothing but was still called),
+            otherwise ``True`` once any pending write locks are released.
         """
         if cpu_data != b"":
             return self._fallback_strategy.commit_store(
@@ -382,9 +396,11 @@ class ShmTransferStrategy(TransferStrategy):
             )
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
-            reserved_keys = self._pending_writes.pop(transfer_key, None)
-        if reserved_keys is None:
-            return False
+            # A key missing from the map means no prepare_store reservation
+            # is pending for it, which is a caller error.
+            if transfer_key not in self._pending_writes:
+                return False
+            reserved_keys = self._pending_writes.pop(transfer_key)
         if reserved_keys:
             self._storage_manager.finish_write(reserved_keys)
         return True
@@ -423,7 +439,14 @@ class ShmTransferStrategy(TransferStrategy):
             )
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
-            self._pending_reads[transfer_key] = shm_prefetched_keys
+            # Multi-group engine-driven prepare_retrieve may call this method
+            # multiple times with the same transfer key. Accumulate the
+            # prefetched key sets so commit_retrieve can release all of them.
+            existing = self._pending_reads.get(transfer_key)
+            if existing is None:
+                self._pending_reads[transfer_key] = list(shm_prefetched_keys)
+            else:
+                existing.extend(shm_prefetched_keys)
         return PrepareRetrieveResponse(success=True, data=b"", context={"slots": slots})
 
     def commit_retrieve(

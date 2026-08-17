@@ -183,6 +183,154 @@ def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
     return block_ids[0]
 
 
+def _kv_caches_for_group(
+    kv_caches: dict[str, torch.Tensor],
+    group_info: EngineGroupInfo | None,
+) -> dict[str, torch.Tensor]:
+    """Return the subset of ``kv_caches`` registered for one LMCache group.
+
+    Args:
+        kv_caches: Worker KV-cache tensors keyed by layer name, in
+            registration order.
+        group_info: The LMCache group to filter for, or ``None`` for the
+            single-group (non-hybrid) fallback, which returns ``kv_caches``
+            unchanged.
+
+    Returns:
+        A dict containing only the layers in ``group_info.layer_indices``,
+        or all of ``kv_caches`` when ``group_info`` is ``None``.
+    """
+    if group_info is None:
+        return kv_caches
+    kv_cache_items = list(kv_caches.items())
+    return {
+        name: tensor
+        for idx, (name, tensor) in enumerate(kv_cache_items)
+        if idx in group_info.layer_indices
+    }
+
+
+def _blocks_per_chunk_for_group(
+    group_info: EngineGroupInfo | None,
+    default_blocks_in_chunk: int,
+    default_block_size: int,
+) -> int:
+    """Return one LMCache chunk's block count for a group's own block size.
+
+    Args:
+        group_info: The LMCache group, or ``None`` for the single-group
+            fallback, which returns ``default_blocks_in_chunk`` unchanged.
+        default_blocks_in_chunk: Blocks per LMCache chunk for the default
+            (single-group) block size.
+        default_block_size: Tokens per paged block for the default
+            (single-group) layout, used to recover the LMCache chunk size in
+            tokens (``default_blocks_in_chunk * default_block_size``).
+
+    Returns:
+        ``default_blocks_in_chunk`` when ``group_info`` is ``None`` or does
+        not report ``tokens_per_block``; otherwise the number of this
+        group's own paged blocks needed to cover one LMCache chunk.
+
+    Raises:
+        ValueError: If the LMCache chunk size in tokens is not a multiple of
+            the group's ``tokens_per_block``.
+    """
+    if group_info is None or group_info.tokens_per_block <= 0:
+        return default_blocks_in_chunk
+    chunk_size_tokens = default_blocks_in_chunk * default_block_size
+    if chunk_size_tokens % group_info.tokens_per_block != 0:
+        raise ValueError(
+            f"LMCache chunk size {chunk_size_tokens} must be a multiple of "
+            f"group tokens_per_block {group_info.tokens_per_block}"
+        )
+    return chunk_size_tokens // group_info.tokens_per_block
+
+
+def _group_chunk_shape(
+    group_info: EngineGroupInfo | None,
+    default_layout_desc: MemoryLayoutDesc,
+    default_num_layers: int,
+) -> torch.Size:
+    """Return one chunk's tensor shape for a group's own layer count.
+
+    Mirrors the shape formula ``register()`` uses to build
+    ``default_layout_desc`` (``[2, num_layers, chunk_tokens, hidden_dim]``, or
+    without the leading ``2`` for MLA/fused-K/V), substituting the group's own
+    layer count for ``num_layers``. The chunk-token and hidden-dim extents are
+    shared across every group by construction (one LMCache chunk always spans
+    the same token count; hidden dim does not vary per group in Phase 2).
+
+    Args:
+        group_info: The LMCache group, or ``None`` for the single-group
+            fallback, which returns ``default_layout_desc.shapes[0]`` unchanged.
+        default_layout_desc: The default (single-group) layout descriptor
+            computed at ``register()`` time.
+        default_num_layers: The default (single-group) layer count that
+            ``default_layout_desc.shapes[0]`` was built from.
+
+    Returns:
+        This group's chunk shape, with its own layer count substituted in.
+    """
+    default_shape = default_layout_desc.shapes[0]
+    if group_info is None or not group_info.layer_indices:
+        return default_shape
+    num_layers = len(group_info.layer_indices)
+    if num_layers == default_num_layers:
+        return default_shape
+    layer_dim = 0 if len(default_shape) == 3 else 1
+    dims = list(default_shape)
+    dims[layer_dim] = num_layers
+    return torch.Size(dims)
+
+
+def _iter_transfer_groups(
+    engine_group_infos: Sequence[EngineGroupInfo],
+    kv_caches: dict[str, torch.Tensor],
+    block_ids: list[list[int]],
+    blocks_in_chunk: int,
+    block_size: int,
+):
+    """Yield one (group_info, kv_caches, block_ids, blocks_per_chunk) tuple
+    per LMCache group to transfer.
+
+    Args:
+        engine_group_infos: The worker's registered LMCache groups, in
+            protocol order. Empty means a single non-hybrid group.
+        kv_caches: Worker KV-cache tensors keyed by layer name.
+        block_ids: Engine block IDs indexed by LMCache group id.
+        blocks_in_chunk: Blocks per LMCache chunk for the default
+            (single-group) block size.
+        block_size: Tokens per paged block for the default (single-group)
+            layout.
+
+    Yields:
+        For each group: its :class:`EngineGroupInfo` (``None`` for the
+        single-group fallback), that group's KV-cache subset, its flat
+        block-id list, and its own blocks-per-chunk count.
+
+    Raises:
+        RuntimeError: If ``engine_group_infos`` is empty and ``block_ids``
+            does not carry exactly one group (see :func:`_single_group_block_ids`).
+        ValueError: If ``engine_group_infos`` is non-empty and ``block_ids``
+            does not carry exactly one entry per group.
+    """
+    if not engine_group_infos:
+        yield None, kv_caches, _single_group_block_ids(block_ids), blocks_in_chunk
+        return
+    if len(block_ids) != len(engine_group_infos):
+        raise ValueError(
+            f"Expected {len(engine_group_infos)} block-id groups, "
+            f"got {len(block_ids)}"
+        )
+    for group_info, group_block_ids in zip(engine_group_infos, block_ids, strict=True):
+        yield (
+            group_info,
+            _kv_caches_for_group(kv_caches, group_info),
+            group_block_ids,
+            _blocks_per_chunk_for_group(group_info, blocks_in_chunk, block_size),
+        )
+
+
 def _get_kv_device(kv_caches: dict[str, torch.Tensor]) -> torch.device:
     """Return the device shared by a non-empty KV-cache mapping.
 
@@ -642,6 +790,9 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_driven_context: EngineDrivenContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._engine_kv_format: Any = None
+        self._engine_group_infos: list[EngineGroupInfo] = []
+        self._block_size: int = 0
+        self._num_layers: int = 0
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -655,6 +806,53 @@ class EngineDrivenTransferContext(TransferContext):
                 "EngineDrivenTransferContext is not registered, call register() first."
             )
         return self._engine_driven_context
+
+    def iter_transfer_groups(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        blocks_in_chunk: int,
+    ):
+        """Yield this context's registered LMCache groups for one transfer.
+
+        Thin wrapper around :func:`_iter_transfer_groups` binding the
+        registered ``engine_group_infos``/``block_size``, for subclasses
+        (e.g. :class:`AsyncEngineDrivenTransferContext`) that need per-group
+        iteration without reaching into private attributes.
+
+        Args:
+            kv_caches: Worker KV-cache tensors keyed by layer name.
+            block_ids: Engine block IDs indexed by LMCache group id.
+            blocks_in_chunk: Blocks per LMCache chunk for the default
+                (single-group) block size.
+
+        Yields:
+            See :func:`_iter_transfer_groups`.
+        """
+        yield from _iter_transfer_groups(
+            self._engine_group_infos,
+            kv_caches,
+            block_ids,
+            blocks_in_chunk,
+            self._block_size,
+        )
+
+    def group_chunk_shape(self, group_info: EngineGroupInfo | None) -> torch.Size:
+        """Return one chunk's tensor shape for a group's own layer count.
+
+        Thin wrapper around :func:`_group_chunk_shape` binding this context's
+        registered layout descriptor and default layer count.
+
+        Args:
+            group_info: The LMCache group, or ``None`` for the single-group
+                fallback.
+
+        Returns:
+            This group's chunk shape (see :func:`_group_chunk_shape`).
+        """
+        return _group_chunk_shape(
+            group_info, self.engine_driven_context.layout_desc, self._num_layers
+        )
 
     def register(
         self,
@@ -672,16 +870,11 @@ class EngineDrivenTransferContext(TransferContext):
     ) -> None:
         """Register KV caches with the non-GPU context server.
 
-        ``engine_group_infos`` and ``engine_type`` are accepted to satisfy
-        the base interface but are currently a no-op: the non-GPU transfer
-        path does not support hybrid KV cache groups and rejects multi-
-        group transfers at store / retrieve time (see
-        ``_single_group_block_ids``).
+        ``engine_group_infos`` is used to split worker-side gather/scatter by
+        LMCache group at store/retrieve time (see ``_iter_transfer_groups``),
+        matching the CUDA transfer path's per-group block-id addressing.
         """
         del engine_type  # unused on the engine-driven path
-        # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs
-        # the tensor-detected slot count, e.g. DeepSeek V4) is only handled
-        # on the CUDA path. The non-CUDA path is yet to be implemented.
         (
             block_size,
             num_layers,
@@ -692,6 +885,9 @@ class EngineDrivenTransferContext(TransferContext):
         ) = compute_kv_layout(kv_caches, layout_hints=layout_hints)
         self._layout_hints = layout_hints
         self._engine_kv_format = engine_kv_format
+        self._engine_group_infos = list(engine_group_infos)
+        self._block_size = block_size
+        self._num_layers = num_layers
 
         # The wire field is named use_mla but only drives the object plane
         # count: single-plane (kv_size == 1) covers MLA and fused-K/V formats.
@@ -719,6 +915,7 @@ class EngineDrivenTransferContext(TransferContext):
                     hidden_dim_size=hidden_dim_size,
                     dtype_str=dtype_str,
                     use_mla=use_mla_flag,
+                    engine_group_infos=list(engine_group_infos),
                 )
             ],
         )
@@ -772,15 +969,54 @@ class EngineDrivenTransferContext(TransferContext):
             future: MessagingFuture[bool] = MessagingFuture()
             future.set_result(True)
             return future
-        cpu_chunks = gather_paged_kv_to_cpu(
-            kv_caches,
-            _single_group_block_ids(block_ids),
-            blocks_in_chunk,
-            layout_hints=self._layout_hints,
-            engine_kv_format=self._engine_kv_format,
-            out=out_buffers,
-            chunk_indices=chunk_indices,
-        )
+
+        cpu_chunks: list[torch.Tensor] = []
+        # ``out_buffers``/``chunk_indices`` (when present) are flat over the
+        # whole multi-group chunk sequence (group 0's chunks first, then
+        # group 1's, ...), matching the order the server concatenated them in
+        # (see EngineDrivenTransferModule.prepare_store). Each group's own
+        # chunk-count range is sliced out before gathering that group.
+        group_offset = 0
+        for (
+            _group_info,
+            group_kv_caches,
+            group_block_ids,
+            group_blocks_in_chunk,
+        ) in self.iter_transfer_groups(kv_caches, block_ids, blocks_in_chunk):
+            num_group_chunks = len(group_block_ids) // group_blocks_in_chunk
+            if chunk_indices is None:
+                group_chunk_indices = None
+                group_out_buffers = None
+            else:
+                selected = [
+                    (out_idx, chunk_idx - group_offset)
+                    for out_idx, chunk_idx in enumerate(chunk_indices)
+                    if group_offset <= chunk_idx < group_offset + num_group_chunks
+                ]
+                group_chunk_indices = [chunk_idx for _, chunk_idx in selected]
+                group_out_buffers = (
+                    [out_buffers[out_idx] for out_idx, _ in selected]
+                    if out_buffers is not None
+                    else None
+                )
+            if chunk_indices is None or group_chunk_indices:
+                cpu_chunks.extend(
+                    gather_paged_kv_to_cpu(
+                        group_kv_caches,
+                        group_block_ids,
+                        group_blocks_in_chunk,
+                        layout_hints=self._layout_hints,
+                        # Hybrid models may mix per-group KV formats (e.g.
+                        # attention + mamba views). Detect per-group format
+                        # from group_kv_caches instead of forcing the
+                        # single-format value computed at register().
+                        engine_kv_format=None,
+                        out=group_out_buffers,
+                        chunk_indices=group_chunk_indices,
+                    )
+                )
+            group_offset += num_group_chunks
+
         if out_buffers is not None:
             # SHM path uses async device->CPU copies; complete them before commit.
             torch_dev.synchronize()
@@ -811,15 +1047,31 @@ class EngineDrivenTransferContext(TransferContext):
         ok = src_buffers is not None
         if src_buffers is not None:
             try:
-                scatter_cpu_to_paged_kv(
-                    kv_caches,
-                    _single_group_block_ids(block_ids),
-                    src_buffers,
-                    blocks_in_chunk,
-                    skip_first_n_tokens=skip_first_n_tokens,
-                    layout_hints=self._layout_hints,
-                    engine_kv_format=self._engine_kv_format,
-                )
+                # ``src_buffers`` is flat over the whole multi-group chunk
+                # sequence, in the same group-major order submit_store wrote
+                # it in (see the group_offset bookkeeping there).
+                group_offset = 0
+                for (
+                    _group_info,
+                    group_kv_caches,
+                    group_block_ids,
+                    group_blocks_in_chunk,
+                ) in self.iter_transfer_groups(kv_caches, block_ids, blocks_in_chunk):
+                    num_group_chunks = len(group_block_ids) // group_blocks_in_chunk
+                    group_chunks = src_buffers[
+                        group_offset : group_offset + num_group_chunks
+                    ]
+                    scatter_cpu_to_paged_kv(
+                        group_kv_caches,
+                        group_block_ids,
+                        group_chunks,
+                        group_blocks_in_chunk,
+                        skip_first_n_tokens=skip_first_n_tokens,
+                        layout_hints=self._layout_hints,
+                        # See submit_store(): discover per-group format.
+                        engine_kv_format=None,
+                    )
+                    group_offset += num_group_chunks
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")
                 ok = False

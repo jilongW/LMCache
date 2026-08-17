@@ -8,6 +8,7 @@ import msgspec
 import torch
 
 # First Party
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.platform.base.ipc_wrapper import (  # noqa: E402,F401
     DeviceIPCWrapper,
 )
@@ -132,6 +133,8 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         hidden_dim_size: Flattened hidden dimension per token.
         dtype_str: Torch dtype name (e.g. ``"float16"``).
         use_mla: Whether the worker KV format is MLA.
+        engine_group_infos: LMCache KV group metadata for multi-group
+            (hybrid) transfer. Empty means a single non-hybrid group.
     """
 
     instance_id: int
@@ -142,6 +145,7 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     hidden_dim_size: int
     dtype_str: str
     use_mla: bool
+    engine_group_infos: list[EngineGroupInfo] = msgspec.field(default_factory=list)
 
 
 @dataclass

@@ -110,6 +110,22 @@ if TYPE_CHECKING:
 logger = lmcache_init_logger(__name__)
 
 
+def _new_transfer_event() -> Any:
+    """Create a device event compatible with the active torch backend.
+
+    CUDA supports ``interprocess=True`` for IPC/event-handle workflows.
+    XPU's Event constructor does not accept that keyword, so fall back to
+    a plain Event instance.
+
+    Returns:
+        A ``torch_dev.Event`` instance, interprocess-capable when supported.
+    """
+    try:
+        return torch_dev.Event(interprocess=True)
+    except TypeError:
+        return torch_dev.Event()
+
+
 # Helper functions
 def _has_preemption_reqs(scheduler_output: SchedulerOutput) -> bool:
     """Return whether the scheduler output contains preemption-related requests.
@@ -535,7 +551,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if len(request_ids) == 0:
             return
 
-        event = torch_dev.Event(interprocess=True)
+        event = _new_transfer_event()
         event.record()
 
         self.worker_adapter.batched_submit_retrieve_requests(
@@ -611,7 +627,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 dispatch(self.dispatcher, "wait_for_save", event=None)
             return
 
-        event = torch_dev.Event(interprocess=True)
+        event = _new_transfer_event()
         event.record()
 
         self.worker_adapter.batched_submit_store_requests(
