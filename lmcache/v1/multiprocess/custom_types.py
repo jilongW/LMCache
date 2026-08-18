@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 # Third Party
 import msgspec
@@ -9,6 +9,10 @@ import torch
 
 # First Party
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+
+if TYPE_CHECKING:
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
+
 from lmcache.v1.platform.base.ipc_wrapper import (  # noqa: E402,F401
     DeviceIPCWrapper,
 )
@@ -146,6 +150,42 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     dtype_str: str
     use_mla: bool
     engine_group_infos: list[EngineGroupInfo] = msgspec.field(default_factory=list)
+    group_layout_descs: list["SerializedMemoryLayoutDesc"] | None = None
+    enable_l1_kvweave_quant: bool = False
+
+
+class SerializedMemoryLayoutDesc(msgspec.Struct, frozen=True):
+    """Message-pack representation of one ``MemoryLayoutDesc``."""
+
+    shapes: list[list[int]]
+    dtypes: list[str]
+
+
+def serialize_memory_layout_desc(
+    layout_desc: "MemoryLayoutDesc",
+) -> SerializedMemoryLayoutDesc:
+    """Encode a memory layout for the engine-driven registration payload."""
+    return SerializedMemoryLayoutDesc(
+        shapes=[list(shape) for shape in layout_desc.shapes],
+        dtypes=[str(dtype) for dtype in layout_desc.dtypes],
+    )
+
+
+def deserialize_memory_layout_desc(
+    payload: SerializedMemoryLayoutDesc,
+) -> "MemoryLayoutDesc":
+    """Decode a serialized layout descriptor from an IPC payload."""
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
+
+    dtypes: list[torch.dtype] = []
+    for dtype_name in payload.dtypes:
+        dtype = getattr(torch, dtype_name.removeprefix("torch."), None)
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"Unsupported torch dtype in payload: {dtype_name}")
+        dtypes.append(dtype)
+    return MemoryLayoutDesc(
+        shapes=[torch.Size(shape) for shape in payload.shapes], dtypes=dtypes
+    )
 
 
 @dataclass

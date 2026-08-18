@@ -116,6 +116,10 @@ class GDSL1MemoryManager:
         """
         return L1BackendType.GDS
 
+    def is_variable_size(self) -> bool:
+        """GDS allocations use the fixed slab allocation path."""
+        return False
+
     def get_memory_usage(self) -> tuple[int, int]:
         """Return ``(used_bytes, total_bytes)`` of the slab."""
         free_size = self._address_manager.get_free_size()

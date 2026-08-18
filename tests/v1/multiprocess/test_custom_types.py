@@ -14,6 +14,8 @@ from lmcache import torch_dev, torch_device_type
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheServerKey,
+    RegisterEngineDrivenContextPayload,
+    SerializedMemoryLayoutDesc,
     get_customized_decoder,
     get_customized_encoder,
 )
@@ -47,6 +49,31 @@ def test_ipc_cache_engine_key_serialization():
 
     # Verify correctness
     assert original_key == decoded_key, "IPCCacheServerKeys do not match!"
+
+
+def test_engine_driven_payload_roundtrip_preserves_kvweave_fields():
+    """Registration metadata must survive the msgspec wire roundtrip."""
+    payload = RegisterEngineDrivenContextPayload(
+        instance_id=3,
+        model_name="model",
+        world_size=2,
+        block_size=16,
+        num_layers=4,
+        hidden_dim_size=32,
+        dtype_str="float16",
+        use_mla=False,
+        group_layout_descs=[
+            SerializedMemoryLayoutDesc(shapes=[[2, 16, 32]], dtypes=["torch.float16"])
+        ],
+        enable_l1_kvweave_quant=True,
+    )
+
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(payload), type=RegisterEngineDrivenContextPayload
+    )
+
+    assert decoded.group_layout_descs == payload.group_layout_descs
+    assert decoded.enable_l1_kvweave_quant is True
 
 
 def test_ipc_cache_engine_key_serialization_with_cache_salt():

@@ -22,6 +22,7 @@ from lmcache.v1.distributed.api import (
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     RegisterEngineDrivenContextPayload,
+    deserialize_memory_layout_desc,
 )
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext, ShmPoolInfo
 from lmcache.v1.multiprocess.engine_module import (
@@ -409,6 +410,14 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 "'bfloat16' for torch.bfloat16, 'float32' for torch.float32)."
             )
 
+        if (
+            payload.enable_l1_kvweave_quant
+            and not self._ctx.storage_manager.is_l1_variable_size()
+        ):
+            raise ValueError(
+                "L1 KVWeave quantization requires a variable-size L1 allocator"
+            )
+
         layout_desc = self._make_group_layout_desc(
             payload.num_layers,
             self._ctx.chunk_size,
@@ -421,20 +430,41 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             block_size=payload.block_size,
             use_mla=payload.use_mla,
         )
-        metadata_by_group = [
-            EngineDrivenContextMetadata(
-                layout_desc=self._make_group_layout_desc(
-                    len(group_info.layer_indices),
-                    self._ctx.chunk_size,
-                    payload.hidden_dim_size,
-                    dtype,
-                    payload.use_mla,
-                ),
-                block_size=group_info.tokens_per_block or payload.block_size,
-                use_mla=payload.use_mla,
-            )
-            for group_info in payload.engine_group_infos
-        ]
+        if payload.group_layout_descs is not None:
+            expected = max(1, len(payload.engine_group_infos))
+            if len(payload.group_layout_descs) != expected:
+                raise ValueError(
+                    "group_layout_descs length mismatch: "
+                    f"expected {expected}, got {len(payload.group_layout_descs)}"
+                )
+            metadata_by_group = [
+                EngineDrivenContextMetadata(
+                    layout_desc=deserialize_memory_layout_desc(encoded),
+                    block_size=(
+                        payload.engine_group_infos[idx].tokens_per_block
+                        if payload.engine_group_infos
+                        else payload.block_size
+                    )
+                    or payload.block_size,
+                    use_mla=payload.use_mla,
+                )
+                for idx, encoded in enumerate(payload.group_layout_descs)
+            ]
+        else:
+            metadata_by_group = [
+                EngineDrivenContextMetadata(
+                    layout_desc=self._make_group_layout_desc(
+                        len(group_info.layer_indices),
+                        self._ctx.chunk_size,
+                        payload.hidden_dim_size,
+                        dtype,
+                        payload.use_mla,
+                    ),
+                    block_size=group_info.tokens_per_block or payload.block_size,
+                    use_mla=payload.use_mla,
+                )
+                for group_info in payload.engine_group_infos
+            ]
         # Build the entry and strategy outside the lock, then insert the pair
         # atomically so a concurrent reap can never strand one without the
         # other. REGISTER is SYNC-serialized, so it is the sole inserter.

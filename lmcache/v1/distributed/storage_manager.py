@@ -6,6 +6,7 @@ Distributed multi-tier storage manager for MP mode
 # Standard
 from contextlib import contextmanager
 from dataclasses import replace
+import os
 from typing import Iterator, Literal, Optional
 import threading
 import time
@@ -64,6 +65,13 @@ from lmcache.v1.platform import HAS_EVENTFD
 
 logger = init_logger(__name__)
 
+_ENV_L1_KVWEAVE_QUANT = "LMCACHE_MP_L1_KVWEAVE_QUANT"
+
+
+def _env_flag(name: str) -> bool:
+    """Parse a conventional boolean environment flag."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
 
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
@@ -82,6 +90,7 @@ class StorageManager:
         # ``SerdeL2AdapterWrapper`` so controllers see a plain L2 adapter
         # and serde is transparent.
         self._l1_memory_desc = self._l1_manager.get_l1_memory_desc()
+        self._l1_kvweave_quant_enabled = _env_flag(_ENV_L1_KVWEAVE_QUANT)
         self._next_adapter_id = 0
         # Serializes add_l2_adapter / delete_l2_adapter against each other.
         self._lifecycle_lock = threading.Lock()
@@ -1120,16 +1129,33 @@ class StorageManager:
         self._next_adapter_id += 1
         adapter: L2AdapterInterface = create_l2_adapter(config, self._l1_memory_desc)
         if config.serde_config is not None:
-            adapter = SerdeL2AdapterWrapper(
-                inner=adapter,
-                serde=create_serde_processor(config.serde_config),
-                l1_manager=self._l1_manager,
-            )
+            if self._l1_kvweave_quant_enabled:
+                if config.serde_config.type == "kvweave":
+                    raise ValueError(
+                        "L1 KVWeave quantization is enabled, but an L2 adapter "
+                        "still uses serde type 'kvweave'. Disable the L2 serde "
+                        "wrapper so quantized L1 bytes are stored verbatim."
+                    )
+                logger.warning(
+                    "L1 KVWeave quantization is enabled; bypassing L2 serde "
+                    "wrapper for adapter %s",
+                    type(adapter).__name__,
+                )
+            else:
+                adapter = SerdeL2AdapterWrapper(
+                    inner=adapter,
+                    serde=create_serde_processor(config.serde_config),
+                    l1_manager=self._l1_manager,
+                )
         descriptor = AdapterDescriptor(index=adapter_id, config=config)
         # Stamp the registered type name so the adapter's cache events on
         # the observability bus carry their backend identity.
         adapter.set_backend_identity(descriptor.type_name, shared=config.shared)
         return adapter_id, adapter, descriptor
+
+    def is_l1_variable_size(self) -> bool:
+        """Return whether the L1 tier supports variable-size allocations."""
+        return self._l1_manager.is_variable_size()
 
     def _should_enable_l2_eviction(
         self,

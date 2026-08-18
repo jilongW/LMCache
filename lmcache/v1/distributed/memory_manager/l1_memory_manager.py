@@ -156,6 +156,10 @@ class L1MemoryManager:
         """
         return L1BackendType.DRAM
 
+    def is_variable_size(self) -> bool:
+        """Return whether the backing allocator supports variable sizes."""
+        return isinstance(self._allocator, (MixedMemoryAllocator, LazyMemoryAllocator))
+
     def get_memory_usage(self) -> tuple[int, int]:
         """
         Get the current memory usage. This function will mainly be used to support

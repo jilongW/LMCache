@@ -3,8 +3,10 @@
 import pytest
 import torch
 
-from lmcache.v1.distributed.serde.kvweave.kvweave_serde import _KVWeaveCodec
 from lmcache.v1.multiprocess.group_view import MambaSubStateWireLayout
+from lmcache.v1.distributed.serde.kvweave.kvweave_serde import (
+    _KVWeaveCodec,
+)
 
 
 def _layouts() -> tuple[MambaSubStateWireLayout, MambaSubStateWireLayout]:
@@ -17,12 +19,8 @@ def _layouts() -> tuple[MambaSubStateWireLayout, MambaSubStateWireLayout]:
 def test_split_and_merge_preserve_real_substate_bytes():
     raw = torch.randn(2, 2, 8, 8, dtype=torch.float32)
     split = _KVWeaveCodec.split_mamba_chunk(raw, _layouts(), block_size=2)
-    merged = _KVWeaveCodec.merge_mamba_chunk(
-        split, _layouts(), block_size=2, hidden_dim=8
-    )
-    split_again = _KVWeaveCodec.split_mamba_chunk(
-        merged, _layouts(), block_size=2
-    )
+    merged = _KVWeaveCodec.merge_mamba_chunk(split, _layouts(), block_size=2, hidden_dim=8)
+    split_again = _KVWeaveCodec.split_mamba_chunk(merged, _layouts(), block_size=2)
 
     assert split.conv.shape == (2, 4, 2, 2)
     assert split.ssm.shape == (2, 4, 3, 4)
@@ -41,9 +39,7 @@ def test_split_accepts_noncontiguous_chunks():
 
 def test_split_rejects_misaligned_chunk_tokens():
     with pytest.raises(ValueError, match="chunk_tokens"):
-        _KVWeaveCodec.split_mamba_chunk(
-            torch.randn(2, 2, 7, 8), _layouts(), block_size=2
-        )
+        _KVWeaveCodec.split_mamba_chunk(torch.randn(2, 2, 7, 8), _layouts(), block_size=2)
 
 
 def test_payload_bundle_round_trip():

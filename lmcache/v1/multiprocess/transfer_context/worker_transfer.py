@@ -15,8 +15,12 @@ import torch
 from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.distributed.serde.kvweave import KVWeaveCodec
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+from lmcache.v1.multiprocess.custom_types import (
+    RegisterEngineDrivenContextPayload,
+    serialize_memory_layout_desc,
+)
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.mq import MessageQueueClient
@@ -38,6 +42,21 @@ from lmcache.v1.platform.base.event_ipc import (
 from lmcache.v1.platform.kv_wrap import wrap_kv_caches
 
 logger = init_logger(__name__)
+
+
+def _copy_bytes_to_tensor(payload: bytes, destination: torch.Tensor) -> None:
+    """Copy a serialized payload into a byte-addressable storage slot."""
+    target = destination.view(torch.uint8).flatten()
+    if len(payload) > target.numel():
+        raise ValueError(
+            f"serialized payload ({len(payload)} bytes) exceeds slot "
+            f"({target.numel()} bytes)"
+        )
+    target.zero_()
+    target[: len(payload)].copy_(
+        torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+    )
+
 
 # Environment variable that lets the user override the default routing
 # performed by :func:`create_transfer_context`. Accepted values match the
@@ -793,6 +812,10 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_group_infos: list[EngineGroupInfo] = []
         self._block_size: int = 0
         self._num_layers: int = 0
+        self._kvweave_codec: KVWeaveCodec | None = None
+        self._kvweave_quant_enabled = False
+        self._group_layout_descs: list[MemoryLayoutDesc] = []
+        self._group_raw_layout_descs: list[MemoryLayoutDesc] = []
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -901,6 +924,80 @@ class EngineDrivenTransferContext(TransferContext):
         )
         dtype = getattr(torch, dtype_str)
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+        self._group_raw_layout_descs = []
+        group_layouts = []
+        group_infos = self._engine_group_infos or [None]
+        for group_info in group_infos:
+            group_tokens = (
+                group_info.tokens_per_block if group_info is not None else block_size
+            ) or block_size
+            group_blocks = (
+                _blocks_per_chunk_for_group(group_info, blocks_in_chunk, block_size)
+                if group_info is not None
+                else blocks_in_chunk
+            )
+            group_shape = list(shape)
+            if group_info is not None:
+                group_shape[0 if use_mla_flag else 1] = len(
+                    group_info.layer_indices
+                )
+            group_shape[1 if use_mla_flag else 2] = group_blocks * group_tokens
+            group_layout = MemoryLayoutDesc(
+                shapes=[torch.Size(group_shape)], dtypes=[dtype]
+            )
+            self._group_raw_layout_descs.append(group_layout)
+            group_layouts.append(group_layout)
+
+        enable_l1_kvweave_quant = os.environ.get(
+            "LMCACHE_MP_L1_KVWEAVE_QUANT", ""
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        if enable_l1_kvweave_quant and not use_mla_flag:
+            self._kvweave_codec = KVWeaveCodec(
+                {
+                    "quantize": True,
+                    "qbit": 4,
+                    "num_kv_heads": int(os.environ.get("LMCACHE_MP_KVWEAVE_NUM_KV_HEADS", "1")),
+                    "head_dim": int(os.environ.get("LMCACHE_MP_KVWEAVE_HEAD_DIM", "0")),
+                    "scaling_method": os.environ.get(
+                        "LMCACHE_MP_KVWEAVE_SCALING_METHOD", "per_channel"
+                    ),
+                    "precond": os.environ.get("LMCACHE_MP_KVWEAVE_PRECOND", "0").lower()
+                    in {"1", "true", "yes", "y", "on"},
+                }
+            )
+            quantized_layouts = []
+            for raw_layout in group_layouts:
+                serialized_size = self._kvweave_codec.estimate_serialized_size(raw_layout)
+                raw_size = sum(
+                    int(torch.tensor(shape).prod().item()) * itemsize
+                    for shape, dtype_item in zip(
+                        raw_layout.shapes, raw_layout.dtypes, strict=True
+                    )
+                    for itemsize in [dtype_item.itemsize]
+                )
+                if serialized_size < raw_size:
+                    quantized_layouts.append(
+                        MemoryLayoutDesc(
+                            shapes=[torch.Size([serialized_size])],
+                            dtypes=[torch.uint8],
+                        )
+                    )
+                else:
+                    quantized_layouts.append(raw_layout)
+            self._group_layout_descs = quantized_layouts
+            self._kvweave_quant_enabled = any(
+                layout.dtypes == [torch.uint8]
+                for layout in quantized_layouts
+            )
+        else:
+            self._group_layout_descs = group_layouts
+            self._kvweave_quant_enabled = False
+        group_layout_descs = (
+            [serialize_memory_layout_desc(layout) for layout in self._group_layout_descs]
+            if self._kvweave_quant_enabled
+            else None
+        )
+        enable_l1_kvweave_quant = self._kvweave_quant_enabled
 
         future = send_request(
             mq_client,
@@ -916,6 +1013,8 @@ class EngineDrivenTransferContext(TransferContext):
                     dtype_str=dtype_str,
                     use_mla=use_mla_flag,
                     engine_group_infos=list(engine_group_infos),
+                    group_layout_descs=group_layout_descs,
+                    enable_l1_kvweave_quant=enable_l1_kvweave_quant,
                 )
             ],
         )
@@ -977,12 +1076,14 @@ class EngineDrivenTransferContext(TransferContext):
         # (see EngineDrivenTransferModule.prepare_store). Each group's own
         # chunk-count range is sliced out before gathering that group.
         group_offset = 0
-        for (
+        for group_index, (
             _group_info,
             group_kv_caches,
             group_block_ids,
             group_blocks_in_chunk,
-        ) in self.iter_transfer_groups(kv_caches, block_ids, blocks_in_chunk):
+        ) in enumerate(
+            self.iter_transfer_groups(kv_caches, block_ids, blocks_in_chunk)
+        ):
             num_group_chunks = len(group_block_ids) // group_blocks_in_chunk
             if chunk_indices is None:
                 group_chunk_indices = None
@@ -1000,21 +1101,43 @@ class EngineDrivenTransferContext(TransferContext):
                     else None
                 )
             if chunk_indices is None or group_chunk_indices:
-                cpu_chunks.extend(
-                    gather_paged_kv_to_cpu(
-                        group_kv_caches,
-                        group_block_ids,
-                        group_blocks_in_chunk,
-                        layout_hints=self._layout_hints,
-                        # Hybrid models may mix per-group KV formats (e.g.
-                        # attention + mamba views). Detect per-group format
-                        # from group_kv_caches instead of forcing the
-                        # single-format value computed at register().
-                        engine_kv_format=None,
-                        out=group_out_buffers,
-                        chunk_indices=group_chunk_indices,
-                    )
+                raw_chunks = gather_paged_kv_to_cpu(
+                    group_kv_caches,
+                    group_block_ids,
+                    group_blocks_in_chunk,
+                    layout_hints=self._layout_hints,
+                    # Hybrid models may mix per-group KV formats (e.g.
+                    # attention + mamba views). Detect per-group format
+                    # from group_kv_caches instead of forcing the
+                    # single-format value computed at register().
+                    engine_kv_format=None,
+                    out=None if self._group_is_quantized(group_index) else group_out_buffers,
+                    chunk_indices=group_chunk_indices,
                 )
+                if self._group_is_quantized(group_index):
+                    if self._kvweave_codec is None:
+                        raise RuntimeError("KVWeave codec is not initialized")
+                    if group_out_buffers is not None:
+                        if len(raw_chunks) != len(group_out_buffers):
+                            raise ValueError("quantized SHM slot count mismatch")
+                        for raw_chunk, destination in zip(
+                            raw_chunks, group_out_buffers, strict=True
+                        ):
+                            _copy_bytes_to_tensor(
+                                self._kvweave_codec.serialize_tensor(raw_chunk),
+                                destination,
+                            )
+                    else:
+                        for raw_chunk in raw_chunks:
+                            payload = self._kvweave_codec.serialize_tensor(raw_chunk)
+                            destination = torch.empty(
+                                (self._group_layout_descs[group_index].shapes[0][0],),
+                                dtype=torch.uint8,
+                            )
+                            _copy_bytes_to_tensor(payload, destination)
+                            cpu_chunks.append(destination)
+                else:
+                    cpu_chunks.extend(raw_chunks)
             group_offset += num_group_chunks
 
         if out_buffers is not None:
@@ -1051,16 +1174,29 @@ class EngineDrivenTransferContext(TransferContext):
                 # sequence, in the same group-major order submit_store wrote
                 # it in (see the group_offset bookkeeping there).
                 group_offset = 0
-                for (
+                for group_index, (
                     _group_info,
                     group_kv_caches,
                     group_block_ids,
                     group_blocks_in_chunk,
-                ) in self.iter_transfer_groups(kv_caches, block_ids, blocks_in_chunk):
+                ) in enumerate(
+                    self.iter_transfer_groups(kv_caches, block_ids, blocks_in_chunk)
+                ):
                     num_group_chunks = len(group_block_ids) // group_blocks_in_chunk
                     group_chunks = src_buffers[
                         group_offset : group_offset + num_group_chunks
                     ]
+                    if self._group_is_quantized(group_index):
+                        if self._kvweave_codec is None:
+                            raise RuntimeError("KVWeave codec is not initialized")
+                        raw_shape = self._group_raw_layout_descs[group_index].shapes[0]
+                        raw_dtype = self._group_raw_layout_descs[group_index].dtypes[0]
+                        decoded_chunks = []
+                        for chunk in group_chunks:
+                            destination = torch.empty(raw_shape, dtype=raw_dtype)
+                            self._kvweave_codec.deserialize_tensor(chunk, destination)
+                            decoded_chunks.append(destination)
+                        group_chunks = decoded_chunks
                     scatter_cpu_to_paged_kv(
                         group_kv_caches,
                         group_block_ids,
@@ -1083,6 +1219,12 @@ class EngineDrivenTransferContext(TransferContext):
         future: MessagingFuture[bool] = MessagingFuture()
         future.set_result(ok)
         return future
+
+    def _group_is_quantized(self, group_index: int) -> bool:
+        return (
+            group_index < len(self._group_layout_descs)
+            and self._group_layout_descs[group_index].dtypes == [torch.uint8]
+        )
 
     def close(self) -> None:
         if self._engine_driven_context is not None:

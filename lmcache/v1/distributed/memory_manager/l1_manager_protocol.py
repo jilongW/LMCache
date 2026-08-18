@@ -45,6 +45,10 @@ class L1ManagerProtocol(Protocol):
         """
         ...
 
+    def is_variable_size(self) -> bool:
+        """Return whether allocations may have variable byte sizes."""
+        ...
+
     def close(self) -> None:
         """Release all resources."""
         ...

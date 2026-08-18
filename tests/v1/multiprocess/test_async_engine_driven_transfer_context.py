@@ -458,3 +458,98 @@ def test_prepare_store_runs_on_background_thread_not_forward_thread(
     prepare_gate.set()
     t.join(timeout=1)
     ctx.close()
+
+
+class _FakeStoreRetrieveContext(_FakeStoreContext):
+    """``_FakeStoreContext`` plus the retrieve half, for round-trip tests."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.retrieve_chunks: list[torch.Tensor] | None = None
+
+    def prepare_retrieve(
+        self, _key: object, _instance_id: int
+    ) -> list[torch.Tensor] | None:
+        return self.retrieve_chunks
+
+    def commit_retrieve(self, _key: object, _instance_id: int) -> bool:
+        return True
+
+
+def test_async_submit_store_quantizes_then_submit_retrieve_dequantizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With LMCACHE_MP_L1_KVWEAVE_QUANT=1, the async store path's own gather
+    loop (which does not go through the base class's submit_store) must
+    still quantize each eligible group's chunk through the KVWeave codec,
+    and the inherited (synchronous) submit_retrieve must dequantize those
+    bytes back before scattering.
+
+    Uses real gather/scatter (no _install_fake_gather) and a large enough
+    chunk for KVWeave's fixed ~4KB header overhead to pay off, so the
+    codec path in AsyncEngineDrivenTransferContext.submit_store is actually
+    exercised rather than falling back to the raw layout.
+    """
+    monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", "1")
+    gather_gate = threading.Event()
+    gather_gate.set()
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
+
+    committed: dict[str, list[torch.Tensor]] = {}
+    fake_context = _FakeStoreRetrieveContext(
+        commit_impl=lambda chunks: committed.update(chunks=chunks) or True
+    )
+
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    kv_caches = {f"layer_{i}": torch.randn(2, 64, 1, 1, 128) for i in range(2)}
+    future = MagicMock()
+    future.result.return_value = MagicMock(shm_name="", pool_size=0)
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *a, **k: fake_context,
+    )
+    ctx.register(
+        instance_id=1,
+        kv_caches=kv_caches,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=64,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=[],
+    )
+    # _FakeStoreContext hardcodes a [2,1,1,1] layout_desc that doesn't match
+    # this test's real KV shape; group_chunk_shape() reads this for the
+    # pinned-staging allocation path, so it must reflect the real chunk.
+    fake_context.layout_desc = SimpleNamespace(
+        shapes=[torch.Size([2, 2, 64, 128])], dtypes=[torch.float32]
+    )
+
+    store_future = ctx.submit_store(
+        "r1",
+        object(),
+        1,
+        kv_caches,
+        [list(range(64))],
+        _FakeEvent(gather_gate),
+        64,
+    )
+    assert store_future.result(timeout=1) is True
+    assert "chunks" in committed
+    raw_nbytes = kv_caches["layer_0"].numel() * kv_caches["layer_0"].element_size()
+    for chunk in committed["chunks"]:
+        assert chunk.dtype == torch.uint8
+        assert chunk.numel() < raw_nbytes
+
+    fake_context.retrieve_chunks = committed["chunks"]
+    destination = {name: torch.zeros_like(tensor) for name, tensor in kv_caches.items()}
+    retrieve_future = ctx.submit_retrieve(
+        "r1", object(), 1, destination, [list(range(64))], _FakeEvent(gather_gate), 64
+    )
+    assert retrieve_future.result(timeout=1) is True
+    for name in kv_caches:
+        assert torch.max(torch.abs(destination[name] - kv_caches[name])) < 1.0
+    ctx.close()
+    ctx.close()

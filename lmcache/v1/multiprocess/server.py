@@ -3,6 +3,7 @@
 
 # Standard
 import argparse
+import os
 import shutil
 import signal
 import sys
@@ -71,6 +72,26 @@ from lmcache.v1.multiprocess.protocol import (
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 
 logger = init_logger(__name__)
+
+_ENV_L1_KVWEAVE_QUANT = "LMCACHE_MP_L1_KVWEAVE_QUANT"
+_ENV_KVWEAVE_LINEAR_QUANT_ENABLED = "LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED"
+_TRUE_VALUES = frozenset({"1", "true", "yes", "y", "on"})
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean environment flag for startup diagnostics."""
+    raw = os.environ.get(name)
+    return default if raw is None else raw.strip().lower() in _TRUE_VALUES
+
+
+def _log_l1_quant_config() -> None:
+    """Log the effective L1 quantization mode when it is enabled."""
+    if not _env_flag(_ENV_L1_KVWEAVE_QUANT, False):
+        return
+    logger.info(
+        "Enable L1 KVWeave quantization; linear/Mamba quantization: %s",
+        _env_flag(_ENV_KVWEAVE_LINEAR_QUANT_ENABLED, True),
+    )
 
 
 class MPCacheServer:
@@ -217,6 +238,7 @@ def _build_modules(
         )
 
     logger.info("Supported transfer mode: %s", mp_config.supported_transfer_mode)
+    _log_l1_quant_config()
 
     # Targets the reaper scans (and reap-notifies). The transfer modules own
     # per-instance liveness; BlendV3Module is appended below as a state mirror.

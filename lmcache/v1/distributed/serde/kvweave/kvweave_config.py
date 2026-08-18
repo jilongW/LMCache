@@ -25,10 +25,13 @@ class KVWeaveCodecConfig:
     num_threads: int = 1
     precond_seed: int = 42
     precond_path: Optional[str] = None
+    MAGIC_RAW: ClassVar[bytes] = b"KVW0"
+    MAGIC_QUANT: ClassVar[bytes] = b"KVW3"
     MAMBA_MAGIC: ClassVar[bytes] = b"MQ01"
     MAMBA_QBIT: ClassVar[int] = 4
     MAMBA_FLAG_RH: ClassVar[int] = 1
     MAMBA_FLAG_ASYM: ClassVar[int] = 2
+    DEFAULT_BLOCK_SIZE: ClassVar[int] = 64
     DTYPE_TO_CODE: ClassVar[dict[torch.dtype, int]] = {
         torch.float16: 0,
         torch.bfloat16: 1,
@@ -59,6 +62,14 @@ class KVWeaveCodecConfig:
         return next(cls.SCALE_IDS) & 0xFFFFFFFF
 
     @classmethod
+    def next_scale_ids(cls, count: int) -> list[int]:
+        return [cls.next_scale_id() for _ in range(count)]
+
+    @staticmethod
+    def quantized_bytes(elements: int, qbit: int) -> int:
+        return (elements + 1) // 2 if qbit == 4 else elements if qbit <= 8 else elements * 2
+
+    @classmethod
     def mamba_dtype(cls, dtype_str: str) -> torch.dtype:
         dtype = getattr(torch, dtype_str.removeprefix("torch."), None)
         if not isinstance(dtype, torch.dtype):
@@ -72,7 +83,9 @@ class KVWeaveCodecConfig:
         blocks = max(int(shape[1]), 1)
         tail = shape[2:]
         head_dim = max(int(tail[-1]) if tail else 1, 1)
-        middle = max(int(np.prod(tail[:-1])) if len(tail) > 1 else 1, 1)
+        middle = max(
+            int(np.prod(tail[:-1])) if len(tail) > 1 else 1, 1
+        )
         if scaling_method == "per_channel":
             return blocks, middle, head_dim, head_dim
         if scaling_method == "per_token" and substate == "conv":
@@ -85,9 +98,7 @@ class KVWeaveCodecConfig:
         self, size: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if size <= 0 or size & (size - 1):
-            raise ValueError(
-                f"rh requires a power-of-2 transform length, got {size}"
-            )
+            raise ValueError(f"rh requires a power-of-2 transform length, got {size}")
         signs, perm = self.get_pd_matrix(size)
         return (
             torch.as_tensor(signs, dtype=torch.float32).contiguous(),
@@ -97,7 +108,7 @@ class KVWeaveCodecConfig:
     def get_pd_matrix(
         self, hadamard_size: int
     ) -> tuple[np.ndarray, np.ndarray] | None:
-        """Return deterministic or file-backed ``(signs, permutation)``."""
+        """Return cached deterministic or file-backed P/D matrices."""
         cached = self._pd_cache.get(hadamard_size)
         if cached is not None:
             return cached

@@ -335,3 +335,71 @@ def test_submit_store_narrows_shm_out_buffers_to_group_chunk_count(
     )[0]
     assert torch.allclose(fake_context.out_buffers[0], expected_group0)
     assert torch.allclose(fake_context.out_buffers[1], expected_group1)
+
+
+def test_submit_store_retrieve_round_trips_kvweave_quantized_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With LMCACHE_MP_L1_KVWEAVE_QUANT=1, submit_store must serialize each
+    quantized group's chunk through the KVWeave codec (not commit raw
+    bytes), and submit_retrieve must dequantize those bytes back into the
+    real KV shape before scattering — regression test for a store/retrieve
+    dtype mismatch where retrieve scattered still-encoded uint8 bytes
+    straight into the paged KV cache.
+
+    Uses a larger chunk (64 blocks x 128 hidden) than the other tests in
+    this module: KVWeave's fixed ~4KB header overhead only pays off once the
+    raw tensor is big enough, so register() would otherwise fall back to
+    the raw (non-quantized) layout and the codec path would go untested.
+    """
+    monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", "1")
+    fake_context = _FakeEngineDrivenContext()
+    monkeypatch.setattr(
+        worker_transfer, "create_engine_driven_context", lambda *a, **k: fake_context
+    )
+    future = MagicMock()
+    future.result.return_value = MagicMock(shm_name="", pool_size=0)
+
+    ctx = EngineDrivenTransferContext()
+    kv_caches = _make_kv_caches(
+        2, num_blocks=64, block_size=1, num_heads=1, head_size=128
+    )
+    ctx.register(
+        instance_id=1,
+        kv_caches=kv_caches,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=64,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=[],
+    )
+
+    store_future = ctx.submit_store(
+        "req", MagicMock(), 1, kv_caches, [list(range(64))], MagicMock(), 64
+    )
+    assert store_future.result() is True
+    assert fake_context.committed_chunks is not None
+    # The quantized group must not commit a raw fp32 chunk: KVWeave's 4-bit
+    # payload is far smaller than the raw (2, 2, 64, 128) float32 chunk.
+    raw_nbytes = kv_caches["layer_0"].numel() * kv_caches["layer_0"].element_size()
+    for chunk in fake_context.committed_chunks:
+        assert chunk.dtype == torch.uint8
+        assert chunk.numel() < raw_nbytes
+
+    fake_context.retrieve_chunks = fake_context.committed_chunks
+    destination = {name: torch.zeros_like(tensor) for name, tensor in kv_caches.items()}
+    retrieve_future = ctx.submit_retrieve(
+        "req", MagicMock(), 1, destination, [list(range(64))], MagicMock(), 64
+    )
+
+    assert retrieve_future.result() is True
+    # Dequantized values must be close to the originals (4-bit quant has
+    # bounded error, not bit-exact).
+    assert torch.max(
+        torch.abs(destination["layer_0"] - kv_caches["layer_0"])
+    ) < 1.0
+    assert torch.max(
+        torch.abs(destination["layer_1"] - kv_caches["layer_1"])
+    ) < 1.0

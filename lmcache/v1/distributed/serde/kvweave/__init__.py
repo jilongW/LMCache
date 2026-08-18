@@ -5,12 +5,10 @@ from lmcache.v1.distributed.serde.kvweave.kvweave_config import KVWeaveCodecConf
 from lmcache.v1.distributed.serde.kvweave.kvweave_serde import (
     KVWeaveCodec,
     _KVWeaveCodec,
-    _copy_bytes_to_tensor,
 )
 
 __all__ = [
     "KVWeaveCodec",
     "KVWeaveCodecConfig",
     "_KVWeaveCodec",
-    "_copy_bytes_to_tensor",
 ]

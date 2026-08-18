@@ -17,6 +17,7 @@ from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     IPCEvent,
+    _copy_bytes_to_tensor,
 )
 
 logger = init_logger(__name__)
@@ -251,16 +252,17 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     with torch.inference_mode(), torch_dev.stream(self._copy_stream):
                         _event.wait(stream=self._copy_stream)
 
-                        for (
+                        for group_index, (
                             group_info,
                             group_kv_caches,
                             group_block_ids,
                             group_blocks_in_chunk,
-                        ) in transfer_groups:
+                        ) in enumerate(transfer_groups):
                             num_group_chunks = (
                                 len(group_block_ids) // group_blocks_in_chunk
                             )
-                            if out_buffers is not None:
+                            quantized = self._group_is_quantized(group_index)
+                            if out_buffers is not None and not quantized:
                                 group_out = out_buffers[
                                     group_offset : group_offset + num_group_chunks
                                 ]
@@ -271,7 +273,8 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                 group_out = self._alloc_pinned_staging(
                                     shape, dtype, num_group_chunks
                                 )
-                                staged_chunks.extend(group_out)
+                                if not quantized:
+                                    staged_chunks.extend(group_out)
                             group_chunk_indices = (
                                 [
                                     idx - group_offset
@@ -283,20 +286,55 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                 if chunk_indices is not None
                                 else None
                             )
-                            gather_target.extend(
-                                gather_paged_kv_to_cpu(
-                                    group_kv_caches,
-                                    group_block_ids,
-                                    group_blocks_in_chunk,
-                                    layout_hints=self._layout_hints,
-                                    # Hybrid groups may carry different
-                                    # concrete KV formats. Discover format
-                                    # per group from group_kv_caches.
-                                    engine_kv_format=None,
-                                    out=group_out,
-                                    chunk_indices=group_chunk_indices,
-                                )
+                            raw_chunks = gather_paged_kv_to_cpu(
+                                group_kv_caches,
+                                group_block_ids,
+                                group_blocks_in_chunk,
+                                layout_hints=self._layout_hints,
+                                # Hybrid groups may carry different
+                                # concrete KV formats. Discover format
+                                # per group from group_kv_caches.
+                                engine_kv_format=None,
+                                out=group_out,
+                                chunk_indices=group_chunk_indices,
                             )
+                            if quantized:
+                                if self._kvweave_codec is None:
+                                    raise RuntimeError(
+                                        "KVWeave codec is not initialized"
+                                    )
+                                self._release_staging(raw_chunks)
+                                if out_buffers is not None:
+                                    group_shm = out_buffers[
+                                        group_offset : group_offset
+                                        + num_group_chunks
+                                    ]
+                                    for raw_chunk, destination in zip(
+                                        raw_chunks, group_shm, strict=True
+                                    ):
+                                        _copy_bytes_to_tensor(
+                                            self._kvweave_codec.serialize_tensor(
+                                                raw_chunk
+                                            ),
+                                            destination,
+                                        )
+                                else:
+                                    slot_size = self._group_layout_descs[
+                                        group_index
+                                    ].shapes[0][0]
+                                    for raw_chunk in raw_chunks:
+                                        payload = (
+                                            self._kvweave_codec.serialize_tensor(
+                                                raw_chunk
+                                            )
+                                        )
+                                        destination = torch.empty(
+                                            (slot_size,), dtype=torch.uint8
+                                        )
+                                        _copy_bytes_to_tensor(payload, destination)
+                                        gather_target.append(destination)
+                            else:
+                                gather_target.extend(raw_chunks)
                             group_offset += num_group_chunks
 
                         gather_done = torch_dev.Event()
