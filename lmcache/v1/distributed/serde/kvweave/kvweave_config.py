@@ -2,13 +2,170 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import count
+import os
 import threading
-from typing import ClassVar, Optional
+from typing import Any, ClassVar, Optional
 
 import numpy as np
 import torch
+
+from lmcache.logging import init_logger
+
+logger = init_logger(__name__)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Parse a conventional boolean environment flag."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_scaling_method(name: str, default: str) -> str:
+    """Read and validate a KVWeave scaling-method environment variable."""
+    value = os.environ.get(name, default)
+    valid = {"per_tensor", "per_channel", "per_token"}
+    if value not in valid:
+        raise ValueError(f"{name}={value!r} is not one of {sorted(valid)}")
+    return value
+
+
+@dataclass(frozen=True)
+class MambaCodecOptions:
+    """Resolved per-substate quantization parameters for Mamba groups.
+
+    ``conv``/``ssm`` scaling and randomized-Hadamard (``rh``) settings are
+    independently configurable; ``asym`` is shared by both sub-states. See
+    ``env_vars.md`` for the full environment variable reference.
+    """
+
+    conv_scaling_method: str
+    conv_rh: bool
+    ssm_scaling_method: str
+    ssm_rh: bool
+    asym: bool
+    conv_qbit: int = 4
+    ssm_qbit: int = 16
+    conv_quant_enabled: bool = True
+    ssm_quant_enabled: bool = True
+
+    @classmethod
+    def from_env(cls) -> "MambaCodecOptions":
+        """Resolve Mamba conv/ssm quantization options from the environment.
+
+        ``LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD`` and
+        ``SSM_SCALING_METHOD`` have independent defaults
+        (``per_channel``), not derived from ``LINEAR_*``. ``CONV_RH`` still
+        falls back to ``LINEAR_RH`` while ``SSM_RH`` defaults to ``true``. A
+        conv ``rh=True`` combined with ``per_tensor``/
+        ``per_channel`` scaling disables RH while preserving the requested
+        scaling method, because the transform length is not guaranteed to be
+        a power of two.
+
+        ``LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED``/``SSM_QUANT_ENABLED``
+        (DEBUG ONLY, default ``true``) independently disable
+        quantization for one sub-state while leaving the other quantized --
+        for isolating which sub-state's quantization causes an accuracy
+        regression.
+        """
+        _env_scaling_method(
+            "LMCACHE_MP_KVWEAVE_LINEAR_SCALING_METHOD", "per_tensor"
+        )
+        linear_rh = _env_flag("LMCACHE_MP_KVWEAVE_LINEAR_RH", False)
+        conv_scaling = _env_scaling_method(
+            "LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD", "per_channel"
+        )
+        conv_rh = _env_flag("LMCACHE_MP_KVWEAVE_CONV_RH", linear_rh)
+        if conv_rh and conv_scaling in {"per_tensor", "per_channel"}:
+            logger.info(
+                "LMCACHE_MP_KVWEAVE_CONV_RH=1 requires scaling_method="
+                "per_token; disabling RH while preserving "
+                "scaling_method=%s",
+                conv_scaling,
+            )
+            conv_rh = False
+        return cls(
+            conv_scaling_method=conv_scaling,
+            conv_rh=conv_rh,
+            ssm_scaling_method=_env_scaling_method(
+                "LMCACHE_MP_KVWEAVE_SSM_SCALING_METHOD", "per_channel"
+            ),
+            ssm_rh=_env_flag("LMCACHE_MP_KVWEAVE_SSM_RH", True),
+            asym=_env_flag("LMCACHE_MP_KVWEAVE_LINEAR_ASYM", True),
+            conv_qbit=int(os.environ.get("LMCACHE_MP_KVWEAVE_CONV_QBIT", "4")),
+            ssm_qbit=int(os.environ.get("LMCACHE_MP_KVWEAVE_SSM_QBIT", "16")),
+            conv_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED", True
+            ),
+            ssm_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_SSM_QUANT_ENABLED", True
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class KVWeaveRuntimeConfig:
+    """Fully resolved L1 KVWeave quantization configuration for one worker.
+
+    The single entry point for every ``LMCACHE_MP_L1_KVWEAVE_QUANT``/
+    ``LMCACHE_MP_KVWEAVE_*`` environment variable (see ``env_vars.md``):
+    callers should read the environment exactly once via :meth:`from_env`
+    and thread the resolved values through, rather than reaching for
+    ``os.environ`` themselves.
+    """
+
+    enabled: bool
+    linear_quant_enabled: bool
+    linear_max_size_ratio: float
+    attention_codec_kwargs: dict[str, Any] = field(default_factory=dict)
+    mamba_options: MambaCodecOptions = field(
+        default_factory=lambda: MambaCodecOptions(
+            conv_scaling_method="per_channel",
+            conv_rh=False,
+            ssm_scaling_method="per_channel",
+            ssm_rh=True,
+            asym=True,
+            conv_qbit=4,
+            ssm_qbit=16,
+        )
+    )
+
+    @classmethod
+    def from_env(cls) -> "KVWeaveRuntimeConfig":
+        """Resolve the full L1 KVWeave runtime configuration from the environment.
+
+        ``enabled`` (``LMCACHE_MP_L1_KVWEAVE_QUANT``) is the overall switch;
+        ``linear_quant_enabled`` (``LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED``,
+        default ``true``) independently gates Mamba/linear groups under it.
+        ``attention_codec_kwargs`` is ready to pass straight into
+        ``KVWeaveCodec(...)``.
+        """
+        enabled = _env_flag("LMCACHE_MP_L1_KVWEAVE_QUANT", False)
+        return cls(
+            enabled=enabled,
+            linear_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED", True
+            ),
+            linear_max_size_ratio=float(
+                os.environ.get("LMCACHE_MP_KVWEAVE_LINEAR_MAX_SIZE_RATIO", "1.20")
+            ),
+            attention_codec_kwargs={
+                "quantize": True,
+                "qbit": 4,
+                "num_kv_heads": int(
+                    os.environ.get("LMCACHE_MP_KVWEAVE_NUM_KV_HEADS", "1")
+                ),
+                "head_dim": int(os.environ.get("LMCACHE_MP_KVWEAVE_HEAD_DIM", "0")),
+                "scaling_method": os.environ.get(
+                    "LMCACHE_MP_KVWEAVE_SCALING_METHOD", "per_channel"
+                ),
+                "precond": _env_flag("LMCACHE_MP_KVWEAVE_PRECOND", False),
+            },
+            mamba_options=MambaCodecOptions.from_env(),
+        )
 
 
 @dataclass

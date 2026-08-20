@@ -18,6 +18,7 @@ from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     IPCEvent,
     _copy_bytes_to_tensor,
+    _safe_gather_block_ids,
 )
 
 logger = init_logger(__name__)
@@ -26,7 +27,6 @@ logger = init_logger(__name__)
 # async engine-driven store path. >1 so that a slow gather for one store does
 # not block the commit of another store whose gather already finished.
 DEFAULT_ENGINE_DRIVEN_COMMIT_WORKERS = 4
-
 
 # TODO: async retrieve path TBD, but benefit might be very limited
 class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
@@ -262,77 +262,151 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                 len(group_block_ids) // group_blocks_in_chunk
                             )
                             quantized = self._group_is_quantized(group_index)
-                            if out_buffers is not None and not quantized:
-                                group_out = out_buffers[
-                                    group_offset : group_offset + num_group_chunks
+                            if chunk_indices is None:
+                                group_chunk_indices = None
+                                group_out_buffers = (
+                                    out_buffers[
+                                        group_offset : group_offset + num_group_chunks
+                                    ]
+                                    if out_buffers is not None
+                                    else None
+                                )
+                            else:
+                                selected = [
+                                    (out_idx, chunk_idx - group_offset)
+                                    for out_idx, chunk_idx in enumerate(chunk_indices)
+                                    if group_offset
+                                    <= chunk_idx
+                                    < group_offset + num_group_chunks
                                 ]
+                                group_chunk_indices = [
+                                    chunk_idx for _, chunk_idx in selected
+                                ]
+                                group_out_buffers = (
+                                    [out_buffers[out_idx] for out_idx, _ in selected]
+                                    if out_buffers is not None
+                                    else None
+                                )
+                            selected_count = (
+                                len(group_chunk_indices)
+                                if group_chunk_indices is not None
+                                else num_group_chunks
+                            )
+                            if group_out_buffers is not None and not quantized:
+                                group_out = group_out_buffers
                                 used_shm_direct = True
                             else:
-                                shape = self.group_chunk_shape(group_info)
-                                dtype = engine_driven_context.layout_desc.dtypes[0]
+                                raw_layout = (
+                                    self._group_raw_layout_descs[group_index]
+                                    if group_index < len(self._group_raw_layout_descs)
+                                    else engine_driven_context.layout_desc
+                                )
+                                shape = raw_layout.shapes[0]
+                                dtype = raw_layout.dtypes[0]
                                 group_out = self._alloc_pinned_staging(
-                                    shape, dtype, num_group_chunks
+                                    shape, dtype, selected_count
                                 )
                                 if not quantized:
                                     staged_chunks.extend(group_out)
-                            group_chunk_indices = (
-                                [
-                                    idx - group_offset
-                                    for idx in chunk_indices
-                                    if group_offset
-                                    <= idx
-                                    < group_offset + num_group_chunks
+                            is_mamba_group = (
+                                group_info is not None
+                                and group_info.cache_category == "mamba"
+                            )
+                            selected_group_block_ids = (
+                                group_block_ids
+                                if group_chunk_indices is None
+                                else [
+                                    block_id
+                                    for chunk_index in group_chunk_indices
+                                    for block_id in group_block_ids[
+                                        chunk_index * group_blocks_in_chunk :
+                                        (chunk_index + 1) * group_blocks_in_chunk
+                                    ]
                                 ]
-                                if chunk_indices is not None
-                                else None
                             )
-                            raw_chunks = gather_paged_kv_to_cpu(
-                                group_kv_caches,
-                                group_block_ids,
-                                group_blocks_in_chunk,
-                                layout_hints=self._layout_hints,
-                                # Hybrid groups may carry different
-                                # concrete KV formats. Discover format
-                                # per group from group_kv_caches.
-                                engine_kv_format=None,
-                                out=group_out,
-                                chunk_indices=group_chunk_indices,
-                            )
+                            gather_block_ids = group_block_ids
+                            if is_mamba_group:
+                                gather_block_ids, safe_block_id = _safe_gather_block_ids(
+                                    selected_group_block_ids
+                                )
+                                if safe_block_id is None:
+                                    raw_layout = (
+                                        self._group_raw_layout_descs[group_index]
+                                        if group_index
+                                        < len(self._group_raw_layout_descs)
+                                        else engine_driven_context.layout_desc
+                                    )
+                                    selected_count = (
+                                        len(group_chunk_indices)
+                                        if group_chunk_indices is not None
+                                        else num_group_chunks
+                                    )
+                                    raw_chunks = self._alloc_pinned_staging(
+                                        raw_layout.shapes[0],
+                                        raw_layout.dtypes[0],
+                                        selected_count,
+                                    )
+                                else:
+                                    raw_chunks = None
+                            else:
+                                raw_chunks = None
+                            if raw_chunks is None:
+                                raw_chunks = gather_paged_kv_to_cpu(
+                                    group_kv_caches,
+                                    gather_block_ids,
+                                    group_blocks_in_chunk,
+                                    layout_hints=self._layout_hints,
+                                    engine_kv_format=None,
+                                    out=group_out,
+                                    chunk_indices=(
+                                        None if is_mamba_group else group_chunk_indices
+                                    ),
+                                )
+                            # The gather above may enqueue an async D2H copy into
+                            # pinned staging buffers. CPU-side KVWeave encode must
+                            # not read those buffers until the copy has completed.
+                            torch_dev.synchronize()
                             if quantized:
                                 if self._kvweave_codec is None:
                                     raise RuntimeError(
                                         "KVWeave codec is not initialized"
                                     )
-                                self._release_staging(raw_chunks)
-                                if out_buffers is not None:
-                                    group_shm = out_buffers[
-                                        group_offset : group_offset
-                                        + num_group_chunks
-                                    ]
+                                category = self._group_cache_categories[group_index]
+                                mamba_layout = self._group_mamba_layouts[group_index]
+                                tokens_per_block = self._group_tokens_per_block[
+                                    group_index
+                                ]
+                                if group_out_buffers is not None:
+                                    group_shm = group_out_buffers
                                     for raw_chunk, destination in zip(
                                         raw_chunks, group_shm, strict=True
                                     ):
-                                        _copy_bytes_to_tensor(
-                                            self._kvweave_codec.serialize_tensor(
-                                                raw_chunk
-                                            ),
-                                            destination,
+                                        payload = self._kvweave_codec.encode_chunk(
+                                            category,
+                                            mamba_layout,
+                                            tokens_per_block,
+                                            self._mamba_codec_options,
+                                            raw_chunk,
                                         )
+                                        _copy_bytes_to_tensor(payload, destination)
                                 else:
                                     slot_size = self._group_layout_descs[
                                         group_index
                                     ].shapes[0][0]
                                     for raw_chunk in raw_chunks:
-                                        payload = (
-                                            self._kvweave_codec.serialize_tensor(
-                                                raw_chunk
-                                            )
+                                        payload = self._kvweave_codec.encode_chunk(
+                                            category,
+                                            mamba_layout,
+                                            tokens_per_block,
+                                            self._mamba_codec_options,
+                                            raw_chunk,
                                         )
                                         destination = torch.empty(
                                             (slot_size,), dtype=torch.uint8
                                         )
                                         _copy_bytes_to_tensor(payload, destination)
                                         gather_target.append(destination)
+                                self._release_staging(raw_chunks)
                             else:
                                 gather_target.extend(raw_chunks)
                             group_offset += num_group_chunks

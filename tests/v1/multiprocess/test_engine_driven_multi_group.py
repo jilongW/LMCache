@@ -13,8 +13,16 @@ import torch
 
 # First Party
 from lmcache.v1.distributed.api import MemoryLayoutDesc
-from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.distributed.serde.kvweave.kvweave_serde import (
+    MambaChunkSplit,
+    _KVWeaveCodec,
+)
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo, MambaSubStateWireLayout
 from lmcache.v1.multiprocess.transfer_context import worker_transfer
+from lmcache.v1.multiprocess.transfer_context.base import (
+    gather_paged_kv_to_cpu,
+    scatter_cpu_to_paged_kv,
+)
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
 )
@@ -267,6 +275,31 @@ def test_submit_retrieve_scatters_chunks_group_major(
     assert torch.allclose(destination["layer_2"][:, 7], kv_caches["layer_2"][:, 5])
 
 
+def test_submit_retrieve_skips_all_null_destination_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mamba null pages must not receive retrieved data or shift later groups."""
+    ctx, fake_context = _register_two_group_context(monkeypatch)
+    kv_caches = _make_kv_caches(4, num_blocks=8, block_size=4, num_heads=2, head_size=8)
+
+    store_future = ctx.submit_store(
+        "req", MagicMock(), 1, kv_caches, [[1, 2], [4, 5]], MagicMock(), 2
+    )
+    assert store_future.result() is True
+    fake_context.retrieve_chunks = fake_context.committed_chunks
+
+    destination = {name: torch.zeros_like(tensor) for name, tensor in kv_caches.items()}
+    retrieve_future = ctx.submit_retrieve(
+        "req", MagicMock(), 1, destination, [[0, 0], [6, 7]], MagicMock(), 2
+    )
+
+    assert retrieve_future.result() is True
+    assert torch.count_nonzero(destination["layer_0"]) == 0
+    assert torch.count_nonzero(destination["layer_1"]) == 0
+    assert torch.allclose(destination["layer_2"][:, 6], kv_caches["layer_2"][:, 4])
+    assert torch.allclose(destination["layer_2"][:, 7], kv_caches["layer_2"][:, 5])
+
+
 def test_submit_store_narrows_shm_out_buffers_to_group_chunk_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -403,3 +436,361 @@ def test_submit_store_retrieve_round_trips_kvweave_quantized_groups(
     assert torch.max(
         torch.abs(destination["layer_1"] - kv_caches["layer_1"])
     ) < 1.0
+
+
+def _mamba_group_layout() -> tuple[MambaSubStateWireLayout, MambaSubStateWireLayout]:
+    """Conv/ssm byte layout for a 128-hidden, fp32, single-token-per-block
+    Mamba page (page_bytes = 2*1*128*4 = 1024): conv takes the first 128
+    bytes (32 fp32 elements), ssm the remaining 896 (224 fp32 elements)."""
+    return (
+        MambaSubStateWireLayout(0, 128, "torch.float32", (32,)),
+        MambaSubStateWireLayout(128, 896, "torch.float32", (224,)),
+    )
+
+
+def test_submit_store_retrieve_round_trips_mamba_group_without_corruption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for the bug where a Mamba group's opaque page-view
+    chunk was quantized through the attention KVWeave codec (silently
+    corrupting conv/ssm state) instead of Phase 4's dedicated Mamba codec.
+
+    The primary assertion is behavioral (which codec method gets called for
+    the Mamba group), not a numeric error threshold: a per-channel attention
+    codec quantizes finely enough that a same-process quantize-then-
+    dequantize round trip can still land within a numeric tolerance even
+    when it is semantically the wrong codec (tried several adversarial
+    magnitude constructions and none reliably discriminated correct from
+    buggy dispatch without becoming coupled to unrelated codec internals
+    like per-channel scale granularity or randomized-Hadamard preconditioning
+    precision floors — see the investigation notes in MIGRATION_PLAN.md
+    Phase 6). Asserting the call site directly is the robust, deterministic
+    way to verify this dispatch decision, consistent with this repo's
+    existing convention of preferring observable-behavior assertions over
+    accessing private state (see Phase 1's test notes)."""
+    monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", "1")
+    fake_context = _FakeEngineDrivenContext()
+    monkeypatch.setattr(
+        worker_transfer, "create_engine_driven_context", lambda *a, **k: fake_context
+    )
+    future = MagicMock()
+    future.result.return_value = MagicMock(shm_name="", pool_size=0)
+
+    split_spy = MagicMock(wraps=_KVWeaveCodec.split_mamba_chunk)
+    merge_spy = MagicMock(wraps=_KVWeaveCodec.merge_mamba_chunk)
+    serialize_spy = MagicMock(wraps=_KVWeaveCodec.serialize_tensor)
+    monkeypatch.setattr(_KVWeaveCodec, "split_mamba_chunk", split_spy)
+    monkeypatch.setattr(_KVWeaveCodec, "merge_mamba_chunk", merge_spy)
+    monkeypatch.setattr(_KVWeaveCodec, "serialize_tensor", serialize_spy)
+
+    ctx = EngineDrivenTransferContext()
+    kv_caches = _make_kv_caches(
+        2, num_blocks=65, block_size=1, num_heads=1, head_size=128
+    )
+    mamba_layout = _mamba_group_layout()
+    groups = [
+        EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=(0, 1),
+            tokens_per_block=1,
+            cache_category="mamba",
+            mamba_real_layout=mamba_layout,
+        )
+    ]
+    ctx.register(
+        instance_id=1,
+        kv_caches=kv_caches,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=64,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=groups,
+    )
+
+    store_future = ctx.submit_store(
+        "req", MagicMock(), 1, kv_caches, [list(range(1, 65))], MagicMock(), 64
+    )
+    assert store_future.result() is True
+    assert fake_context.committed_chunks is not None
+    raw_nbytes = kv_caches["layer_0"].numel() * kv_caches["layer_0"].element_size()
+    for chunk in fake_context.committed_chunks:
+        assert chunk.dtype == torch.uint8
+        conv_payload, ssm_payload = _KVWeaveCodec.unpack_mamba_payloads(
+            _KVWeaveCodec._tensor_bytes(chunk)
+        )
+        assert 8 + len(conv_payload) + len(ssm_payload) < raw_nbytes
+
+    fake_context.retrieve_chunks = fake_context.committed_chunks
+    destination = {name: torch.zeros_like(tensor) for name, tensor in kv_caches.items()}
+    retrieve_future = ctx.submit_retrieve(
+        "req", MagicMock(), 1, destination, [list(range(1, 65))], MagicMock(), 64
+    )
+    assert retrieve_future.result() is True
+
+    # The Mamba group must go through Phase 4's dedicated split/merge codec,
+    # never through the generic attention serialize_tensor -- this is what
+    # the pre-fix code got backwards (it called serialize_tensor on every
+    # quantized group regardless of cache_category).
+    assert split_spy.call_count >= 1
+    assert merge_spy.call_count >= 1
+    assert serialize_spy.call_count == 0
+
+    # Sanity check: the correct codec's round trip is still numerically
+    # faithful (bounded 4-bit quantization error), not just "some codec ran".
+    retrieved_raw_chunks = gather_paged_kv_to_cpu(destination, list(range(1, 65)), 64)
+    original_raw_chunks = gather_paged_kv_to_cpu(kv_caches, list(range(1, 65)), 64)
+    retrieved_split = _KVWeaveCodec.split_mamba_chunk(
+        retrieved_raw_chunks[0], mamba_layout, block_size=1
+    )
+    original_split = _KVWeaveCodec.split_mamba_chunk(
+        original_raw_chunks[0], mamba_layout, block_size=1
+    )
+    assert torch.max(torch.abs(retrieved_split.conv - original_split.conv)) < 1.0
+    assert torch.max(torch.abs(retrieved_split.ssm - original_split.ssm)) < 1.0
+
+
+def test_submit_retrieve_mamba_skip_first_n_tokens_survives_leading_null_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: a leading all-null Mamba chunk must not desync
+    ``skip_first_n_tokens`` from the real chunk that follows it.
+
+    ``submit_retrieve`` used to drop leading all-null chunks from
+    ``group_block_ids``/``group_chunks`` before handing them to
+    ``_scatter_non_null_mamba_chunks``, but that helper's internal
+    ``block_ordinal`` counter (compared against
+    ``skip_first_n_tokens // block_size``) assumes it is walking the
+    *original*, uncompacted block sequence. Dropping the leading null chunk
+    shifted every later block's ordinal down, so a nonzero
+    ``skip_first_n_tokens`` sized to skip only the null chunk would also
+    skip the first real block after it -- silently leaving that Mamba
+    state block never written (stale/garbage device memory) instead of
+    corrupting it with a small numeric error.
+    """
+    monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", "1")
+    fake_context = _FakeEngineDrivenContext()
+    monkeypatch.setattr(
+        worker_transfer, "create_engine_driven_context", lambda *a, **k: fake_context
+    )
+    future = MagicMock()
+    future.result.return_value = MagicMock(shm_name="", pool_size=0)
+
+    ctx = EngineDrivenTransferContext()
+    kv_caches = _make_kv_caches(
+        2, num_blocks=8, block_size=1, num_heads=1, head_size=128
+    )
+    mamba_layout = _mamba_group_layout()
+    groups = [
+        EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=(0, 1),
+            tokens_per_block=1,
+            cache_category="mamba",
+            mamba_real_layout=mamba_layout,
+        )
+    ]
+    ctx.register(
+        instance_id=1,
+        kv_caches=kv_caches,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=groups,
+    )
+
+    # Store real state for blocks 5 and 6 (chunk 0 = [0, 0] null padding,
+    # chunk 1 = [5, 6] real blocks).
+    store_future = ctx.submit_store(
+        "req", MagicMock(), 1, kv_caches, [[0, 0, 5, 6]], MagicMock(), 2
+    )
+    assert store_future.result() is True
+    fake_context.retrieve_chunks = fake_context.committed_chunks
+
+    # Retrieve with skip_first_n_tokens sized to skip exactly the leading
+    # null chunk (2 tokens = 1 block_size each): the real blocks 5 and 6
+    # must still be written, not skipped as a side effect of the null
+    # chunk being dropped before the ordinal count.
+    destination = {name: torch.zeros_like(tensor) for name, tensor in kv_caches.items()}
+    retrieve_future = ctx.submit_retrieve(
+        "req", MagicMock(), 1, destination, [[0, 0, 5, 6]], MagicMock(), 2,
+        skip_first_n_tokens=2,
+    )
+    assert retrieve_future.result() is True
+
+    for name in kv_caches:
+        assert torch.count_nonzero(destination[name][:, 5]) > 0, (
+            f"{name} block 5 was never written back (skip desync bug)"
+        )
+        assert torch.count_nonzero(destination[name][:, 6]) > 0, (
+            f"{name} block 6 was never written back (skip desync bug)"
+        )
+        assert torch.max(
+            torch.abs(destination[name][:, 5] - kv_caches[name][:, 5])
+        ) < 1.0
+        assert torch.max(
+            torch.abs(destination[name][:, 6] - kv_caches[name][:, 6])
+        ) < 1.0
+
+
+def test_register_leaves_mamba_group_unquantized_without_real_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Mamba group with cache_category='mamba' but no mamba_real_layout
+    (e.g. the engine could not compute it) must never be quantized -- there
+    is no safe way to split it into conv/ssm, so silently falling back to
+    the attention codec (the original bug) or crashing are both wrong."""
+    monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", "1")
+    fake_context = _FakeEngineDrivenContext()
+    monkeypatch.setattr(
+        worker_transfer, "create_engine_driven_context", lambda *a, **k: fake_context
+    )
+    future = MagicMock()
+    future.result.return_value = MagicMock(shm_name="", pool_size=0)
+
+    ctx = EngineDrivenTransferContext()
+    kv_caches = _make_kv_caches(
+        2, num_blocks=64, block_size=1, num_heads=1, head_size=128
+    )
+    groups = [
+        EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=(0, 1),
+            tokens_per_block=1,
+            cache_category="mamba",
+            mamba_real_layout=None,
+        )
+    ]
+    ctx.register(
+        instance_id=1,
+        kv_caches=kv_caches,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=64,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=groups,
+    )
+
+    assert ctx._group_layout_descs[0].dtypes != [torch.uint8]
+
+
+def test_register_sends_group_layouts_when_all_groups_are_raw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", "1")
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED", "0")
+    fake_context = _FakeEngineDrivenContext()
+    monkeypatch.setattr(
+        worker_transfer, "create_engine_driven_context", lambda *a, **k: fake_context
+    )
+    future = MagicMock()
+    future.result.return_value = MagicMock(shm_name="", pool_size=0)
+    send_request = MagicMock(return_value=future)
+    kv_caches = _make_kv_caches(
+        4, num_blocks=64, block_size=1, num_heads=1, head_size=128
+    )
+    groups = [
+        EngineGroupInfo(
+            engine_group_id=group_id,
+            layer_indices=layer_indices,
+            tokens_per_block=1,
+            cache_category="mamba",
+            mamba_real_layout=_mamba_group_layout(),
+        )
+        for group_id, layer_indices in enumerate(((0, 1), (2, 3)))
+    ]
+
+    ctx = EngineDrivenTransferContext()
+    ctx.register(
+        instance_id=1,
+        kv_caches=kv_caches,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=64,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=send_request,
+        engine_group_infos=groups,
+    )
+
+    payload = send_request.call_args.args[2][0]
+    assert payload.enable_l1_kvweave_quant is False
+    assert payload.group_layout_descs is not None
+    assert len(payload.group_layout_descs) == 2
+
+
+def test_submit_store_hybrid_attention_and_mamba_groups_independently_quantized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hybrid registration with one attention group and one Mamba group:
+    each group's quantize-or-not decision and codec must be independent --
+    neither group's classification should affect the other's."""
+    monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", "1")
+    fake_context = _FakeEngineDrivenContext()
+    monkeypatch.setattr(
+        worker_transfer, "create_engine_driven_context", lambda *a, **k: fake_context
+    )
+    future = MagicMock()
+    future.result.return_value = MagicMock(shm_name="", pool_size=0)
+
+    ctx = EngineDrivenTransferContext()
+    kv_caches = _make_kv_caches(
+        4, num_blocks=65, block_size=1, num_heads=1, head_size=128
+    )
+    mamba_layout = _mamba_group_layout()
+    groups = [
+        EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=(0, 1),
+            tokens_per_block=1,
+            cache_category="attention",
+        ),
+        EngineGroupInfo(
+            engine_group_id=1,
+            layer_indices=(2, 3),
+            tokens_per_block=1,
+            cache_category="mamba",
+            mamba_real_layout=mamba_layout,
+        ),
+    ]
+    ctx.register(
+        instance_id=1,
+        kv_caches=kv_caches,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=64,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=groups,
+    )
+    assert ctx._group_layout_descs[0].dtypes == [torch.uint8]
+    assert ctx._group_layout_descs[1].dtypes == [torch.uint8]
+
+    store_future = ctx.submit_store(
+        "req", MagicMock(), 1, kv_caches, [list(range(64)), list(range(1, 65))],
+        MagicMock(), 64,
+    )
+    assert store_future.result() is True
+    assert fake_context.committed_chunks is not None
+    for chunk in fake_context.committed_chunks:
+        assert chunk.dtype == torch.uint8
+
+    fake_context.retrieve_chunks = fake_context.committed_chunks
+    destination = {name: torch.zeros_like(tensor) for name, tensor in kv_caches.items()}
+    retrieve_future = ctx.submit_retrieve(
+        "req", MagicMock(), 1, destination, [list(range(64)), list(range(1, 65))],
+        MagicMock(), 64,
+    )
+    assert retrieve_future.result() is True
+    for name in kv_caches:
+        if name in {"layer_2", "layer_3"}:
+            assert torch.isfinite(destination[name][1:]).all()
+        else:
+            assert torch.isfinite(destination[name][:64]).all()

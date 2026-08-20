@@ -13,6 +13,9 @@ import pytest
 import torch
 
 # First Party
+from lmcache.v1.distributed.serde.kvweave.kvweave_serde import _KVWeaveCodec
+from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo, MambaSubStateWireLayout
 from lmcache.v1.multiprocess.transfer_context import (
     async_engine_driven,
     worker_transfer,
@@ -165,6 +168,62 @@ def test_submit_store_commit_waits_for_gather_done(
     gather_gate.set()
     assert future.result(timeout=1) is True
     assert commit_called.is_set()
+    ctx.close()
+
+
+def test_submit_store_maps_sparse_shm_slot_to_later_mamba_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compressed out-buffer list must be indexed through chunk_indices."""
+    gather_gate = threading.Event()
+    gather_gate.set()
+    committed: dict[str, list[torch.Tensor]] = {}
+    ctx = _new_context(
+        monkeypatch,
+        gather_gate=gather_gate,
+        commit_impl=lambda chunks: committed.update(chunks=chunks) or True,
+    )
+    slot = torch.zeros(2, 1, 1, 512)
+    assert ctx._engine_driven_context is not None
+    ctx._engine_driven_context.prepare_result = ([slot], [1])  # type: ignore[attr-defined]
+    ctx._engine_group_infos = [
+        EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=(0,),
+            tokens_per_block=1,
+            cache_category="attention",
+        ),
+        EngineGroupInfo(
+            engine_group_id=1,
+            layer_indices=(1,),
+            tokens_per_block=1,
+            cache_category="mamba",
+        ),
+    ]
+    attention_layout = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 1, 1, 1024])], dtypes=[torch.float32]
+    )
+    mamba_layout = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 1, 1, 512])], dtypes=[torch.float32]
+    )
+    ctx._group_raw_layout_descs = [attention_layout, mamba_layout]
+    ctx._group_layout_descs = [attention_layout, mamba_layout]
+    ctx._block_size = 1
+    ctx._num_layers = 2
+
+    future = ctx.submit_store(
+        "r1",
+        object(),
+        1,
+        {"attention": torch.zeros(1), "mamba": torch.zeros(1)},
+        [[1], [1]],
+        _FakeEvent(gather_gate),
+        1,
+    )
+
+    assert future.result(timeout=1) is True
+    assert committed["chunks"] == [slot]
+    assert torch.count_nonzero(slot == 1).item() == slot.numel()
     ctx.close()
 
 
@@ -552,4 +611,104 @@ def test_async_submit_store_quantizes_then_submit_retrieve_dequantizes(
     for name in kv_caches:
         assert torch.max(torch.abs(destination[name] - kv_caches[name])) < 1.0
     ctx.close()
+    ctx.close()
+
+
+def test_async_submit_store_dispatches_mamba_group_to_dedicated_codec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirrors the sync-path regression test: the async store path's own
+    gather loop (which does not reuse the base class's submit_store) must
+    also route a Mamba group through Phase 4's dedicated split/merge codec,
+    never through the generic attention serialize_tensor -- that mismatch
+    silently corrupts conv/ssm state and was the root cause of hybrid models
+    producing garbled output with LMCACHE_MP_L1_KVWEAVE_QUANT=1.
+
+    Asserts the call site (which codec method ran), not a numeric error
+    threshold -- see the sync-path test's docstring for why a numeric
+    threshold does not reliably discriminate correct from buggy dispatch
+    here (per-channel attention scaling adapts finely enough that a
+    same-process round trip can still land within a naive tolerance)."""
+    monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", "1")
+    gather_gate = threading.Event()
+    gather_gate.set()
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
+
+    split_spy = MagicMock(wraps=_KVWeaveCodec.split_mamba_chunk)
+    merge_spy = MagicMock(wraps=_KVWeaveCodec.merge_mamba_chunk)
+    serialize_spy = MagicMock(wraps=_KVWeaveCodec.serialize_tensor)
+    monkeypatch.setattr(_KVWeaveCodec, "split_mamba_chunk", split_spy)
+    monkeypatch.setattr(_KVWeaveCodec, "merge_mamba_chunk", merge_spy)
+    monkeypatch.setattr(_KVWeaveCodec, "serialize_tensor", serialize_spy)
+
+    committed: dict[str, list[torch.Tensor]] = {}
+    fake_context = _FakeStoreRetrieveContext(
+        commit_impl=lambda chunks: committed.update(chunks=chunks) or True
+    )
+
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    kv_caches = {f"layer_{i}": torch.randn(2, 64, 1, 1, 128) for i in range(2)}
+    mamba_layout = (
+        MambaSubStateWireLayout(0, 128, "torch.float32", (32,)),
+        MambaSubStateWireLayout(128, 896, "torch.float32", (224,)),
+    )
+    future = MagicMock()
+    future.result.return_value = MagicMock(shm_name="", pool_size=0)
+    monkeypatch.setattr(
+        worker_transfer,
+        "create_engine_driven_context",
+        lambda *a, **k: fake_context,
+    )
+    ctx.register(
+        instance_id=1,
+        kv_caches=kv_caches,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=64,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=MagicMock(return_value=future),
+        engine_group_infos=[
+            EngineGroupInfo(
+                engine_group_id=0,
+                layer_indices=(0, 1),
+                tokens_per_block=1,
+                cache_category="mamba",
+                mamba_real_layout=mamba_layout,
+            )
+        ],
+    )
+    fake_context.layout_desc = SimpleNamespace(
+        shapes=[torch.Size([2, 2, 64, 128])], dtypes=[torch.float32]
+    )
+
+    store_future = ctx.submit_store(
+        "r1",
+        object(),
+        1,
+        kv_caches,
+        [list(range(64))],
+        _FakeEvent(gather_gate),
+        64,
+    )
+    assert store_future.result(timeout=1) is True
+    assert "chunks" in committed
+    raw_nbytes = kv_caches["layer_0"].numel() * kv_caches["layer_0"].element_size()
+    for chunk in committed["chunks"]:
+        assert chunk.dtype == torch.uint8
+        conv_payload, ssm_payload = _KVWeaveCodec.unpack_mamba_payloads(
+            _KVWeaveCodec._tensor_bytes(chunk)
+        )
+        assert 8 + len(conv_payload) + len(ssm_payload) < raw_nbytes
+
+    fake_context.retrieve_chunks = committed["chunks"]
+    destination = {name: torch.zeros_like(tensor) for name, tensor in kv_caches.items()}
+    retrieve_future = ctx.submit_retrieve(
+        "r1", object(), 1, destination, [list(range(64))], _FakeEvent(gather_gate), 64
+    )
+    assert retrieve_future.result(timeout=1) is True
+
+    assert split_spy.call_count >= 1
+    assert merge_spy.call_count >= 1
+    assert serialize_spy.call_count == 0
     ctx.close()

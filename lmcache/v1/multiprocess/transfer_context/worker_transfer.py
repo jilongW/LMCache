@@ -15,14 +15,18 @@ import torch
 from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
-from lmcache.v1.distributed.serde.kvweave import KVWeaveCodec
+from lmcache.v1.distributed.serde.kvweave import (
+    KVWeaveCodec,
+    KVWeaveRuntimeConfig,
+    MambaCodecOptions,
+)
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     RegisterEngineDrivenContextPayload,
     serialize_memory_layout_desc,
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
-from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo, MambaSubStateWireLayout
 from lmcache.v1.multiprocess.mq import MessageQueueClient
 from lmcache.v1.multiprocess.protocol import RequestType
 from lmcache.v1.multiprocess.protocols.engine import RegisterEngineDrivenContextResponse
@@ -200,6 +204,54 @@ def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
             "engine-driven transfer does not support hybrid KV cache groups"
         )
     return block_ids[0]
+
+
+def _safe_gather_block_ids(block_ids: list[int]) -> tuple[list[int], int | None]:
+    """Replace null Mamba block IDs for a read, preserving their positions."""
+    safe_id = next((block_id for block_id in block_ids if block_id != 0), None)
+    if safe_id is None:
+        return list(block_ids), None
+    return [safe_id if block_id == 0 else block_id for block_id in block_ids], safe_id
+
+
+def _scatter_non_null_mamba_chunks(
+    kv_caches: dict[str, torch.Tensor],
+    block_ids: list[int],
+    chunks: list[torch.Tensor],
+    blocks_per_chunk: int,
+    block_size: int,
+    layout_hints: LayoutHints | None,
+    skip_first_n_tokens: int,
+) -> None:
+    """Scatter only real Mamba pages; null IDs never reach the H2D kernel."""
+    skip_blocks = skip_first_n_tokens // block_size
+    block_ordinal = 0
+    for chunk_index, chunk in enumerate(chunks):
+        ids = block_ids[
+            chunk_index * blocks_per_chunk : (chunk_index + 1) * blocks_per_chunk
+        ]
+        for block_index, block_id in enumerate(ids):
+            if block_id == 0:
+                block_ordinal += 1
+                continue
+            written = block_ordinal >= skip_blocks
+            if written:
+                start = block_index * block_size
+                end = start + block_size
+                block_chunk = (
+                    chunk[:, :, start:end, :]
+                    if chunk.dim() == 4
+                    else chunk[:, start:end, :]
+                ).contiguous()
+                scatter_cpu_to_paged_kv(
+                    kv_caches,
+                    [block_id],
+                    [block_chunk],
+                    1,
+                    layout_hints=layout_hints,
+                    engine_kv_format=None,
+                )
+            block_ordinal += 1
 
 
 def _kv_caches_for_group(
@@ -816,6 +868,12 @@ class EngineDrivenTransferContext(TransferContext):
         self._kvweave_quant_enabled = False
         self._group_layout_descs: list[MemoryLayoutDesc] = []
         self._group_raw_layout_descs: list[MemoryLayoutDesc] = []
+        self._group_cache_categories: list[str] = []
+        self._group_mamba_layouts: list[
+            tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None
+        ] = []
+        self._group_tokens_per_block: list[int] = []
+        self._mamba_codec_options: MambaCodecOptions | None = None
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -873,6 +931,10 @@ class EngineDrivenTransferContext(TransferContext):
         Returns:
             This group's chunk shape (see :func:`_group_chunk_shape`).
         """
+        if group_info is not None and group_info in self._engine_group_infos:
+            group_index = self._engine_group_infos.index(group_info)
+            if group_index < len(self._group_raw_layout_descs):
+                return self._group_raw_layout_descs[group_index].shapes[0]
         return _group_chunk_shape(
             group_info, self.engine_driven_context.layout_desc, self._num_layers
         )
@@ -926,48 +988,117 @@ class EngineDrivenTransferContext(TransferContext):
         layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
         self._group_raw_layout_descs = []
         group_layouts = []
+        group_cache_categories: list[str] = []
+        group_mamba_layouts: list[
+            tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None
+        ] = []
+        group_tokens_per_block: list[int] = []
+        group_kv_sizes: list[int] = []
         group_infos = self._engine_group_infos or [None]
         for group_info in group_infos:
+            group_caches = (
+                _kv_caches_for_group(kv_caches, group_info)
+                if group_info is not None
+                else kv_caches
+            )
+            (
+                group_block_size,
+                group_num_layers,
+                group_hidden_dim,
+                group_dtype_str,
+                _group_format,
+                group_kv_size,
+            ) = compute_kv_layout(group_caches, layout_hints=layout_hints)
             group_tokens = (
                 group_info.tokens_per_block if group_info is not None else block_size
             ) or block_size
             group_blocks = (
-                _blocks_per_chunk_for_group(group_info, blocks_in_chunk, block_size)
+                _blocks_per_chunk_for_group(
+                    group_info, blocks_in_chunk, group_block_size
+                )
                 if group_info is not None
                 else blocks_in_chunk
             )
-            group_shape = list(shape)
-            if group_info is not None:
-                group_shape[0 if use_mla_flag else 1] = len(
-                    group_info.layer_indices
+            group_layer_count = (
+                len(group_info.layer_indices)
+                if group_info is not None and group_info.layer_indices
+                else group_num_layers
+            )
+            if group_kv_size == 1:
+                group_shape = torch.Size(
+                    [group_layer_count, group_blocks * group_tokens, group_hidden_dim]
                 )
-            group_shape[1 if use_mla_flag else 2] = group_blocks * group_tokens
+            else:
+                group_shape = torch.Size(
+                    [
+                        2,
+                        group_layer_count,
+                        group_blocks * group_tokens,
+                        group_hidden_dim,
+                    ]
+                )
+            group_category = (
+                group_info.cache_category if group_info is not None else "attention"
+            )
+            group_mamba_layout = (
+                group_info.mamba_real_layout if group_info is not None else None
+            )
+            group_dtype = getattr(torch, group_dtype_str)
+            if group_category == "mamba" and group_mamba_layout is not None:
+                # Mamba opaque page view must use conv_state dtype for byte
+                # addressing. vLLM version changes may desync spec dtype vs
+                # actual page view dtype; pin to real conv dtype to keep
+                # split/merge byte math consistent.
+                conv_layout, ssm_layout = group_mamba_layout
+                conv_dtype = getattr(
+                    torch, conv_layout.dtype_str.removeprefix("torch.")
+                )
+                if group_dtype != conv_dtype:
+                    logger.warning(
+                        "Mamba group %d page-view dtype mismatch: "
+                        "compute_kv_layout=%s, conv_layout=%s; "
+                        "using conv_layout dtype for raw page view",
+                        len(group_layouts),
+                        group_dtype,
+                        conv_dtype,
+                    )
+                group_dtype = conv_dtype
+
+                planes = 1 if group_kv_size == 1 else 2
+                page_bytes = (
+                    planes
+                    * group_tokens
+                    * group_hidden_dim
+                    * group_dtype.itemsize
+                )
+                mamba_bytes = conv_layout.byte_length + ssm_layout.byte_length
+                if mamba_bytes > page_bytes:
+                    raise ValueError(
+                        "Mamba real layout exceeds page bytes: "
+                        f"group={len(group_layouts)} mamba_bytes={mamba_bytes} "
+                        f"page_bytes={page_bytes}"
+                    )
             group_layout = MemoryLayoutDesc(
-                shapes=[torch.Size(group_shape)], dtypes=[dtype]
+                shapes=[group_shape],
+                dtypes=[group_dtype],
             )
             self._group_raw_layout_descs.append(group_layout)
             group_layouts.append(group_layout)
+            group_cache_categories.append(group_category)
+            group_mamba_layouts.append(group_mamba_layout)
+            group_tokens_per_block.append(group_tokens)
+            group_kv_sizes.append(group_kv_size)
+        self._group_cache_categories = group_cache_categories
+        self._group_mamba_layouts = group_mamba_layouts
+        self._group_tokens_per_block = group_tokens_per_block
 
-        enable_l1_kvweave_quant = os.environ.get(
-            "LMCACHE_MP_L1_KVWEAVE_QUANT", ""
-        ).strip().lower() in {"1", "true", "yes", "y", "on"}
-        if enable_l1_kvweave_quant and not use_mla_flag:
-            self._kvweave_codec = KVWeaveCodec(
-                {
-                    "quantize": True,
-                    "qbit": 4,
-                    "num_kv_heads": int(os.environ.get("LMCACHE_MP_KVWEAVE_NUM_KV_HEADS", "1")),
-                    "head_dim": int(os.environ.get("LMCACHE_MP_KVWEAVE_HEAD_DIM", "0")),
-                    "scaling_method": os.environ.get(
-                        "LMCACHE_MP_KVWEAVE_SCALING_METHOD", "per_channel"
-                    ),
-                    "precond": os.environ.get("LMCACHE_MP_KVWEAVE_PRECOND", "0").lower()
-                    in {"1", "true", "yes", "y", "on"},
-                }
-            )
+        runtime_config = KVWeaveRuntimeConfig.from_env()
+        if runtime_config.enabled:
+            self._kvweave_codec = KVWeaveCodec(runtime_config.attention_codec_kwargs)
+            self._mamba_codec_options = runtime_config.mamba_options
             quantized_layouts = []
-            for raw_layout in group_layouts:
-                serialized_size = self._kvweave_codec.estimate_serialized_size(raw_layout)
+            for group_index, raw_layout in enumerate(group_layouts):
+                category = group_cache_categories[group_index]
                 raw_size = sum(
                     int(torch.tensor(shape).prod().item()) * itemsize
                     for shape, dtype_item in zip(
@@ -975,7 +1106,39 @@ class EngineDrivenTransferContext(TransferContext):
                     )
                     for itemsize in [dtype_item.itemsize]
                 )
-                if serialized_size < raw_size:
+                if category == "mamba":
+                    mamba_layout = group_mamba_layouts[group_index]
+                    if not runtime_config.linear_quant_enabled or mamba_layout is None:
+                        quantized_layouts.append(raw_layout)
+                        continue
+                    serialized_size = KVWeaveCodec.estimate_mamba_serialized_size(
+                        raw_layout,
+                        mamba_layout,
+                        group_tokens_per_block[group_index],
+                        (
+                            self._mamba_codec_options.conv_scaling_method,
+                            self._mamba_codec_options.ssm_scaling_method,
+                        ),
+                        (
+                            self._mamba_codec_options.conv_qbit,
+                            self._mamba_codec_options.ssm_qbit,
+                        ),
+                    )
+                    threshold = raw_size * runtime_config.linear_max_size_ratio
+                elif (
+                    category in {"attention", "unknown"}
+                    and group_kv_sizes[group_index] == 2
+                ):
+                    serialized_size = self._kvweave_codec.estimate_serialized_size(
+                        raw_layout
+                    )
+                    threshold = raw_size
+                else:
+                    # MLA attention (single-plane) is not supported by the
+                    # attention codec; leave the group unquantized.
+                    quantized_layouts.append(raw_layout)
+                    continue
+                if serialized_size < threshold:
                     quantized_layouts.append(
                         MemoryLayoutDesc(
                             shapes=[torch.Size([serialized_size])],
@@ -994,7 +1157,7 @@ class EngineDrivenTransferContext(TransferContext):
             self._kvweave_quant_enabled = False
         group_layout_descs = (
             [serialize_memory_layout_desc(layout) for layout in self._group_layout_descs]
-            if self._kvweave_quant_enabled
+            if engine_group_infos
             else None
         )
         enable_l1_kvweave_quant = self._kvweave_quant_enabled
@@ -1101,35 +1264,83 @@ class EngineDrivenTransferContext(TransferContext):
                     else None
                 )
             if chunk_indices is None or group_chunk_indices:
-                raw_chunks = gather_paged_kv_to_cpu(
-                    group_kv_caches,
-                    group_block_ids,
-                    group_blocks_in_chunk,
-                    layout_hints=self._layout_hints,
-                    # Hybrid models may mix per-group KV formats (e.g.
-                    # attention + mamba views). Detect per-group format
-                    # from group_kv_caches instead of forcing the
-                    # single-format value computed at register().
-                    engine_kv_format=None,
-                    out=None if self._group_is_quantized(group_index) else group_out_buffers,
-                    chunk_indices=group_chunk_indices,
+                is_mamba_group = (
+                    self._group_is_quantized(group_index)
+                    and
+                    _group_info is not None and _group_info.cache_category == "mamba"
                 )
+                if not is_mamba_group:
+                    raw_chunks = gather_paged_kv_to_cpu(
+                        group_kv_caches,
+                        group_block_ids,
+                        group_blocks_in_chunk,
+                        layout_hints=self._layout_hints,
+                        engine_kv_format=None,
+                        out=None if self._group_is_quantized(group_index) else group_out_buffers,
+                        chunk_indices=group_chunk_indices,
+                    )
+                else:
+                    selected_group_block_ids = (
+                        group_block_ids
+                        if group_chunk_indices is None
+                        else [
+                            block_id
+                            for chunk_index in group_chunk_indices
+                            for block_id in group_block_ids[
+                                chunk_index * group_blocks_in_chunk :
+                                (chunk_index + 1) * group_blocks_in_chunk
+                            ]
+                        ]
+                    )
+                    gather_block_ids, safe_block_id = _safe_gather_block_ids(
+                        selected_group_block_ids
+                    )
+                    if safe_block_id is None:
+                        raw_shape = self.group_chunk_shape(_group_info)
+                        raw_chunks = [
+                            torch.zeros(
+                                raw_shape,
+                                dtype=next(iter(group_kv_caches.values())).dtype,
+                            )
+                            for _ in range(
+                                len(group_chunk_indices)
+                                if group_chunk_indices is not None
+                                else len(group_block_ids) // group_blocks_in_chunk
+                            )
+                        ]
+                    else:
+                        raw_chunks = gather_paged_kv_to_cpu(
+                            group_kv_caches,
+                            gather_block_ids,
+                            group_blocks_in_chunk,
+                            layout_hints=self._layout_hints,
+                            engine_kv_format=None,
+                            out=None,
+                            chunk_indices=None,
+                        )
                 if self._group_is_quantized(group_index):
                     if self._kvweave_codec is None:
                         raise RuntimeError("KVWeave codec is not initialized")
+                    category = self._group_cache_categories[group_index]
+                    mamba_layout = self._group_mamba_layouts[group_index]
+                    tokens_per_block = self._group_tokens_per_block[group_index]
                     if group_out_buffers is not None:
                         if len(raw_chunks) != len(group_out_buffers):
                             raise ValueError("quantized SHM slot count mismatch")
                         for raw_chunk, destination in zip(
                             raw_chunks, group_out_buffers, strict=True
                         ):
-                            _copy_bytes_to_tensor(
-                                self._kvweave_codec.serialize_tensor(raw_chunk),
-                                destination,
+                            payload = self._kvweave_codec.encode_chunk(
+                                category, mamba_layout, tokens_per_block,
+                                self._mamba_codec_options, raw_chunk,
                             )
+                            _copy_bytes_to_tensor(payload, destination)
                     else:
                         for raw_chunk in raw_chunks:
-                            payload = self._kvweave_codec.serialize_tensor(raw_chunk)
+                            payload = self._kvweave_codec.encode_chunk(
+                                category, mamba_layout, tokens_per_block,
+                                self._mamba_codec_options, raw_chunk,
+                            )
                             destination = torch.empty(
                                 (self._group_layout_descs[group_index].shapes[0][0],),
                                 dtype=torch.uint8,
@@ -1186,27 +1397,84 @@ class EngineDrivenTransferContext(TransferContext):
                     group_chunks = src_buffers[
                         group_offset : group_offset + num_group_chunks
                     ]
+                    # ``_scatter_non_null_mamba_chunks`` walks ``block_ids``
+                    # in original, uncompacted order to keep its internal
+                    # ``block_ordinal`` (used to compare against
+                    # ``skip_first_n_tokens // block_size``) in the same
+                    # reference frame as the caller's global skip count.
+                    # Dropping leading all-null chunks before that call would
+                    # shift ``block_ordinal`` relative to ``skip_first_n_tokens``
+                    # and desync which block gets skipped -- so only compact
+                    # for the non-mamba (attention) scatter path below.
+                    is_mamba_group = (
+                        _group_info is not None
+                        and _group_info.cache_category == "mamba"
+                    )
+                    if not is_mamba_group:
+                        active_chunk_indices = [
+                            chunk_index
+                            for chunk_index in range(num_group_chunks)
+                            if any(
+                                group_block_ids[
+                                    chunk_index
+                                    * group_blocks_in_chunk : (chunk_index + 1)
+                                    * group_blocks_in_chunk
+                                ]
+                            )
+                        ]
+                        group_chunks = [
+                            group_chunks[chunk_index]
+                            for chunk_index in active_chunk_indices
+                        ]
+                        group_block_ids = [
+                            block_id
+                            for chunk_index in active_chunk_indices
+                            for block_id in group_block_ids[
+                                chunk_index
+                                * group_blocks_in_chunk : (chunk_index + 1)
+                                * group_blocks_in_chunk
+                            ]
+                        ]
                     if self._group_is_quantized(group_index):
                         if self._kvweave_codec is None:
                             raise RuntimeError("KVWeave codec is not initialized")
+                        category = self._group_cache_categories[group_index]
+                        mamba_layout = self._group_mamba_layouts[group_index]
+                        tokens_per_block = self._group_tokens_per_block[group_index]
                         raw_shape = self._group_raw_layout_descs[group_index].shapes[0]
                         raw_dtype = self._group_raw_layout_descs[group_index].dtypes[0]
-                        decoded_chunks = []
-                        for chunk in group_chunks:
-                            destination = torch.empty(raw_shape, dtype=raw_dtype)
-                            self._kvweave_codec.deserialize_tensor(chunk, destination)
-                            decoded_chunks.append(destination)
-                        group_chunks = decoded_chunks
-                    scatter_cpu_to_paged_kv(
-                        group_kv_caches,
-                        group_block_ids,
-                        group_chunks,
-                        group_blocks_in_chunk,
-                        skip_first_n_tokens=skip_first_n_tokens,
-                        layout_hints=self._layout_hints,
-                        # See submit_store(): discover per-group format.
-                        engine_kv_format=None,
+                        group_chunks = [
+                            self._kvweave_codec.decode_chunk(
+                                category, mamba_layout, tokens_per_block,
+                                raw_shape, raw_dtype, chunk,
+                            )
+                            for chunk in group_chunks
+                        ]
+                    has_null_mamba_block = (
+                        self._group_is_quantized(group_index)
+                        and is_mamba_group
+                        and any(block_id == 0 for block_id in group_block_ids)
                     )
+                    if has_null_mamba_block:
+                        _scatter_non_null_mamba_chunks(
+                            group_kv_caches,
+                            group_block_ids,
+                            group_chunks,
+                            group_blocks_in_chunk,
+                            self._group_tokens_per_block[group_index],
+                            self._layout_hints,
+                            skip_first_n_tokens,
+                        )
+                    else:
+                        scatter_cpu_to_paged_kv(
+                            group_kv_caches,
+                            group_block_ids,
+                            group_chunks,
+                            group_blocks_in_chunk,
+                            skip_first_n_tokens=skip_first_n_tokens,
+                            layout_hints=self._layout_hints,
+                            engine_kv_format=None,
+                        )
                     group_offset += num_group_chunks
             except (RuntimeError, ValueError, TypeError, IndexError):
                 logger.exception("Failed to scatter retrieved CPU context chunks")

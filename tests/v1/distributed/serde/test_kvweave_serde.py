@@ -4,8 +4,13 @@ import pytest
 import torch
 
 from lmcache.v1.distributed.api import MemoryLayoutDesc
-from lmcache.v1.distributed.serde.kvweave.kvweave_config import KVWeaveCodecConfig
+from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
+    KVWeaveCodecConfig,
+    KVWeaveRuntimeConfig,
+    MambaCodecOptions,
+)
 from lmcache.v1.distributed.serde.kvweave.kvweave_serde import _KVWeaveCodec
+from lmcache.v1.multiprocess.group_view import MambaSubStateWireLayout
 
 
 def _codec(**kwargs: object) -> _KVWeaveCodec:
@@ -81,3 +86,78 @@ def test_estimate_serialized_size_is_an_upper_bound():
 def test_rejects_non_kv_shape():
     with pytest.raises(ValueError, match="KVWeave"):
         _codec().serialize_tensor(torch.randn(1, 64, 8))
+
+
+def test_runtime_config_resolves_environment(monkeypatch):
+    monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", "true")
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED", "false")
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_LINEAR_MAX_SIZE_RATIO", "1.5")
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_NUM_KV_HEADS", "8")
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_HEAD_DIM", "128")
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_PRECOND", "1")
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD", "per_token")
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_CONV_RH", "true")
+
+    config = KVWeaveRuntimeConfig.from_env()
+
+    assert config.enabled
+    assert not config.linear_quant_enabled
+    assert config.linear_max_size_ratio == 1.5
+    assert config.attention_codec_kwargs["num_kv_heads"] == 8
+    assert config.attention_codec_kwargs["head_dim"] == 128
+    assert config.attention_codec_kwargs["precond"]
+    assert config.mamba_options == MambaCodecOptions(
+        conv_scaling_method="per_token",
+        conv_rh=True,
+        ssm_scaling_method="per_channel",
+        ssm_rh=True,
+        asym=True,
+    )
+
+
+def test_codec_chunk_methods_dispatch_attention():
+    codec = _codec()
+    source = torch.randn(2, 1, 64, 8, dtype=torch.float16)
+
+    payload = codec.encode_chunk("attention", None, 64, None, source)
+    restored = codec.decode_chunk(
+        "attention",
+        None,
+        64,
+        source.shape,
+        source.dtype,
+        torch.tensor(list(payload), dtype=torch.uint8),
+    )
+
+    assert restored.shape == source.shape
+    assert torch.max(torch.abs(source.float() - restored.float())) < 0.5
+
+
+def _mamba_layouts() -> tuple[MambaSubStateWireLayout, MambaSubStateWireLayout]:
+    return (
+        MambaSubStateWireLayout(0, 16, "torch.float32", (2, 2)),
+        MambaSubStateWireLayout(16, 48, "torch.float32", (3, 4)),
+    )
+
+
+def test_estimate_mamba_serialized_size_is_positive_and_scales_with_layers():
+    small_layout = MemoryLayoutDesc([torch.Size([2, 2, 8, 8])], [torch.float32])
+    large_layout = MemoryLayoutDesc([torch.Size([2, 8, 8, 8])], [torch.float32])
+
+    small = _KVWeaveCodec.estimate_mamba_serialized_size(
+        small_layout, _mamba_layouts(), block_size=2
+    )
+    large = _KVWeaveCodec.estimate_mamba_serialized_size(
+        large_layout, _mamba_layouts(), block_size=2
+    )
+
+    assert small > 0
+    assert large > small
+
+
+def test_estimate_mamba_serialized_size_rejects_misaligned_block_size():
+    layout = MemoryLayoutDesc([torch.Size([2, 2, 7, 8])], [torch.float32])
+    with pytest.raises(ValueError, match="chunk_tokens"):
+        _KVWeaveCodec.estimate_mamba_serialized_size(
+            layout, _mamba_layouts(), block_size=2
+        )
