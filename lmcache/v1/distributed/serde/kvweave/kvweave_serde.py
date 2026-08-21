@@ -10,6 +10,7 @@ from typing import Optional
 import numpy as np
 import torch
 
+from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
     KVWeaveCodecConfig,
@@ -21,6 +22,8 @@ try:
     from kvweave import kvweave_quant
 except ImportError:  # pragma: no cover
     kvweave_quant = None
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -284,7 +287,7 @@ class _KVWeaveCodec:
             raise ValueError(f"unsupported substate: {substate!r}")
         if scaling_method not in KVWeaveCodecConfig.SCALING_TO_CODE:
             raise ValueError(f"unsupported scaling_method: {scaling_method!r}")
-        if tensor.dim() < 2 or (substate == "conv" and rh and scaling_method in {"per_tensor", "per_channel"}):
+        if tensor.dim() < 2 :
             raise ValueError("invalid Mamba tensor or RH configuration")
         cpu = tensor.detach().to("cpu").contiguous()
         shape = tuple(int(dim) for dim in cpu.shape)
@@ -497,6 +500,48 @@ class _KVWeaveCodec:
         if ssm_size > len(blob) - offset:
             raise ValueError("Mamba payload bundle is truncated")
         return conv, blob[offset : offset + ssm_size]
+
+    @staticmethod
+    def pack_conv_qkv_payloads(query: bytes, key: bytes, value: bytes) -> bytes:
+        """Frame conv query/key/value payloads into one stored blob."""
+        return (
+            struct.pack(">I", len(query))
+            + query
+            + struct.pack(">I", len(key))
+            + key
+            + struct.pack(">I", len(value))
+            + value
+        )
+
+    @staticmethod
+    def unpack_conv_qkv_payloads(blob: bytes) -> tuple[bytes, bytes, bytes]:
+        """Split a framed conv Q/K/V blob back into query, key, and value payloads."""
+        if len(blob) < 4:
+            raise ValueError("Conv QKV payload bundle is truncated")
+
+        query_size = struct.unpack(">I", blob[:4])[0]
+        if query_size > len(blob) - 4:
+            raise ValueError("Conv QKV payload bundle is truncated")
+        offset = 4 + query_size
+        query = blob[4:offset]
+
+        if len(blob) - offset < 4:
+            raise ValueError("Conv QKV payload bundle is truncated")
+        key_size = struct.unpack(">I", blob[offset : offset + 4])[0]
+        offset += 4
+        if key_size > len(blob) - offset:
+            raise ValueError("Conv QKV payload bundle is truncated")
+        key = blob[offset : offset + key_size]
+        offset += key_size
+
+        if len(blob) - offset < 4:
+            raise ValueError("Conv QKV payload bundle is truncated")
+        value_size = struct.unpack(">I", blob[offset : offset + 4])[0]
+        offset += 4
+        if value_size > len(blob) - offset:
+            raise ValueError("Conv QKV payload bundle is truncated")
+        value = blob[offset : offset + value_size]
+        return query, key, value
 
     def encode_chunk(
         self,

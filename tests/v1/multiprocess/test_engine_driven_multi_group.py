@@ -13,6 +13,7 @@ import torch
 
 # First Party
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.distributed.serde.kvweave.kvweave_config import MambaCodecOptions
 from lmcache.v1.distributed.serde.kvweave.kvweave_serde import (
     MambaChunkSplit,
     _KVWeaveCodec,
@@ -154,6 +155,83 @@ class TestIterTransferGroups:
             list(
                 worker_transfer._iter_transfer_groups(groups, kv_caches, [[0, 1]], 2, 4)
             )
+
+
+class TestMambaRhStartupFallback:
+    def test_fallback_disables_conv_rh_when_transform_len_not_pow2(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        options = MambaCodecOptions(
+            conv_scaling_method="per_channel",
+            conv_rh=True,
+            ssm_scaling_method="per_channel",
+            ssm_rh=False,
+            asym=True,
+        )
+        raw_layout = MemoryLayoutDesc(
+            shapes=[torch.Size([2, 3, 4, 3072])], dtypes=[torch.float16]
+        )
+        conv_layout = MambaSubStateWireLayout(
+            byte_offset=0,
+            byte_length=0,
+            dtype_str="torch.float16",
+            shape=(8, 128, 3),
+        )
+        ssm_layout = MambaSubStateWireLayout(
+            byte_offset=0,
+            byte_length=0,
+            dtype_str="torch.float16",
+            shape=(4, 4, 4),
+        )
+
+        resolved = worker_transfer._maybe_fallback_invalid_mamba_rh(
+            options,
+            linear_quant_enabled=True,
+            group_cache_categories=["mamba"],
+            group_layouts=[raw_layout],
+            group_mamba_layouts=[(conv_layout, ssm_layout)],
+            group_tokens_per_block=[1],
+        )
+
+        assert resolved is not None
+        assert resolved.conv_rh is False
+        assert "disabling conv RH at startup" in caplog.text
+
+    def test_fallback_keeps_conv_rh_when_transform_len_is_pow2(self) -> None:
+        options = MambaCodecOptions(
+            conv_scaling_method="per_channel",
+            conv_rh=True,
+            ssm_scaling_method="per_channel",
+            ssm_rh=False,
+            asym=True,
+        )
+        raw_layout = MemoryLayoutDesc(
+            shapes=[torch.Size([2, 3, 4, 4096])], dtypes=[torch.float16]
+        )
+        conv_layout = MambaSubStateWireLayout(
+            byte_offset=0,
+            byte_length=0,
+            dtype_str="torch.float16",
+            shape=(8, 128, 4),
+        )
+        ssm_layout = MambaSubStateWireLayout(
+            byte_offset=0,
+            byte_length=0,
+            dtype_str="torch.float16",
+            shape=(4, 4, 4),
+        )
+
+        resolved = worker_transfer._maybe_fallback_invalid_mamba_rh(
+            options,
+            linear_quant_enabled=True,
+            group_cache_categories=["mamba"],
+            group_layouts=[raw_layout],
+            group_mamba_layouts=[(conv_layout, ssm_layout)],
+            group_tokens_per_block=[1],
+        )
+
+        assert resolved is not None
+        assert resolved.conv_rh is True
 
 
 class _FakeEngineDrivenContext:

@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+
 import pytest
 import torch
 
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
+    ConvQKVSplit,
     KVWeaveCodecConfig,
     KVWeaveRuntimeConfig,
     MambaCodecOptions,
@@ -88,12 +91,28 @@ def test_rejects_non_kv_shape():
         _codec().serialize_tensor(torch.randn(1, 64, 8))
 
 
-def test_runtime_config_resolves_environment(monkeypatch):
+def test_runtime_config_resolves_environment(monkeypatch, tmp_path):
+    model_dir = tmp_path / "SomeModel"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "text_config": {
+                    "head_dim": 128,
+                    "num_key_value_heads": 8,
+                    "linear_key_head_dim": 64,
+                    "linear_num_key_heads": 4,
+                    "linear_value_head_dim": 64,
+                    "linear_num_value_heads": 4,
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("MODEL_PATH", str(tmp_path))
+    monkeypatch.setenv("MODEL", "SomeModel")
     monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", "true")
     monkeypatch.setenv("LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED", "false")
     monkeypatch.setenv("LMCACHE_MP_KVWEAVE_LINEAR_MAX_SIZE_RATIO", "1.5")
-    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_NUM_KV_HEADS", "8")
-    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_HEAD_DIM", "128")
     monkeypatch.setenv("LMCACHE_MP_KVWEAVE_PRECOND", "1")
     monkeypatch.setenv("LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD", "per_token")
     monkeypatch.setenv("LMCACHE_MP_KVWEAVE_CONV_RH", "true")
@@ -112,6 +131,39 @@ def test_runtime_config_resolves_environment(monkeypatch):
         ssm_scaling_method="per_channel",
         ssm_rh=True,
         asym=True,
+        ssm_qbit=4,
+        conv_qkv_split=ConvQKVSplit(key_dim=256, value_dim=256),
+    )
+
+
+def test_runtime_config_falls_back_to_qwen35_9b_defaults(monkeypatch):
+    monkeypatch.delenv("MODEL_PATH", raising=False)
+    monkeypatch.delenv("MODEL", raising=False)
+
+    config = KVWeaveRuntimeConfig.from_env()
+
+    assert config.attention_codec_kwargs["num_kv_heads"] == 4
+    assert config.attention_codec_kwargs["head_dim"] == 256
+    assert config.mamba_options.conv_qkv_split == ConvQKVSplit(
+        key_dim=2048, value_dim=4096
+    )
+
+
+def test_runtime_config_falls_back_when_config_json_missing_fields(
+    monkeypatch, tmp_path
+):
+    model_dir = tmp_path / "PartialModel"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps({"text_config": {}}))
+    monkeypatch.setenv("MODEL_PATH", str(tmp_path))
+    monkeypatch.setenv("MODEL", "PartialModel")
+
+    config = KVWeaveRuntimeConfig.from_env()
+
+    assert config.attention_codec_kwargs["num_kv_heads"] == 4
+    assert config.attention_codec_kwargs["head_dim"] == 256
+    assert config.mamba_options.conv_qkv_split == ConvQKVSplit(
+        key_dim=2048, value_dim=4096
     )
 
 

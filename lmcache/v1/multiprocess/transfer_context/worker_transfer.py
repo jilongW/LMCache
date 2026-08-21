@@ -4,6 +4,7 @@
 # Standard
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import replace
 from enum import Enum
 from typing import Any, Callable, Protocol
 import os
@@ -20,6 +21,7 @@ from lmcache.v1.distributed.serde.kvweave import (
     KVWeaveRuntimeConfig,
     MambaCodecOptions,
 )
+from lmcache.v1.distributed.serde.kvweave.kvweave_config import KVWeaveCodecConfig
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     RegisterEngineDrivenContextPayload,
@@ -60,6 +62,107 @@ def _copy_bytes_to_tensor(payload: bytes, destination: torch.Tensor) -> None:
     target[: len(payload)].copy_(
         torch.frombuffer(bytearray(payload), dtype=torch.uint8)
     )
+
+
+def _is_pow2(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _mamba_transform_len(
+    raw_layout: MemoryLayoutDesc,
+    sub_layout: MambaSubStateWireLayout,
+    tokens_per_block: int,
+    substate: str,
+    scaling_method: str,
+) -> int:
+    shape = tuple(int(dim) for dim in raw_layout.shapes[0])
+    if len(shape) == 4:
+        _, layers, tokens, _ = shape
+    elif len(shape) == 3:
+        layers, tokens, _ = shape
+    else:
+        raise ValueError(
+            f"expected Mamba chunk shape [2,L,T,H] or [L,T,H], got {shape}"
+        )
+    blocks = max(tokens // tokens_per_block, 1)
+    full_shape = (layers, blocks, *sub_layout.shape)
+    _, _, _, chunks = KVWeaveCodecConfig.mamba_layout(
+        substate, full_shape, scaling_method
+    )
+    elements = int(layers) * int(blocks)
+    for dim in sub_layout.shape:
+        elements *= int(dim)
+    return max(elements // max(int(layers), 1) // max(int(chunks), 1), 1)
+
+
+def _maybe_fallback_invalid_mamba_rh(
+    mamba_options: MambaCodecOptions | None,
+    linear_quant_enabled: bool,
+    group_cache_categories: list[str],
+    group_layouts: list[MemoryLayoutDesc],
+    group_mamba_layouts: list[
+        tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None
+    ],
+    group_tokens_per_block: list[int],
+) -> MambaCodecOptions | None:
+    if not linear_quant_enabled or mamba_options is None:
+        return mamba_options
+
+    conv_invalid_len: int | None = None
+    ssm_invalid_len: int | None = None
+    for idx, category in enumerate(group_cache_categories):
+        if category != "mamba":
+            continue
+        m_layout = group_mamba_layouts[idx]
+        if m_layout is None:
+            continue
+        conv_layout, ssm_layout = m_layout
+        raw_layout = group_layouts[idx]
+        tokens_per_block = group_tokens_per_block[idx]
+
+        if mamba_options.conv_rh and conv_invalid_len is None:
+            conv_len = _mamba_transform_len(
+                raw_layout,
+                conv_layout,
+                tokens_per_block,
+                "conv",
+                mamba_options.conv_scaling_method,
+            )
+            if not _is_pow2(conv_len):
+                conv_invalid_len = conv_len
+
+        if mamba_options.ssm_rh and ssm_invalid_len is None:
+            ssm_len = _mamba_transform_len(
+                raw_layout,
+                ssm_layout,
+                tokens_per_block,
+                "ssm",
+                mamba_options.ssm_scaling_method,
+            )
+            if not _is_pow2(ssm_len):
+                ssm_invalid_len = ssm_len
+
+    if conv_invalid_len is not None:
+        logger.info(
+            "LMCACHE: disabling conv RH at startup because transform "
+            "length=%d is not power-of-2 "
+            "(scaling_method=%s)",
+            conv_invalid_len,
+            mamba_options.conv_scaling_method,
+        )
+        mamba_options = replace(mamba_options, conv_rh=False)
+
+    if ssm_invalid_len is not None:
+        logger.info(
+            "LMCACHE: disabling ssm RH at startup because transform "
+            "length=%d is not power-of-2 "
+            "(scaling_method=%s)",
+            ssm_invalid_len,
+            mamba_options.ssm_scaling_method,
+        )
+        mamba_options = replace(mamba_options, ssm_rh=False)
+
+    return mamba_options
 
 
 # Environment variable that lets the user override the default routing
@@ -1095,7 +1198,14 @@ class EngineDrivenTransferContext(TransferContext):
         runtime_config = KVWeaveRuntimeConfig.from_env()
         if runtime_config.enabled:
             self._kvweave_codec = KVWeaveCodec(runtime_config.attention_codec_kwargs)
-            self._mamba_codec_options = runtime_config.mamba_options
+            self._mamba_codec_options = _maybe_fallback_invalid_mamba_rh(
+                runtime_config.mamba_options,
+                runtime_config.linear_quant_enabled,
+                group_cache_categories,
+                group_layouts,
+                group_mamba_layouts,
+                group_tokens_per_block,
+            )
             quantized_layouts = []
             for group_index, raw_layout in enumerate(group_layouts):
                 category = group_cache_categories[group_index]

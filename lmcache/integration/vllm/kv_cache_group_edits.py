@@ -473,7 +473,9 @@ class _MambaUnifiedViewEdit(KVCacheGroupEdit):
         layout_hints: LayoutHints,
     ) -> torch.Tensor:
         """
-        Convert the unified page to LMCache's logical block view.
+        Convert [num_blocks, 1, 1, context_size] to
+        [num_blocks, 1, vllm_block_size, head_size] for HND layout, or
+        [num_blocks, vllm_block_size, 1, head_size] for NHD layout.
         """
         assert isinstance(kv_cache, torch.Tensor), (
             "single-layer KV cache must be a torch.Tensor"
@@ -481,11 +483,12 @@ class _MambaUnifiedViewEdit(KVCacheGroupEdit):
         kv_layout = layout_hints.get("kv_layout", "none")
         if kv_layout == "NHD":
             return kv_cache.view(kv_cache.shape[0], spec.block_size, 1, -1)
-        if kv_layout == "HND":
+        elif kv_layout == "HND":
             return kv_cache.view(kv_cache.shape[0], 1, spec.block_size, -1)
-        raise ValueError(
-            f"Unsupported kv_layout: {kv_layout}. Only NHD and HND are supported."
-        )
+        else:
+            raise ValueError(
+                f"Unsupported kv_layout: {kv_layout}. Only NHD and HND are supported."
+            )
 
 
 class _SubpagedMLAAttentionViewEdit(KVCacheGroupEdit):

@@ -23,7 +23,6 @@ from typing import cast
 import msgspec
 
 
-
 class MambaSubStateWireLayout(msgspec.Struct, frozen=True):
     """Wire-safe byte layout of one Mamba sub-state (``conv`` or ``ssm``)."""
 

@@ -16,6 +16,18 @@ from lmcache.logging import init_logger
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class ConvQKVSplit:
+    """Conv-state Q/K/V split widths used by newer codec variants.
+
+    This branch may not actively use the split in runtime code yet, but the
+    option is part of the public config surface expected by tests.
+    """
+
+    key_dim: int
+    value_dim: int
+
+
 def _env_flag(name: str, default: bool) -> bool:
     """Parse a conventional boolean environment flag."""
     raw = os.environ.get(name)
@@ -51,6 +63,9 @@ class MambaCodecOptions:
     ssm_qbit: int = 16
     conv_quant_enabled: bool = True
     ssm_quant_enabled: bool = True
+    conv_qkv_split: ConvQKVSplit = field(
+        default_factory=lambda: ConvQKVSplit(key_dim=2048, value_dim=4096)
+    )
 
     @classmethod
     def from_env(cls) -> "MambaCodecOptions":
@@ -59,11 +74,7 @@ class MambaCodecOptions:
         ``LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD`` and
         ``SSM_SCALING_METHOD`` have independent defaults
         (``per_channel``), not derived from ``LINEAR_*``. ``CONV_RH`` still
-        falls back to ``LINEAR_RH`` while ``SSM_RH`` defaults to ``true``. A
-        conv ``rh=True`` combined with ``per_tensor``/
-        ``per_channel`` scaling disables RH while preserving the requested
-        scaling method, because the transform length is not guaranteed to be
-        a power of two.
+        falls back to ``LINEAR_RH`` while ``SSM_RH`` defaults to ``true``.
 
         ``LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED``/``SSM_QUANT_ENABLED``
         (DEBUG ONLY, default ``true``) independently disable
@@ -79,14 +90,6 @@ class MambaCodecOptions:
             "LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD", "per_channel"
         )
         conv_rh = _env_flag("LMCACHE_MP_KVWEAVE_CONV_RH", linear_rh)
-        if conv_rh and conv_scaling in {"per_tensor", "per_channel"}:
-            logger.info(
-                "LMCACHE_MP_KVWEAVE_CONV_RH=1 requires scaling_method="
-                "per_token; disabling RH while preserving "
-                "scaling_method=%s",
-                conv_scaling,
-            )
-            conv_rh = False
         return cls(
             conv_scaling_method=conv_scaling,
             conv_rh=conv_rh,
@@ -245,10 +248,10 @@ class KVWeaveCodecConfig:
         )
         if scaling_method == "per_channel":
             return blocks, middle, head_dim, head_dim
-        if scaling_method == "per_token" and substate == "conv":
-            return blocks * middle, 1, head_dim, blocks * middle
         if scaling_method == "per_token":
-            return blocks, middle, head_dim, blocks
+            # Token-wise grouping uses one scale per logical token slice
+            # across the non-head_dim axes (blocks * middle).
+            return blocks * middle, 1, head_dim, blocks * middle
         return blocks, middle, head_dim, 1
 
     def mamba_precond_tensors(

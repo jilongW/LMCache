@@ -8,7 +8,10 @@ from lmcache.v1.distributed.serde.kvweave.kvweave_serde import (
     MambaChunkSplit,
     _KVWeaveCodec,
 )
-from lmcache.v1.distributed.serde.kvweave.kvweave_config import MambaCodecOptions
+from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
+    ConvQKVSplit,
+    MambaCodecOptions,
+)
 
 
 def _layouts() -> tuple[MambaSubStateWireLayout, MambaSubStateWireLayout]:
@@ -104,6 +107,63 @@ def test_qwen35_mamba_page_quant_round_trip_is_deterministic():
     assert torch.max(torch.abs(decoded.ssm - original.ssm)) < 2.0
 
 
+def test_conv_qkv_split_respects_non_default_key_value_dims():
+    """Qwen3.5-0.8B's conv_dim (6144) splits unevenly from the 9B default.
+
+    ``key_dim == value_dim == 2048`` here (unlike 9B's
+    ``key_dim=2048, value_dim=4096``) -- passing a non-default
+    ``ConvQKVSplit`` must change where query/key/value are cut, not just be
+    accepted and ignored.
+    """
+    torch.manual_seed(11)
+    block_size = 64
+    conv_shape = (3, 6144)
+    ssm_shape = (16, 128, 128)
+    conv_dtype = torch.float16
+    ssm_dtype = torch.float32
+    conv_bytes = torch.Size(conv_shape).numel() * conv_dtype.itemsize
+    ssm_bytes = torch.Size(ssm_shape).numel() * ssm_dtype.itemsize
+    page_bytes = conv_bytes + ssm_bytes
+    hidden_dim = page_bytes // (block_size * conv_dtype.itemsize)
+    layouts = (
+        MambaSubStateWireLayout(0, conv_bytes, str(conv_dtype), conv_shape),
+        MambaSubStateWireLayout(conv_bytes, ssm_bytes, str(ssm_dtype), ssm_shape),
+    )
+    conv = torch.randn(1, 1, *conv_shape, dtype=conv_dtype)
+    ssm = torch.randn(1, 1, *ssm_shape, dtype=ssm_dtype)
+    raw = _KVWeaveCodec.merge_mamba_chunk(
+        MambaChunkSplit(conv, ssm),
+        layouts,
+        block_size,
+        hidden_dim,
+        raw_shape=torch.Size([1, block_size, hidden_dim]),
+        raw_dtype=conv_dtype,
+    )
+    codec = _KVWeaveCodec()
+    options = MambaCodecOptions(
+        conv_scaling_method="per_channel",
+        conv_rh=False,
+        ssm_scaling_method="per_channel",
+        ssm_rh=False,
+        asym=True,
+        conv_qkv_split=ConvQKVSplit(key_dim=2048, value_dim=2048),
+    )
+
+    payload = codec.encode_chunk("mamba", layouts, block_size, options, raw)
+    restored = codec.decode_chunk(
+        "mamba", layouts, block_size, raw.shape, raw.dtype,
+        torch.frombuffer(bytearray(payload), dtype=torch.uint8),
+    )
+    original = _KVWeaveCodec.split_mamba_chunk(raw, layouts, block_size)
+    decoded = _KVWeaveCodec.split_mamba_chunk(restored, layouts, block_size)
+
+    assert torch.isfinite(decoded.conv).all()
+    conv_mean_abs_err = torch.mean(torch.abs(decoded.conv - original.conv))
+    # per_channel+rh=False on real Qwen3.5-0.8B conv_state measures ~0.005
+    # mean abs error; generous margin for this random tensor's own scale.
+    assert conv_mean_abs_err < 0.5
+
+
 def test_split_accepts_noncontiguous_chunks():
     raw = torch.randn(2, 2, 16, 8, dtype=torch.float32)[:, :, ::2, :]
     assert not raw.is_contiguous()
@@ -154,6 +214,23 @@ def test_payload_bundle_survives_zero_padding_to_a_larger_slot():
     padded = blob + b"\x00" * 128
 
     assert _KVWeaveCodec.unpack_mamba_payloads(padded) == (b"conv", b"ssm")
+
+
+def test_conv_qkv_payload_bundle_round_trip():
+    blob = _KVWeaveCodec.pack_conv_qkv_payloads(b"query", b"key", b"value")
+
+    assert _KVWeaveCodec.unpack_conv_qkv_payloads(blob) == (
+        b"query", b"key", b"value",
+    )
+
+
+def test_conv_qkv_payload_bundle_survives_zero_padding_to_a_larger_slot():
+    blob = _KVWeaveCodec.pack_conv_qkv_payloads(b"query", b"key", b"value")
+    padded = blob + b"\x00" * 128
+
+    assert _KVWeaveCodec.unpack_conv_qkv_payloads(padded) == (
+        b"query", b"key", b"value",
+    )
 
 
 @pytest.mark.parametrize("substate", ["conv", "ssm"])
@@ -220,5 +297,20 @@ def test_native_substate_quant_rejects_invalid_substate():
         _KVWeaveCodec.quantize_mamba_substate_4bit(
             torch.randn(2, 4, 8), substate="invalid"
         )
+
+
+@pytest.mark.parametrize("scaling_method", ["per_tensor", "per_channel"])
+def test_mamba_options_preserve_explicit_conv_rh_true(
+    monkeypatch: pytest.MonkeyPatch,
+    scaling_method: str,
+):
+    """Explicit conv RH setting should not be silently downgraded."""
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD", scaling_method)
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_CONV_RH", "true")
+
+    options = MambaCodecOptions.from_env()
+
+    assert options.conv_scaling_method == scaling_method
+    assert options.conv_rh is True
 
 
