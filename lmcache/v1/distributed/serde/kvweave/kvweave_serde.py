@@ -108,7 +108,7 @@ class _KVWeaveCodec:
             return 32 + 2 * elements * dtype.itemsize
         scales = self._scale_count(tokens, hidden, layers, method)
         header = 32 + 4 * len(shape)
-        return int((header + 8 + 2 * (4 + scales * 12) + 2 * KVWeaveCodecConfig.quantized_bytes(elements, self.qbit)) * 1.10) + 4096
+        return int((header + 8 + 2 * (4 + scales * 12) + 2 * KVWeaveCodecConfig.quantized_bytes(elements, self.qbit)) * 1.02) + 4096
 
     def serialize_tensor(self, tensor: torch.Tensor, scaling_method: str | None = None) -> bytes:
         """Normalize a KV tensor and serialize it as raw or 4-bit data."""
@@ -127,7 +127,15 @@ class _KVWeaveCodec:
             head_dim=self._head_dim(shape.hidden_dim), num_layers=shape.num_layers,
             rh=rh, asym=asym, scaling_method=method, num_threads=self.num_threads,
         )
-        return bytes(payload)
+        payload = bytes(payload)
+        raw_bytes = cpu.numel() * cpu.element_size()
+        logger.debug(
+            "KVWeave quantize store shape=%s dtype=%s qbit=%d scaling=%s "
+            "raw_bytes=%d payload_bytes=%d ratio=%.4f",
+            tuple(cpu.shape), cpu.dtype, self.qbit, method, raw_bytes,
+            len(payload), len(payload) / raw_bytes if raw_bytes else 0.0,
+        )
+        return payload
 
     def deserialize_tensor(self, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Decode a payload and restore it into the destination KV tensor."""
@@ -299,13 +307,21 @@ class _KVWeaveCodec:
             )
         flags = (KVWeaveCodecConfig.MAMBA_FLAG_RH if rh else 0) | (KVWeaveCodecConfig.MAMBA_FLAG_ASYM if asym else 0)
         header = KVWeaveCodecConfig.MAMBA_MAGIC + struct.pack(">BBBBBB" + "i" * len(shape), qbit, KVWeaveCodecConfig.DTYPE_TO_CODE[cpu.dtype], flags, KVWeaveCodecConfig.SCALING_TO_CODE[scaling_method], KVWeaveCodecConfig.SUBSTATE_TO_CODE[substate], len(shape), *shape)
-        return bytes(kvweave_quant.kvweave_serialize_chunk_state(
+        payload = bytes(kvweave_quant.kvweave_serialize_chunk_state(
             cpu.view(-1), header, KVWeaveCodecConfig.next_scale_id(),
             qbit=qbit, blocks_num=blocks,
             block_size=1, head_num=heads, head_dim=head_dim,
             num_layers=shape[0], rh=rh, asym=asym,
             scaling_method=scaling_method, signs=signs, perm=perm,
         ))
+        raw_bytes = cpu.numel() * cpu.element_size()
+        logger.debug(
+            "Mamba quantize %s shape=%s dtype=%s qbit=%d raw_bytes=%d "
+            "payload_bytes=%d ratio=%.4f",
+            substate, shape, cpu.dtype, qbit, raw_bytes, len(payload),
+            len(payload) / raw_bytes if raw_bytes else 0.0,
+        )
+        return payload
 
     @staticmethod
     def _decode_mamba_substate(
