@@ -114,12 +114,45 @@ class TransferStrategy(abc.ABC):
         context: EngineDrivenContextMetadata,
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
     ) -> bool:
-        """Finalize a store request.
+        """Finalize a store request from its serialized wire payload.
+
+        Callers that already hold the decoded chunks -- e.g. a multi-group
+        commit that decodes the worker's flat payload once and slices it per
+        group -- should call :meth:`commit_store_chunks` instead, to avoid a
+        re-serialize / re-deserialize round-trip per group.
 
         Args:
             key: Cache key identifying the requested token range.
             instance_id: Worker instance identifier.
             cpu_data: Serialized payload from the worker.
+            context: Non-GPU transfer metadata for the instance.
+            resolve_obj_keys: Callable that resolves object keys from ``key``.
+
+        Returns:
+            ``True`` when the strategy successfully commits the store request.
+        """
+
+    @abc.abstractmethod
+    def commit_store_chunks(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        chunks: list[torch.Tensor],
+        context: EngineDrivenContextMetadata,
+        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+    ) -> bool:
+        """Finalize a store request from already-decoded chunks.
+
+        The chunk-list counterpart of :meth:`commit_store`. Implementations
+        must treat an empty ``chunks`` list the same way ``commit_store``
+        treats ``cpu_data=b""`` (the SHM no-payload case), so the two entry
+        points stay interchangeable.
+
+        Args:
+            key: Cache key identifying the requested token range.
+            instance_id: Worker instance identifier.
+            chunks: Decoded CPU chunk tensors for this call, positionally
+                aligned with ``resolve_obj_keys(key)``.
             context: Non-GPU transfer metadata for the instance.
             resolve_obj_keys: Callable that resolves object keys from ``key``.
 
@@ -143,6 +176,31 @@ class TransferStrategy(abc.ABC):
 
         Returns:
             Transport-specific retrieve preparation response.
+        """
+
+    @abc.abstractmethod
+    def prepare_retrieve_chunks(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+    ) -> tuple[PrepareRetrieveResponse, list[torch.Tensor]]:
+        """Prepare a retrieve, returning chunks alongside the response.
+
+        The chunk-list counterpart of :meth:`prepare_retrieve`, letting a
+        multi-group caller concatenate every group's chunks and serialize the
+        result once instead of unpickling each group's payload only to
+        re-pickle the concatenation.
+
+        Args:
+            key: Cache key identifying the requested token range.
+            instance_id: Worker instance identifier.
+            resolve_obj_keys: Callable that resolves object keys from ``key``.
+
+        Returns:
+            ``(response, chunks)``. ``response.data`` is always ``b""`` --
+            the payload is carried by ``chunks`` instead, which is empty for
+            transports that hand back SHM slots rather than tensors.
         """
 
     @abc.abstractmethod
@@ -208,8 +266,35 @@ class PickleTransferStrategy(TransferStrategy):
         Returns:
             ``True`` when every reserved object is written successfully.
         """
+        return self.commit_store_chunks(
+            key=key,
+            instance_id=instance_id,
+            chunks=pickle.loads(cpu_data),
+            context=context,
+            resolve_obj_keys=resolve_obj_keys,
+        )
+
+    def commit_store_chunks(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        chunks: list[torch.Tensor],
+        context: EngineDrivenContextMetadata,
+        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+    ) -> bool:
+        """Write already-decoded chunks into reserved objects.
+
+        Called from this class's own ``commit_store`` (after unpickling
+        ``cpu_data``); from ``EngineDrivenTransferModule.commit_store``'s
+        pickle-mode, per-group loop, which already has decoded chunks; and as
+        ``ShmTransferStrategy``'s fallback when a group's ``chunks`` argument
+        is non-empty (that group's store went through pickle mode even though
+        SHM is the registered strategy).
+
+        Returns:
+            ``True`` when every reserved object is written successfully.
+        """
         obj_keys = resolve_obj_keys(key)
-        chunks: list[torch.Tensor] = pickle.loads(cpu_data)
         reserved_dict = self._storage_manager.reserve_write(
             obj_keys, context.layout_desc, "new"
         )
@@ -275,23 +360,51 @@ class PickleTransferStrategy(TransferStrategy):
         resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
     ) -> PrepareRetrieveResponse:
         """Read prefetched objects and return serialized pickle payload."""
+        response, chunks = self.prepare_retrieve_chunks(
+            key=key, instance_id=instance_id, resolve_obj_keys=resolve_obj_keys
+        )
+        if not response.success:
+            return response
+        return PrepareRetrieveResponse(
+            success=True, data=pickle.dumps(chunks), context=response.context
+        )
+
+    def prepare_retrieve_chunks(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+    ) -> tuple[PrepareRetrieveResponse, list[torch.Tensor]]:
+        """Read prefetched objects and return their chunk tensors.
+
+        Called from this class's own ``prepare_retrieve`` (before pickling
+        the chunks) and from ``EngineDrivenTransferModule.prepare_retrieve``'s
+        per-group loop. 
+        """
         obj_keys = resolve_obj_keys(key)
         prefetched_keys: list[ObjectKey] = []
         try:
             read_ctx = self._storage_manager.read_prefetched_results(obj_keys)
             with read_ctx as maybe_memory_objs:
                 if not maybe_memory_objs or len(maybe_memory_objs) != len(obj_keys):
-                    return PrepareRetrieveResponse(success=False, data=b"", context={})
+                    return (
+                        PrepareRetrieveResponse(success=False, data=b"", context={}),
+                        [],
+                    )
                 prefetched_keys = obj_keys[: len(maybe_memory_objs)]
                 chunks = []
                 for memory_obj in maybe_memory_objs:
                     if memory_obj.tensor is None:
-                        return PrepareRetrieveResponse(
-                            success=False, data=b"", context={}
+                        return (
+                            PrepareRetrieveResponse(
+                                success=False, data=b"", context={}
+                            ),
+                            [],
                         )
                     chunks.append(memory_obj.tensor.cpu().clone())
-                return PrepareRetrieveResponse(
-                    success=True, data=pickle.dumps(chunks), context={}
+                return (
+                    PrepareRetrieveResponse(success=True, data=b"", context={}),
+                    chunks,
                 )
         finally:
             if prefetched_keys:
@@ -388,7 +501,15 @@ class ShmTransferStrategy(TransferStrategy):
             return PrepareStoreResponse(context={"slots": [], "chunk_indices": []})
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
-            self._pending_writes[transfer_key] = reserved_keys
+            # Multi-group engine-driven prepare_store calls this method once
+            # per LMCache group with the same (instance_id, key) transfer key.
+            # Accumulate the per-group reservations so a single commit_store
+            # releases all of them in one pop (see commit_store).
+            existing = self._pending_writes.get(transfer_key)
+            if existing is None:
+                self._pending_writes[transfer_key] = list(reserved_keys)
+            else:
+                existing.extend(reserved_keys)
         return PrepareStoreResponse(
             context={"slots": slots, "chunk_indices": chunk_indices}
         )
@@ -403,10 +524,17 @@ class ShmTransferStrategy(TransferStrategy):
     ) -> bool:
         """Finalize SHM store write locks or fallback to pickle commit.
 
+        Multi-group prepare_store accumulates every group's reservations
+        under the same transfer key (see :meth:`prepare_store`), so one
+        commit_store call releases all of them together.
+
         Returns:
-            ``True`` when pending SHM reservation is committed successfully.
+            ``False`` if no ``prepare_store`` reservation is pending for this
+            key (including one that reserved nothing but was still called),
+            otherwise ``True`` once any pending write locks are released.
         """
         if cpu_data != b"":
+            # Non-empty payload: caller used the pickle path for this call.
             return self._fallback_strategy.commit_store(
                 key=key,
                 instance_id=instance_id,
@@ -414,11 +542,65 @@ class ShmTransferStrategy(TransferStrategy):
                 context=context,
                 resolve_obj_keys=resolve_obj_keys,
             )
+        return self._release_write_locks(key, instance_id)
+
+    def commit_store_chunks(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        chunks: list[torch.Tensor],
+        context: EngineDrivenContextMetadata,
+        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+    ) -> bool:
+        """Finalize SHM store write locks or fallback to a chunk commit.
+
+        Called from ``EngineDrivenTransferModule.commit_store`` (both its SHM
+        branch, with ``chunks=[]``, and its pickle-mode per-group loop, with
+        that group's decoded chunks) whenever SHM is the registered strategy.
+
+        Mirrors :meth:`commit_store`, treating an empty ``chunks`` list the
+        same way that method treats ``cpu_data=b""``: the worker wrote
+        straight into the SHM slots, so there is nothing to copy and only the
+        pending write locks need releasing.
+
+        Returns:
+            ``False`` if no ``prepare_store`` reservation is pending for this
+            key, otherwise ``True`` once any pending write locks are released.
+        """
+        if chunks:
+            return self._fallback_strategy.commit_store_chunks(
+                key=key,
+                instance_id=instance_id,
+                chunks=chunks,
+                context=context,
+                resolve_obj_keys=resolve_obj_keys,
+            )
+        return self._release_write_locks(key, instance_id)
+
+    def _release_write_locks(self, key: IPCCacheServerKey, instance_id: int) -> bool:
+        """Release the write locks a ``prepare_store`` reserved for this key.
+
+        Called from ``commit_store`` (``cpu_data == b""``) and
+        ``commit_store_chunks`` (``chunks`` empty) -- this class's two
+        no-payload, SHM-direct-write commit paths.
+
+        Args:
+            key: Cache key identifying the requested token range.
+            instance_id: Worker instance identifier.
+
+        Returns:
+            ``False`` if no ``prepare_store`` reservation is pending for this
+            key (including one that reserved nothing but was still called),
+            otherwise ``True``.
+        """
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
-            reserved_keys = self._pending_writes.pop(transfer_key, None)
-        if reserved_keys is None:
-            return False
+            # A key missing from the map means no prepare_store reservation
+            # is pending for it, which is a caller error. Distinguished from
+            # a reservation that legitimately reserved zero objects.
+            if transfer_key not in self._pending_writes:
+                return False
+            reserved_keys = self._pending_writes.pop(transfer_key)
         if reserved_keys:
             self._storage_manager.finish_write(reserved_keys)
         return True
@@ -457,8 +639,34 @@ class ShmTransferStrategy(TransferStrategy):
             )
         transfer_key = self._transfer_key_factory(key, instance_id)
         with self._pending_lock:
-            self._pending_reads[transfer_key] = shm_prefetched_keys
+            # Multi-group engine-driven prepare_retrieve calls this method
+            # once per LMCache group with the same transfer key. Accumulate
+            # the prefetched key sets so commit_retrieve releases all of them.
+            existing = self._pending_reads.get(transfer_key)
+            if existing is None:
+                self._pending_reads[transfer_key] = list(shm_prefetched_keys)
+            else:
+                existing.extend(shm_prefetched_keys)
         return PrepareRetrieveResponse(success=True, data=b"", context={"slots": slots})
+
+    def prepare_retrieve_chunks(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+        resolve_obj_keys: Callable[[IPCCacheServerKey], list[ObjectKey]],
+    ) -> tuple[PrepareRetrieveResponse, list[torch.Tensor]]:
+        """Read SHM objects, returning slot descriptors and no chunks.
+
+        SHM hands the worker slot descriptors to read in place rather than
+        tensors, so :meth:`prepare_retrieve` already emits ``data=b""`` and
+        the chunk list is always empty here.
+        """
+        return (
+            self.prepare_retrieve(
+                key=key, instance_id=instance_id, resolve_obj_keys=resolve_obj_keys
+            ),
+            [],
+        )
 
     def commit_retrieve(
         self,

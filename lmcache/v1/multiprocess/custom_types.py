@@ -8,6 +8,7 @@ import msgspec
 import torch
 
 # First Party
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.platform.base.ipc_wrapper import (  # noqa: E402,F401
     DeviceIPCWrapper,
 )
@@ -68,6 +69,26 @@ class IPCCacheServerKey:
     # that many read locks (see ``require_num_kv_readers``). 0 = not sent;
     # lookups reject it.
     num_kv_readers: int = field(default=0, compare=False)
+
+    # Set by the worker on a store request to tell the server which chunks
+    # to skip because they hold no real KV. Shape is
+    # ``[group_id][chunk_position]``, where ``chunk_position`` indexes this
+    # key's ``[start, end)`` range in units of that group's own chunk size.
+    # ``True`` at a position means every engine block backing that chunk was
+    # vLLM's null block for this group -- e.g. an align-mode Mamba/GDN chunk
+    # before the request reached that group's one live snapshot, or a
+    # sliding-window chunk outside the live window (see
+    # ``null_chunk_mask_from_groups``). The server drops those positions'
+    # object keys before reserving/writing storage (see
+    # ``EngineDrivenTransferModule.prepare_store``), instead of storing
+    # garbage KV that a later retrieve could serve back.
+    # ``None`` means every chunk is real, which is also how a sender that
+    # predates this field is interpreted (no behavior change for it).
+    # Not part of cache identity: it describes this store call, not what
+    # the key's tokens are.
+    null_chunk_mask: tuple[tuple[bool, ...], ...] | None = field(
+        default=None, compare=False
+    )
 
     # Duplicated from ObjectKey — cannot import ObjectKey here due to
     # circular dependency (api.py imports IPCCacheServerKey).
@@ -167,6 +188,22 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         num_physical_slots: Number of physical KV slots gathered into one
             LMCache chunk. ``None`` accepts the legacy protocol, where the
             server assumed one physical slot per logical token.
+        engine_group_infos: One entry per LMCache KV cache group the worker
+            registers, in protocol order (e.g. one full-attention group plus
+            one recurrent-state group for a hybrid Mamba/GDN model). The
+            server uses this to build one ``GroupTransferPlan`` per group
+            (layer selection, chunk shape, KV format) instead of treating
+            the worker's KV tensors as a single uniform layout. Empty means
+            the worker has a single non-hybrid group, which is also how a
+            sender that predates this field is interpreted.
+        group_hidden_dim_sizes: This group's own flattened hidden dimension
+            per token, one entry per ``engine_group_infos`` entry, in the
+            same order. Hybrid groups can pack K/V differently per group
+            (e.g. sliding-window layers fused, full-attention layers split),
+            so ``hidden_dim_size`` alone is not always correct for every
+            group. ``None`` (or a shorter list) falls back to the shared
+            ``hidden_dim_size`` for the missing groups, which is also how a
+            sender that predates this field is interpreted.
     """
 
     instance_id: int
@@ -178,6 +215,8 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     dtype_str: str
     use_mla: bool
     num_physical_slots: int | None = None
+    engine_group_infos: list[EngineGroupInfo] = msgspec.field(default_factory=list)
+    group_hidden_dim_sizes: list[int] | None = None
 
 
 @dataclass
