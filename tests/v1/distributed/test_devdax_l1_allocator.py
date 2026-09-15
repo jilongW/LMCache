@@ -408,6 +408,23 @@ def test_devdax_l1_memory_manager_reports_devdax_desc(tmp_path):
     manager.close()
 
 
+def test_devdax_l1_memory_manager_is_variable_size(tmp_path):
+    path = _make_mmap_file(tmp_path)
+    manager = DevDaxL1MemoryManager(
+        L1MemoryManagerConfig(
+            size_in_bytes=1024 * 1024,
+            use_lazy=False,
+            shm_name="",
+            devdax_path=path,
+        )
+    )
+
+    # Inherits the same AddressManager-backed, byte-granular allocation as
+    # the CPU tier -- Device-DAX doesn't change this.
+    assert manager.is_variable_size() is True
+    manager.close()
+
+
 def test_cli_parses_l1_devdax_path(tmp_path):
     path = _make_mmap_file(tmp_path)
     config = _parse_mp_storage_args(

@@ -851,6 +851,10 @@ class L1Manager:
         """Return an L1MemoryDesc describing the underlying L1 memory buffer."""
         return self._memory_manager.get_l1_memory_desc()
 
+    def is_variable_size(self) -> bool:
+        """Whether the active L1 tier can allocate chunks of arbitrary size."""
+        return self._memory_manager.is_variable_size()
+
     def close(self) -> None:
         """Close the L1Manager and free all resources."""
         with self._lock:

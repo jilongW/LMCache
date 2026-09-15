@@ -30,6 +30,13 @@ from lmcache.v1.distributed.l2_adapters.config import (
     L2AdaptersConfig,
 )
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import MockL2AdapterConfig
+from lmcache.v1.distributed.serde import (
+    AsyncSerdeProcessor,
+    Deserializer,
+    SerdeConfig,
+    Serializer,
+    register_serde_factory,
+)
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventBusConfig, init_event_bus
 from tests.v1.distributed.utils import should_use_lazy_alloc
@@ -391,6 +398,129 @@ class TestStorageManagerBasic:
         for key in object_keys[1:]:
             assert key in ret
             assert ret[key] is not None
+        storage_manager.close()
+
+
+# =============================================================================
+# Tests for is_l1_variable_size() and the lossy-serde double-quantization guard
+# =============================================================================
+
+
+class _NoOpSerializer(Serializer):
+    """Lossless pass-through Serializer for guard tests, avoiding any real
+    quantization/encryption serde's setup requirements (e.g. key files)."""
+
+    def serialize(self, src, dst, key) -> int:  # type: ignore[no-untyped-def]
+        return 0
+
+    def estimate_serialized_size(self, layout_desc) -> int:  # type: ignore[no-untyped-def]
+        return 1
+
+
+class _NoOpDeserializer(Deserializer):
+    def deserialize(self, src, dst, key) -> None:  # type: ignore[no-untyped-def]
+        pass
+
+
+_LOSSLESS_TEST_SERDE_TYPE = "test-lossless-guard-ser-de-xyz"
+try:
+    register_serde_factory(
+        _LOSSLESS_TEST_SERDE_TYPE,
+        lambda kwargs: AsyncSerdeProcessor(_NoOpSerializer(), _NoOpDeserializer()),
+    )
+except ValueError:
+    pass  # already registered by a prior test module import
+
+
+class TestIsL1VariableSizeAndLossyGuard:
+    """Tests for StorageManager.is_l1_variable_size(),
+    mark_l1_kvweave_quant_enabled()/is_l1_kvweave_quant_enabled(), and the
+    double-quantization guard in _build_l2_adapter() that rejects pairing a
+    lossy L2 serde with an L1 tier that has confirmed KVWeave quantization
+    enabled.
+    """
+
+    def test_is_l1_variable_size_reflects_default_cpu_tier(
+        self, basic_storage_manager_config
+    ):
+        """The default CPU L1 tier is variable-size."""
+        storage_manager = StorageManager(basic_storage_manager_config)
+
+        assert storage_manager.is_l1_variable_size() is True
+
+        storage_manager.close()
+
+    def test_l1_kvweave_quant_defaults_to_disabled(self, basic_storage_manager_config):
+        """Without a call to mark_l1_kvweave_quant_enabled(), L1 quant is off."""
+        storage_manager = StorageManager(basic_storage_manager_config)
+
+        assert storage_manager.is_l1_kvweave_quant_enabled() is False
+
+        storage_manager.close()
+
+    def test_mark_l1_kvweave_quant_enabled_is_idempotent(
+        self, basic_storage_manager_config
+    ):
+        """Calling mark_l1_kvweave_quant_enabled() more than once is a no-op
+        after the first call."""
+        storage_manager = StorageManager(basic_storage_manager_config)
+
+        storage_manager.mark_l1_kvweave_quant_enabled()
+        storage_manager.mark_l1_kvweave_quant_enabled()
+
+        assert storage_manager.is_l1_kvweave_quant_enabled() is True
+
+        storage_manager.close()
+
+    def test_lossy_serde_allowed_when_l1_quant_not_enabled(self, basic_l1_config):
+        """A lossy L2 serde is allowed when L1 quantization is not enabled."""
+        adapter_config = MockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
+        adapter_config.serde_config = SerdeConfig(type="fp8")
+        config = StorageManagerConfig(
+            l1_manager_config=basic_l1_config,
+            eviction_config=EvictionConfig(eviction_policy="LRU"),
+            l2_adapter_config=L2AdaptersConfig(adapters=[adapter_config]),
+        )
+
+        storage_manager = StorageManager(config)
+
+        storage_manager.close()
+
+    def test_lossy_serde_rejected_when_l1_quant_enabled(self, basic_l1_config):
+        """add_l2_adapter() with a lossy serde raises once L1 KVWeave
+        quantization has been confirmed enabled."""
+        storage_manager = StorageManager(
+            StorageManagerConfig(
+                l1_manager_config=basic_l1_config,
+                eviction_config=EvictionConfig(eviction_policy="LRU"),
+            )
+        )
+        storage_manager.mark_l1_kvweave_quant_enabled()
+
+        adapter_config = MockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
+        adapter_config.serde_config = SerdeConfig(type="fp8")
+
+        with pytest.raises(ValueError, match="double lossy quantization"):
+            storage_manager.add_l2_adapter(adapter_config)
+
+        storage_manager.close()
+
+    def test_lossless_serde_allowed_when_l1_quant_enabled(self, basic_l1_config):
+        """A lossless L2 serde is still allowed even after L1 KVWeave
+        quantization is confirmed enabled."""
+        storage_manager = StorageManager(
+            StorageManagerConfig(
+                l1_manager_config=basic_l1_config,
+                eviction_config=EvictionConfig(eviction_policy="LRU"),
+            )
+        )
+        storage_manager.mark_l1_kvweave_quant_enabled()
+
+        adapter_config = MockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
+        adapter_config.serde_config = SerdeConfig(type=_LOSSLESS_TEST_SERDE_TYPE)
+
+        storage_manager.add_l2_adapter(adapter_config)
+
         storage_manager.close()
 
 

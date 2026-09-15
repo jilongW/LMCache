@@ -131,6 +131,15 @@ class GDSL1MemoryManager:
         """
         return None
 
+    def is_variable_size(self) -> bool:
+        """Whether this tier can allocate chunks of arbitrary byte size.
+
+        Returns:
+            ``False`` — the GDS slab's cuFile/O_DIRECT DMA path assumes
+            uniformly-sized chunks.
+        """
+        return False
+
     def close(self) -> None:
         """No-op: the GDSContext owning the slab is closed at server shutdown."""
         return

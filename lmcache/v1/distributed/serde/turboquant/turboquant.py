@@ -897,4 +897,4 @@ def _create_turboquant_serde(kwargs: dict[str, object]) -> SerdeProcessor:
     )
 
 
-register_serde_factory("turboquant", _create_turboquant_serde)
+register_serde_factory("turboquant", _create_turboquant_serde, is_lossy=True)

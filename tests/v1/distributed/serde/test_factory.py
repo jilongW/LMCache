@@ -26,6 +26,7 @@ from lmcache.v1.distributed.serde import (
     SerdeProcessor,
     create_serde_processor,
     get_registered_serde_types,
+    is_lossy_serde_type,
     register_serde_factory,
 )
 
@@ -125,6 +126,49 @@ def test_register_serde_factory_duplicate_raises() -> None:
 
     with pytest.raises(ValueError, match="already registered"):
         register_serde_factory("fp8", _factory)
+
+
+# =============================================================================
+# Lossy serde detection
+# =============================================================================
+
+
+def test_fp8_and_turboquant_are_lossy() -> None:
+    """Built-in quantization serdes self-declare as lossy."""
+    assert is_lossy_serde_type("fp8") is True
+    assert is_lossy_serde_type("turboquant") is True
+
+
+def test_aesgcm_is_not_lossy() -> None:
+    """Encryption is not a lossy transform."""
+    assert is_lossy_serde_type("aesgcm") is False
+
+
+def test_unknown_serde_type_is_not_lossy() -> None:
+    """Unregistered names report as not lossy rather than raising."""
+    assert is_lossy_serde_type("does-not-exist") is False
+
+
+def test_register_serde_factory_defaults_to_not_lossy() -> None:
+    """A factory registered without is_lossy is treated as lossless."""
+
+    def _factory(config: dict) -> SerdeProcessor:  # pragma: no cover - not called
+        raise NotImplementedError
+
+    register_serde_factory("test-lossless-ser-de-xyz", _factory)
+
+    assert is_lossy_serde_type("test-lossless-ser-de-xyz") is False
+
+
+def test_register_serde_factory_marks_lossy() -> None:
+    """A factory registered with is_lossy=True is detected as lossy."""
+
+    def _factory(config: dict) -> SerdeProcessor:  # pragma: no cover - not called
+        raise NotImplementedError
+
+    register_serde_factory("test-lossy-ser-de-xyz", _factory, is_lossy=True)
+
+    assert is_lossy_serde_type("test-lossy-ser-de-xyz") is True
 
 
 # =============================================================================

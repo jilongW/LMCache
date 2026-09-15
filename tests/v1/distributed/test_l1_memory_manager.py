@@ -435,6 +435,36 @@ class TestGetL1MemoryDesc:
 
 
 # =============================================================================
+# Tests for L1MemoryManager.is_variable_size()
+# =============================================================================
+
+
+class TestIsVariableSize:
+    """Tests for L1MemoryManager.is_variable_size().
+
+    Per the docstring: True for both allocator types the CPU tier can hold
+    (MixedMemoryAllocator, LazyMemoryAllocator), since neither uses paging
+    on this path.
+    """
+
+    def test_lazy_allocator_is_variable_size(self, basic_config):
+        """Lazy-allocation config (when supported) reports variable-size."""
+        manager = L1MemoryManager(basic_config)
+
+        assert manager.is_variable_size() is True
+
+        manager.close()
+
+    def test_non_lazy_allocator_is_variable_size(self, non_lazy_config):
+        """Non-lazy (MixedMemoryAllocator) config reports variable-size."""
+        manager = L1MemoryManager(non_lazy_config)
+
+        assert manager.is_variable_size() is True
+
+        manager.close()
+
+
+# =============================================================================
 # Tests for L1MemoryManager integration
 # =============================================================================
 

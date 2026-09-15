@@ -28,9 +28,15 @@ logger = init_logger(__name__)
 # Factories receive the type-specific kwargs (everything except "type").
 _SERDE_FACTORY_REGISTRY: dict[str, Callable[[dict[str, object]], "SerdeProcessor"]] = {}
 
+# Serde type names that perform lossy (precision-reducing) transforms, e.g.
+# quantization. Populated by register_serde_factory(..., is_lossy=True).
+_LOSSY_SERDE_TYPES: set[str] = set()
+
 
 def register_serde_factory(
-    name: str, factory: Callable[[dict[str, object]], "SerdeProcessor"]
+    name: str,
+    factory: Callable[[dict[str, object]], "SerdeProcessor"],
+    is_lossy: bool = False,
 ) -> None:
     """Register a serde factory under a type name.
 
@@ -38,6 +44,9 @@ def register_serde_factory(
         name: Serde type name (used in the JSON config ``"type"`` field).
         factory: Callable that takes the type-specific kwargs dict and
             returns a SerdeProcessor instance.
+        is_lossy: Whether this serde reduces precision (e.g. quantization).
+            Used by callers that need to detect lossy serdes generically,
+            without hardcoding type names (see ``is_lossy_serde_type``).
 
     Raises:
         ValueError: If ``name`` is already registered.
@@ -45,11 +54,26 @@ def register_serde_factory(
     if name in _SERDE_FACTORY_REGISTRY:
         raise ValueError(f"Serde type already registered: {name!r}")
     _SERDE_FACTORY_REGISTRY[name] = factory
+    if is_lossy:
+        _LOSSY_SERDE_TYPES.add(name)
 
 
 def get_registered_serde_types() -> list[str]:
     """Return the list of registered serde type names."""
     return list(_SERDE_FACTORY_REGISTRY)
+
+
+def is_lossy_serde_type(name: str) -> bool:
+    """Whether the named serde type performs a lossy transform.
+
+    Args:
+        name: Serde type name.
+
+    Returns:
+        True if registered with ``is_lossy=True``. False for lossless
+        serdes and for unregistered names.
+    """
+    return name in _LOSSY_SERDE_TYPES
 
 
 def create_serde_processor(config: "SerdeConfig") -> "SerdeProcessor":

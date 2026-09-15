@@ -45,6 +45,17 @@ class L1ManagerProtocol(Protocol):
         """
         ...
 
+    def is_variable_size(self) -> bool:
+        """Whether this tier can allocate chunks of arbitrary byte size.
+
+        Returns ``True`` for allocators backed by a byte-granular address
+        space (CPU pinned-DRAM, Device-DAX), ``False`` for tiers whose DMA
+        path assumes uniformly-sized chunks (GDS). Callers that want to
+        enable variable-size payloads (e.g. quantization) on L1 must check
+        this first and fail fast if it is ``False``.
+        """
+        ...
+
     def close(self) -> None:
         """Release all resources."""
         ...

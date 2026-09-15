@@ -42,7 +42,7 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
 )
 from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
 from lmcache.v1.distributed.quota_manager import QuotaManager
-from lmcache.v1.distributed.serde import create_serde_processor
+from lmcache.v1.distributed.serde import create_serde_processor, is_lossy_serde_type
 from lmcache.v1.distributed.storage_controllers import (
     L1EvictionController,
     L2AdapterEvictionState,
@@ -79,6 +79,14 @@ class StorageManager:
         # size is a pure function of it.
         self._l1_config = config.l1_manager_config
         self._event_bus = get_event_bus()
+
+        # Set by mark_l1_kvweave_quant_enabled() once the engine-driven
+        # registration path (Phase D) confirms L1 KVWeave quantization is
+        # actually turned on for this process, as opposed to merely
+        # possible (see is_l1_variable_size()). Only ever flips False ->
+        # True: registration enables quantization for the process lifetime,
+        # it is never disabled once L2 adapters may have already assumed it.
+        self._l1_kvweave_quant_enabled = False
 
         # L1 eviction controller
         self._eviction_controller = L1EvictionController(
@@ -1096,6 +1104,37 @@ class StorageManager:
             (desc, adapter) for _adapter_id, desc, adapter in self._snapshot_adapters()
         ]
 
+    def is_l1_variable_size(self) -> bool:
+        """Whether the active L1 tier can allocate chunks of arbitrary size.
+
+        Callers that want to enable variable-size L1 payloads (e.g.
+        quantization) must check this first and fail fast if it is False.
+        """
+        return self._l1_manager.is_variable_size()
+
+    def mark_l1_kvweave_quant_enabled(self) -> None:
+        """Record that L1 KVWeave quantization is enabled for this process.
+
+        Called by the engine-driven registration path once it has confirmed
+        (via ``enable_l1_kvweave_quant`` on the registration payload) that L1
+        chunks will be quantized. This is one-way: once called, subsequent
+        ``add_l2_adapter()`` calls that pair a lossy L2 serde with this
+        already-quantized L1 are rejected (see ``_build_l2_adapter()``).
+
+        Idempotent: calling this more than once has no additional effect.
+        """
+        self._l1_kvweave_quant_enabled = True
+
+    def is_l1_kvweave_quant_enabled(self) -> bool:
+        """Whether L1 KVWeave quantization is confirmed enabled.
+
+        Unlike ``is_l1_variable_size()`` (which only reports whether the L1
+        tier is *capable* of variable-size chunks), this reflects whether
+        quantization has actually been turned on for this process via
+        ``mark_l1_kvweave_quant_enabled()``.
+        """
+        return self._l1_kvweave_quant_enabled
+
     # Management APIs
     def clear(self, force: bool = False):
         """
@@ -1203,7 +1242,25 @@ class StorageManager:
             A ``(adapter_id, adapter, descriptor)`` tuple. ``adapter_id`` is
             the freshly allocated stable id, ``adapter`` is the new adapter
             instance, and ``descriptor`` is its descriptor carrying that id.
+
+        Raises:
+            ValueError: If ``config.serde_config`` names a lossy serde type
+                and L1 KVWeave quantization is already confirmed enabled
+                (see ``mark_l1_kvweave_quant_enabled()``) -- pairing two
+                lossy quantization layers would silently compound error.
         """
+        if (
+            config.serde_config is not None
+            and is_lossy_serde_type(config.serde_config.type)
+            and self.is_l1_kvweave_quant_enabled()
+        ):
+            # Checked before create_l2_adapter() so a rejected config never
+            # constructs (and leaks) an underlying adapter/connection.
+            raise ValueError(
+                f"L2 adapter uses lossy serde {config.serde_config.type!r} "
+                "but L1 KVWeave quantization is already enabled for this "
+                "process; double lossy quantization is not supported."
+            )
         adapter_id = self._next_adapter_id
         self._next_adapter_id += 1
         adapter: L2AdapterInterface = create_l2_adapter(config, self._l1_memory_desc)

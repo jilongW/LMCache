@@ -216,6 +216,18 @@ class L1MemoryManager:
             align_bytes=self._align_bytes,
         )
 
+    def is_variable_size(self) -> bool:
+        """Whether this tier can allocate chunks of arbitrary byte size.
+
+        Returns:
+            ``True``: both ``MixedMemoryAllocator`` and ``LazyMemoryAllocator``
+            are backed by an ``AddressManager``/``TensorMemoryAllocator``
+            byte-granular address space on this path (``create_memory_allocator``
+            never enables ``use_paging``), so either can serve arbitrarily
+            sized allocations.
+        """
+        return True
+
     def close(self) -> None:
         """
         Close the memory manager and release all resources.
