@@ -38,6 +38,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TypeAlias
 
 # Third Party
@@ -58,6 +59,60 @@ logger = init_logger(__name__)
 # One registered cache value: a paged KV tensor, or [conv_state, ssm_state]
 # for Mamba layers.
 RegisteredKVCache: TypeAlias = torch.Tensor | list[torch.Tensor]
+
+
+@dataclass(frozen=True)
+class MambaSubStateLayout:
+    """Byte extent of one real (non-pad) tensor within a Mamba page.
+
+    Args:
+        byte_offset: Offset of this tensor's data from the page base, in
+            bytes. Identical for every block (all blocks share one page
+            layout).
+        byte_length: Length of this tensor's real per-block data, in bytes.
+        dtype: This tensor's own dtype, as declared by vLLM's ``MambaSpec``
+            (independent of any other tensor sharing the page).
+        shape: This tensor's real per-block shape, as declared by vLLM's
+            ``MambaSpec`` (e.g. ``(num_heads, head_dim)`` for ``ssm_state``),
+            independent of any other tensor sharing the page.
+    """
+
+    byte_offset: int
+    byte_length: int
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class MambaRealLayout:
+    """Real-data byte layout of a Mamba page, as ``(conv | ssm | pad)``.
+
+    Unlike the flattened, single-dtype view :meth:`KVCacheGroupEdit.apply`
+    returns for the transfer path, this describes where each tensor's real
+    bytes actually live and in which dtype they must be read -- needed by
+    any caller that wants to read the page's content (e.g. per-tensor
+    quantization) instead of treating it as opaque addressing bytes.
+
+    Args:
+        conv: Byte layout of the page's ``conv_state`` region.
+        ssm: Byte layout of the page's ``ssm_state`` region.
+        page_size_bytes: Total page size, including trailing pad.
+    """
+
+    conv: MambaSubStateLayout
+    ssm: MambaSubStateLayout
+    page_size_bytes: int
+
+    @property
+    def pad_byte_offset(self) -> int:
+        """Offset of the trailing pad region from the page base, in bytes."""
+        return self.ssm.byte_offset + self.ssm.byte_length
+
+    @property
+    def pad_byte_length(self) -> int:
+        """Length of the trailing pad region, in bytes (0 if page-aligned)."""
+        return self.page_size_bytes - self.pad_byte_offset
+
 
 # Synthetic head count for a reinterpreted page. The page is opaque bytes, so
 # one "head" holding the whole per-(K/V) slab is enough; head_size is derived
@@ -217,7 +272,11 @@ class _MambaPageViewEdit(KVCacheGroupEdit):
     dtype, with ``head_size`` derived to fill the page exactly.
 
     The view's dims are addressing metadata only; the bytes are opaque
-    (conv | ssm | pad, not K/V), so content-aware processing does not apply.
+    (conv | ssm | pad, not K/V) by default, so content-aware processing does
+    not apply to :meth:`apply`'s return value -- it may mix ``conv_state``
+    and ``ssm_state`` bytes under one dtype even when they differ (see
+    :meth:`real_layout`). Callers that need to read real values instead of
+    just addressing bytes must use :meth:`real_layout`.
     """
 
     name = "mamba-page-view"
@@ -226,6 +285,81 @@ class _MambaPageViewEdit(KVCacheGroupEdit):
         return get_kv_cache_spec_kind(spec) == KVCacheSpecKind.MAMBA and isinstance(
             kv_cache, list
         )
+
+    def real_layout(self, spec: KVCacheSpec) -> MambaRealLayout:
+        """Return the page's real (non-pad) byte layout, per sub-state.
+
+        vLLM's ``MambaSpec.shapes``/``dtypes`` declare ``conv_state`` and
+        ``ssm_state`` independently (see ``gated_delta_net_state_shape`` /
+        ``gated_delta_net_state_dtype``) and may give them different dtypes
+        -- e.g. Qwen3.5/3.6 keep ``ssm_state`` in float32 for accuracy while
+        ``conv_state`` stays float16. :meth:`apply`'s flattened view walks
+        the page in ``conv_state``'s element size throughout, so reading it
+        as real values (not just addressing bytes) over the ``ssm_state``
+        region reinterprets fp32 bit patterns as fp16 -- garbage, not a
+        precision loss. Callers that need real values (e.g. per-tensor
+        quantization) must read each region with the dtype this method
+        reports, not the dtype :meth:`apply`'s view happens to carry.
+
+        Args:
+            spec: The layer's vLLM ``MambaSpec`` (from its group). Must
+                declare exactly two sub-states, ``(conv_state, ssm_state)``,
+                matching the order :meth:`apply` and vLLM's registered
+                ``[conv_state, ssm_state]`` list both assume.
+
+        Returns:
+            The page's real byte layout: ``conv_state``'s and
+            ``ssm_state``'s own byte extents (offset, length, dtype), plus
+            the total page size (pad is whatever remains after ``ssm``).
+
+        Raises:
+            ValueError: If ``spec`` does not declare exactly two sub-states,
+                or their combined real bytes exceed the page size.
+        """
+        shapes = spec.shapes
+        dtypes = spec.dtypes
+        if len(shapes) != 2 or len(dtypes) != 2:
+            raise ValueError(
+                f"expected a Mamba spec with exactly 2 sub-states "
+                f"(conv_state, ssm_state), got {len(shapes)} shapes and "
+                f"{len(dtypes)} dtypes"
+            )
+        conv_shape, ssm_shape = shapes
+        conv_dtype, ssm_dtype = dtypes
+        conv_bytes = (
+            self._numel(conv_shape) * torch.empty((), dtype=conv_dtype).element_size()
+        )
+        ssm_bytes = (
+            self._numel(ssm_shape) * torch.empty((), dtype=ssm_dtype).element_size()
+        )
+        if conv_bytes + ssm_bytes > spec.page_size_bytes:
+            raise ValueError(
+                f"Mamba conv_state + ssm_state real bytes "
+                f"({conv_bytes + ssm_bytes}) exceed the page size "
+                f"({spec.page_size_bytes} bytes)"
+            )
+        return MambaRealLayout(
+            conv=MambaSubStateLayout(
+                byte_offset=0,
+                byte_length=conv_bytes,
+                dtype=conv_dtype,
+                shape=tuple(conv_shape),
+            ),
+            ssm=MambaSubStateLayout(
+                byte_offset=conv_bytes,
+                byte_length=ssm_bytes,
+                dtype=ssm_dtype,
+                shape=tuple(ssm_shape),
+            ),
+            page_size_bytes=spec.page_size_bytes,
+        )
+
+    @staticmethod
+    def _numel(shape: tuple[int, ...]) -> int:
+        result = 1
+        for dim in shape:
+            result *= dim
+        return result
 
     def apply(
         self,

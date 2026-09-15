@@ -64,6 +64,15 @@ class MambaSpec:
 
 
 @dataclass
+class MambaSpecWithLayout(MambaSpec):
+    """Mamba spec double that also declares real sub-state layout."""
+
+    shapes: tuple = ((3, 6144), (16, 128, 128))
+    dtypes: tuple = (torch.float16, torch.float32)
+    page_size_bytes: int = 3 * 6144 * 2 + 16 * 128 * 128 * 4
+
+
+@dataclass
 class UniformTypeKVCacheSpecs:
     block_size: int
     kv_cache_specs: "dict[str, object]" = field(default_factory=dict)
@@ -236,6 +245,102 @@ def test_conversion_mamba_non_align_not_windowed():
     )
 
     assert [group.sw_size_tokens for group in spec] == [-1]
+
+
+def test_conversion_resolves_cache_category():
+    """Attention, Mamba, and unknown (no-config) layers get their category."""
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["layer.0"], FullAttentionSpec(block_size=16)),
+                MockKVCacheGroup(["layer.1"], MambaSpec(block_size=16)),
+            ]
+        ),
+        _same_shape_caches(["layer.0", "layer.1"]),
+    )
+
+    assert [group.cache_category for group in spec] == ["attention", "mamba"]
+
+
+def test_conversion_defaults_cache_category_to_unknown_without_config():
+    """No vLLM KV cache groups -> cache_category stays 'unknown'."""
+    spec = create_engine_group_infos_from_vllm(
+        None, _same_shape_caches(["layer.0", "layer.1"])
+    )
+
+    assert [group.cache_category for group in spec] == ["unknown"]
+
+
+def test_conversion_resolves_mamba_real_layout():
+    """A Mamba spec declaring shapes/dtypes/page_size_bytes yields a
+    (conv, ssm) wire layout with each sub-state's own dtype and byte extent."""
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["layer.0"], MambaSpecWithLayout(block_size=16)),
+            ]
+        ),
+        _same_shape_caches(["layer.0"]),
+    )
+
+    (group,) = spec
+    assert group.cache_category == "mamba"
+    conv, ssm = group.mamba_real_layout
+    assert conv.byte_offset == 0
+    assert conv.byte_length == 3 * 6144 * 2
+    assert conv.dtype_str == "torch.float16"
+    assert conv.shape == (3, 6144)
+    assert ssm.byte_offset == conv.byte_length
+    assert ssm.byte_length == 16 * 128 * 128 * 4
+    assert ssm.dtype_str == "torch.float32"
+    assert ssm.shape == (16, 128, 128)
+
+
+def test_conversion_mamba_without_layout_fields_has_no_real_layout():
+    """A Mamba spec double without shapes/dtypes (e.g. a minimal test double
+    or older payload) still classifies as 'mamba' but layout is None."""
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["layer.0"], MambaSpec(block_size=16)),
+            ]
+        ),
+        _same_shape_caches(["layer.0"]),
+    )
+
+    (group,) = spec
+    assert group.cache_category == "mamba"
+    assert group.mamba_real_layout is None
+
+
+def test_conversion_attention_group_has_no_mamba_real_layout():
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["layer.0"], FullAttentionSpec(block_size=16)),
+            ]
+        ),
+        _same_shape_caches(["layer.0"]),
+    )
+
+    (group,) = spec
+    assert group.mamba_real_layout is None
+
+
+def test_conversion_rejects_mamba_layout_with_wrong_substate_count():
+    """A Mamba spec declaring other than exactly 2 sub-states is rejected."""
+    bad_spec = MambaSpecWithLayout(
+        block_size=16,
+        shapes=((3, 6144),),
+        dtypes=(torch.float16,),
+    )
+    with pytest.raises(ValueError, match="exactly 2 sub-states"):
+        create_engine_group_infos_from_vllm(
+            MockKVCacheConfig(
+                kv_cache_groups=[MockKVCacheGroup(["layer.0"], bad_spec)]
+            ),
+            _same_shape_caches(["layer.0"]),
+        )
 
 
 def test_conversion_uniform_type_specs_resolve_per_layer():
