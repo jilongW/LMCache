@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import count
+import json
 import os
 import threading
 from typing import Any, ClassVar, Optional
@@ -14,6 +15,52 @@ import torch
 from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
+
+# Fallback model text-config, used when MODEL_PATH/MODEL are unset or the
+# model's config.json is missing the fields KVWeave needs. Mirrors
+# Qwen3.5-9B's known text_config geometry.
+_QWEN35_9B_DEFAULTS: dict[str, int] = {
+    "num_key_value_heads": 4,
+    "head_dim": 256,
+    "linear_key_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_value_head_dim": 128,
+    "linear_num_value_heads": 32,
+}
+
+
+def _load_model_text_config() -> dict[str, int]:
+    """Resolve KV/Mamba geometry from ``{MODEL_PATH}/{MODEL}/config.json``.
+
+    Reads the ``text_config`` section (falling back to the top-level object
+    for models that don't nest their text config) and returns
+    ``num_key_value_heads``/``head_dim``/``linear_*_head_dim``/
+    ``linear_num_*_heads``. Any field missing from the environment, the
+    model directory, or the model's config falls back to the Qwen3.5-9B
+    defaults above.
+    """
+    result = dict(_QWEN35_9B_DEFAULTS)
+    model_path = os.environ.get("MODEL_PATH")
+    model = os.environ.get("MODEL")
+    if not model_path or not model:
+        return result
+    config_path = os.path.join(model_path, model, "config.json")
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(
+            "Failed to read model config at %s (%s); falling back to "
+            "Qwen3.5-9B KVWeave defaults",
+            config_path,
+            e,
+        )
+        return result
+    text_config = config.get("text_config", config)
+    for key in result:
+        if key in text_config:
+            result[key] = int(text_config[key])
+    return result
 
 
 @dataclass(frozen=True)
@@ -60,7 +107,7 @@ class MambaCodecOptions:
     ssm_rh: bool
     asym: bool
     conv_qbit: int = 4
-    ssm_qbit: int = 16
+    ssm_qbit: int = 4
     conv_quant_enabled: bool = True
     ssm_quant_enabled: bool = True
     conv_qkv_split: ConvQKVSplit = field(
@@ -90,6 +137,13 @@ class MambaCodecOptions:
             "LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD", "per_channel"
         )
         conv_rh = _env_flag("LMCACHE_MP_KVWEAVE_CONV_RH", linear_rh)
+        text_config = _load_model_text_config()
+        conv_qkv_split = ConvQKVSplit(
+            key_dim=text_config["linear_key_head_dim"]
+            * text_config["linear_num_key_heads"],
+            value_dim=text_config["linear_value_head_dim"]
+            * text_config["linear_num_value_heads"],
+        )
         return cls(
             conv_scaling_method=conv_scaling,
             conv_rh=conv_rh,
@@ -99,13 +153,14 @@ class MambaCodecOptions:
             ssm_rh=_env_flag("LMCACHE_MP_KVWEAVE_SSM_RH", True),
             asym=_env_flag("LMCACHE_MP_KVWEAVE_LINEAR_ASYM", True),
             conv_qbit=int(os.environ.get("LMCACHE_MP_KVWEAVE_CONV_QBIT", "4")),
-            ssm_qbit=int(os.environ.get("LMCACHE_MP_KVWEAVE_SSM_QBIT", "16")),
+            ssm_qbit=int(os.environ.get("LMCACHE_MP_KVWEAVE_SSM_QBIT", "4")),
             conv_quant_enabled=_env_flag(
                 "LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED", True
             ),
             ssm_quant_enabled=_env_flag(
                 "LMCACHE_MP_KVWEAVE_SSM_QUANT_ENABLED", True
             ),
+            conv_qkv_split=conv_qkv_split,
         )
 
 
@@ -132,7 +187,7 @@ class KVWeaveRuntimeConfig:
             ssm_rh=True,
             asym=True,
             conv_qbit=4,
-            ssm_qbit=16,
+            ssm_qbit=4,
         )
     )
 
@@ -147,6 +202,7 @@ class KVWeaveRuntimeConfig:
         ``KVWeaveCodec(...)``.
         """
         enabled = _env_flag("LMCACHE_MP_L1_KVWEAVE_QUANT", False)
+        text_config = _load_model_text_config()
         return cls(
             enabled=enabled,
             linear_quant_enabled=_env_flag(
@@ -158,10 +214,8 @@ class KVWeaveRuntimeConfig:
             attention_codec_kwargs={
                 "quantize": True,
                 "qbit": 4,
-                "num_kv_heads": int(
-                    os.environ.get("LMCACHE_MP_KVWEAVE_NUM_KV_HEADS", "1")
-                ),
-                "head_dim": int(os.environ.get("LMCACHE_MP_KVWEAVE_HEAD_DIM", "0")),
+                "num_kv_heads": text_config["num_key_value_heads"],
+                "head_dim": text_config["head_dim"],
                 "scaling_method": os.environ.get(
                     "LMCACHE_MP_KVWEAVE_SCALING_METHOD", "per_channel"
                 ),

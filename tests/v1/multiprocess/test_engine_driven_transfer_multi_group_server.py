@@ -21,6 +21,7 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     RegisterEngineDrivenContextPayload,
+    serialize_memory_layout_desc,
 )
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
@@ -228,6 +229,118 @@ def test_register_without_groups_keeps_single_group_registry_call(
 
         assert mock_register.call_args.kwargs == {}
         assert len(mock_register.call_args.args) == 3
+
+
+def test_register_rejects_quantization_on_fixed_size_l1(
+    stub_native_storage_ops: None,
+) -> None:
+    """``enable_l1_kvweave_quant=True`` against a fixed-size L1 must be
+    rejected with a clean error response, not raise, and must not register
+    the context or mark quantization enabled (see MIGRATION_PLAN.md V8)."""
+    with ExitStack() as stack:
+        mock_storage = MagicMock()
+        mock_storage.is_l1_variable_size.return_value = False
+        _patch_engine_context(stack, mock_storage, [b"h1", b"h2"])
+        ctx = _make_context()
+        module = EngineDrivenTransferModule(ctx)
+
+        payload = RegisterEngineDrivenContextPayload(
+            instance_id=1,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+            num_physical_slots=8,
+            enable_l1_kvweave_quant=True,
+        )
+        response = module.register_kv_cache_engine_driven_context(payload)
+
+        assert response.error is not None
+        assert "variable-size" in response.error
+        mock_storage.mark_l1_kvweave_quant_enabled.assert_not_called()
+        # Rejected registration must not be visible to later transfers.
+        assert 1 not in module._engine_driven_contexts  # noqa: SLF001
+
+
+def test_register_accepts_quantization_on_variable_size_l1(
+    stub_native_storage_ops: None,
+) -> None:
+    """``enable_l1_kvweave_quant=True`` against a variable-size L1 succeeds
+    and marks quantization enabled on the storage manager."""
+    with ExitStack() as stack:
+        mock_storage = MagicMock()
+        mock_storage.is_l1_variable_size.return_value = True
+        _patch_engine_context(stack, mock_storage, [b"h1", b"h2"])
+        ctx = _make_context()
+        module = EngineDrivenTransferModule(ctx)
+
+        payload = RegisterEngineDrivenContextPayload(
+            instance_id=1,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+            num_physical_slots=8,
+            enable_l1_kvweave_quant=True,
+        )
+        response = module.register_kv_cache_engine_driven_context(payload)
+
+        assert response.error is None
+        mock_storage.mark_l1_kvweave_quant_enabled.assert_called_once()
+        assert 1 in module._engine_driven_contexts  # noqa: SLF001
+
+
+def test_register_group_layout_descs_override_per_group_layout(
+    stub_native_storage_ops: None,
+) -> None:
+    """A non-``None`` ``group_layout_descs`` entry overrides that group's
+    server-derived layout; a ``None`` entry keeps the server's own
+    derivation (see MIGRATION_PLAN.md Phase D item 4)."""
+    with ExitStack() as stack:
+        mock_storage = MagicMock()
+        mock_storage.is_l1_variable_size.return_value = True
+        _patch_engine_context(stack, mock_storage, [b"h1", b"h2"])
+        ctx = _make_context()
+        module = EngineDrivenTransferModule(ctx)
+
+        quantized_layout = serialize_memory_layout_desc(
+            MemoryLayoutDesc(shapes=[torch.Size([123])], dtypes=[torch.uint8])
+        )
+        payload = RegisterEngineDrivenContextPayload(
+            instance_id=1,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=4,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+            num_physical_slots=8,
+            engine_group_infos=_hybrid_groups(),
+            group_layout_descs=[quantized_layout, None],
+            enable_l1_kvweave_quant=True,
+        )
+        response = module.register_kv_cache_engine_driven_context(payload)
+
+        assert response.error is None
+        entry = module._engine_driven_contexts[1]  # noqa: SLF001
+        # Group 0's layout is the worker-supplied quantized override.
+        assert tuple(entry.metadata_by_group[0].layout_desc.shapes[0]) == (123,)
+        assert entry.metadata_by_group[0].layout_desc.dtypes[0] == torch.uint8
+        # Group 1 has no override: server derives it as before (2 layers x
+        # 2 x 8 physical slots x 16 hidden dim).
+        assert tuple(entry.metadata_by_group[1].layout_desc.shapes[0]) == (
+            2,
+            2,
+            8,
+            16,
+        )
 
 
 def test_register_falls_back_to_single_metadata_without_groups(

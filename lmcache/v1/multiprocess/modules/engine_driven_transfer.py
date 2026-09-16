@@ -23,6 +23,7 @@ from lmcache.v1.distributed.api import (
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     RegisterEngineDrivenContextPayload,
+    deserialize_memory_layout_desc,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext, ShmPoolInfo
@@ -501,10 +502,15 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             payload: Struct containing all registration fields
                 (instance_id, model_name, world_size, block_size,
                 num_layers, hidden_dim_size, dtype_str, use_mla,
-                num_physical_slots, engine_group_infos).
+                num_physical_slots, engine_group_infos,
+                group_layout_descs, enable_l1_kvweave_quant).
 
-        Raises:
-            ValueError: If ``payload.dtype_str`` is not a valid torch dtype name.
+        Returns:
+            On success, a response carrying ``shm_name``/``pool_size``
+            with ``error=None``. On rejection (invalid ``dtype_str``,
+            invalid ``num_physical_slots``, or a quantized registration
+            requested against a fixed-size L1), a response with ``error``
+            set and no other field meaningful.
         """
         shm_name = self._shm_pool_info["shm_name"]
         pool_size = self._shm_pool_info["pool_size"]
@@ -524,10 +530,13 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
 
         dtype = getattr(torch, payload.dtype_str, None)
         if dtype is None or not isinstance(dtype, torch.dtype):
-            raise ValueError(
-                f"Invalid dtype_str '{payload.dtype_str}': must be a valid torch dtype "
-                "attribute name (e.g. 'float16' for torch.float16, "
-                "'bfloat16' for torch.bfloat16, 'float32' for torch.float32)."
+            return RegisterEngineDrivenContextResponse(
+                error=(
+                    f"Invalid dtype_str '{payload.dtype_str}': must be a valid "
+                    "torch dtype attribute name (e.g. 'float16' for "
+                    "torch.float16, 'bfloat16' for torch.bfloat16, 'float32' "
+                    "for torch.float32)."
+                )
             )
 
         num_physical_slots = payload.num_physical_slots
@@ -536,9 +545,21 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             # was added. Those clients require one slot per logical token.
             num_physical_slots = self._ctx.chunk_size
         elif num_physical_slots <= 0:
-            raise ValueError(
-                f"num_physical_slots must be positive, got {num_physical_slots}"
+            return RegisterEngineDrivenContextResponse(
+                error=f"num_physical_slots must be positive, got {num_physical_slots}"
             )
+
+        if payload.enable_l1_kvweave_quant:
+            if not self._ctx.storage_manager.is_l1_variable_size():
+                return RegisterEngineDrivenContextResponse(
+                    error=(
+                        "enable_l1_kvweave_quant=True but this L1 backend "
+                        "does not support variable-size chunks "
+                        "(is_l1_variable_size() is False); refusing to "
+                        "register a quantized context on a fixed-size L1"
+                    )
+                )
+            self._ctx.storage_manager.mark_l1_kvweave_quant_enabled()
 
         layout_desc = self._make_group_layout_desc(
             payload.num_layers,
@@ -556,9 +577,21 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         # group's per-token width can differ from the shared hidden_dim_size.
         # Missing entries fall back to it.
         group_hidden_dim_sizes = payload.group_hidden_dim_sizes or []
+        # A quantized group's worker-supplied layout takes precedence over
+        # the server's own derivation: the quantized wire payload is
+        # variable-size uint8 bytes, not the group's raw KV dtype/shape, so
+        # SHM slots for that group must be sized off this layout (see
+        # MIGRATION_PLAN.md Phase D / docs/design/v1/multiprocess/
+        # engine_driven_transfer_design.md "KVWeave Quantization").
+        group_layout_overrides: dict[int, MemoryLayoutDesc] = {
+            idx: deserialize_memory_layout_desc(serialized)
+            for idx, serialized in enumerate(payload.group_layout_descs or [])
+            if serialized is not None
+        }
         metadata_by_group = [
             EngineDrivenContextMetadata(
-                layout_desc=self._make_group_layout_desc(
+                layout_desc=group_layout_overrides.get(i)
+                or self._make_group_layout_desc(
                     len(group_info.layer_indices),
                     num_physical_slots,
                     (
@@ -600,11 +633,12 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
 
         logger.info(
             "Registered non-GPU context for instance %d (model=%s, world_size=%d, "
-            "num_groups=%d)",
+            "num_groups=%d, kvweave_quant=%s)",
             payload.instance_id,
             payload.model_name,
             payload.world_size,
             max(1, len(metadata_by_group)),
+            payload.enable_l1_kvweave_quant,
         )
 
         if metadata_by_group:

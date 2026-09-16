@@ -287,8 +287,12 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     # ``out_buffers`` / ``chunk_indices`` (when present) are
                     # flat over the whole multi-group chunk sequence,
                     # group-major; each group's own chunk-count range is
-                    # sliced out before gathering that group.
+                    # sliced out before gathering that group. Boundaries are
+                    # tracked per group so a quantized group's chunks can be
+                    # encoded in Phase 2.5 below without re-enumerating them
+                    # (MIGRATION_PLAN.md R2).
                     gather_target: list[torch.Tensor] = []
+                    group_ranges: list[tuple[Any, int, int]] = []
                     group_offset = 0
                     with torch.inference_mode(), torch_dev.stream(self._copy_stream):
                         _event.wait(stream=self._copy_stream)
@@ -307,7 +311,15 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                             if selection.is_empty:
                                 continue
 
-                            if out_buffers is not None:
+                            # A quantized group's SHM slot is sized for the
+                            # *quantized* (uint8) payload, not this group's
+                            # raw KV tensor shape/dtype -- gathering the raw
+                            # tensor straight into that slot would overflow
+                            # it. Quantized groups always gather into pinned
+                            # staging at the raw shape and are encoded into
+                            # the commit list in Phase 2.5; only
+                            # non-quantized groups use the SHM slot directly.
+                            if out_buffers is not None and not plan.quantized:
                                 group_out = [
                                     out_buffers[out_idx]
                                     for out_idx in selection.out_indices
@@ -320,6 +332,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                 )
                                 staged_chunks.extend(group_out)
 
+                            start_idx = len(gather_target)
                             gather_target.extend(
                                 gather_paged_kv_to_cpu(
                                     group_kv_caches,
@@ -333,6 +346,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                     chunk_indices=selection.chunk_indices,
                                 )
                             )
+                            group_ranges.append((plan, start_idx, len(gather_target)))
 
                         gather_done = torch_dev.Event()
                         gather_done.record(self._copy_stream)
@@ -346,10 +360,23 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     if gather_done is not None:
                         gather_done.synchronize()
 
+                    # --- Phase 2.5: quantize (post-gather, pre-commit) ---
+                    # encode_chunk() must not run until gather_done has been
+                    # synchronized above: gather issues async device->CPU
+                    # copies, and encoding reads the gathered tensor's bytes.
+                    commit_target = list(gather_target)
+                    for plan, start_idx, end_idx in group_ranges:
+                        if plan.quantized:
+                            commit_target[start_idx:end_idx] = (
+                                self._encode_group_chunks(
+                                    plan, gather_target[start_idx:end_idx]
+                                )
+                            )
+
                     # --- Phase 3: commit ---
                     with self._commit_lock:
                         ok = engine_driven_context.commit_store(
-                            key, instance_id, gather_target
+                            key, instance_id, commit_target
                         )
 
                     if not ok:

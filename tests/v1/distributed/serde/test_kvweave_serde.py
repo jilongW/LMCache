@@ -192,6 +192,42 @@ def _mamba_layouts() -> tuple[MambaSubStateWireLayout, MambaSubStateWireLayout]:
     )
 
 
+@pytest.mark.parametrize(
+    "cache_category,mamba_layout",
+    [
+        ("mamba", None),
+        ("attention", _mamba_layouts()),
+        ("unknown", None),
+        ("unknown", _mamba_layouts()),
+        ("bogus", None),
+    ],
+)
+def test_encode_decode_chunk_reject_invalid_category_dispatch(
+    cache_category, mamba_layout
+):
+    """Mamba data fed to the attention path (or vice versa) must raise.
+
+    Guards MIGRATION_PLAN.md R1/R6: dispatch is based solely on the
+    explicit ``cache_category``/``mamba_layout`` pair, never on tensor
+    shape, and "unknown" is never silently treated as attention.
+    """
+    codec = _codec()
+    source = torch.randn(2, 1, 64, 8, dtype=torch.float16)
+
+    with pytest.raises(ValueError):
+        codec.encode_chunk(cache_category, mamba_layout, 64, None, source)
+
+    with pytest.raises(ValueError):
+        codec.decode_chunk(
+            cache_category,
+            mamba_layout,
+            64,
+            source.shape,
+            source.dtype,
+            torch.zeros(1, dtype=torch.uint8),
+        )
+
+
 def test_estimate_mamba_serialized_size_is_positive_and_scales_with_layers():
     small_layout = MemoryLayoutDesc([torch.Size([2, 2, 8, 8])], [torch.float32])
     large_layout = MemoryLayoutDesc([torch.Size([2, 8, 8, 8])], [torch.float32])

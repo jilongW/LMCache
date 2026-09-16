@@ -11,11 +11,17 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
+from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheServerKey,
+    RegisterEngineDrivenContextPayload,
+    RegisterEngineDrivenContextResponse,
+    SerializedMemoryLayoutDesc,
+    deserialize_memory_layout_desc,
     get_customized_decoder,
     get_customized_encoder,
+    serialize_memory_layout_desc,
 )
 
 
@@ -419,3 +425,97 @@ def test_block_allocation_record_list_serialization():
     assert decoded[1].req_id == "req-2"
     assert decoded[1].new_block_ids == []
     assert decoded[1].new_token_ids == [40, 50]
+
+
+def test_serialize_deserialize_memory_layout_desc_round_trip():
+    """A MemoryLayoutDesc must survive serialize -> deserialize with its
+    torch.Size/torch.dtype values intact."""
+    original = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 4, 8, 16]), torch.Size([123])],
+        dtypes=[torch.float16, torch.uint8],
+    )
+
+    serialized = serialize_memory_layout_desc(original)
+    assert serialized.shapes == [[2, 4, 8, 16], [123]]
+    assert serialized.dtypes == ["torch.float16", "torch.uint8"]
+
+    restored = deserialize_memory_layout_desc(serialized)
+    assert restored.shapes == original.shapes
+    assert restored.dtypes == original.dtypes
+
+
+def test_deserialize_memory_layout_desc_rejects_unknown_dtype():
+    bad = SerializedMemoryLayoutDesc(shapes=[[1]], dtypes=["not_a_real_dtype"])
+    with pytest.raises(ValueError, match="Unsupported torch dtype"):
+        deserialize_memory_layout_desc(bad)
+
+
+def test_register_engine_driven_context_payload_round_trip_with_kvweave_fields():
+    """``group_layout_descs``/``enable_l1_kvweave_quant`` must survive the
+    msgspec round-trip used over the wire (see MIGRATION_PLAN.md V7)."""
+    quantized_layout = serialize_memory_layout_desc(
+        MemoryLayoutDesc(shapes=[torch.Size([64])], dtypes=[torch.uint8])
+    )
+    original = RegisterEngineDrivenContextPayload(
+        instance_id=1,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float16",
+        use_mla=False,
+        group_layout_descs=[quantized_layout, None],
+        enable_l1_kvweave_quant=True,
+    )
+
+    encoded = msgspec.msgpack.encode(original)
+    decoded = msgspec.msgpack.decode(encoded, type=RegisterEngineDrivenContextPayload)
+
+    assert decoded.enable_l1_kvweave_quant is True
+    assert decoded.group_layout_descs == [quantized_layout, None]
+
+
+def test_register_engine_driven_context_payload_round_trip_without_kvweave_fields():
+    """Omitting the new fields (old-client wire compatibility) must decode
+    to their documented defaults."""
+    original = RegisterEngineDrivenContextPayload(
+        instance_id=1,
+        model_name="m",
+        world_size=1,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float16",
+        use_mla=False,
+    )
+
+    encoded = msgspec.msgpack.encode(original)
+    decoded = msgspec.msgpack.decode(encoded, type=RegisterEngineDrivenContextPayload)
+
+    assert decoded.group_layout_descs is None
+    assert decoded.enable_l1_kvweave_quant is False
+
+
+def test_register_engine_driven_context_response_round_trip_with_error():
+    original = RegisterEngineDrivenContextResponse(error="L1 is not variable-size")
+
+    encoded = msgspec.msgpack.encode(original)
+    decoded = msgspec.msgpack.decode(encoded, type=RegisterEngineDrivenContextResponse)
+
+    assert decoded.error == "L1 is not variable-size"
+    assert decoded.shm_name == ""
+    assert decoded.pool_size == 0
+
+
+def test_register_engine_driven_context_response_round_trip_without_error():
+    """Old-client wire compatibility: a response with no ``error`` field
+    decodes to ``error=None``."""
+    original = RegisterEngineDrivenContextResponse(shm_name="pool", pool_size=42)
+
+    encoded = msgspec.msgpack.encode(original)
+    decoded = msgspec.msgpack.decode(encoded, type=RegisterEngineDrivenContextResponse)
+
+    assert decoded.error is None
+    assert decoded.shm_name == "pool"
+    assert decoded.pool_size == 42

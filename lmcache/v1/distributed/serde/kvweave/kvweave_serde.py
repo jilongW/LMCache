@@ -559,6 +559,66 @@ class _KVWeaveCodec:
         value = blob[offset : offset + value_size]
         return query, key, value
 
+    _VALID_CACHE_CATEGORIES = frozenset({"attention", "mamba", "unknown"})
+
+    @staticmethod
+    def _validate_cache_category_dispatch(
+        cache_category: str,
+        mamba_layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None,
+    ) -> None:
+        """Reject any category/layout combination that would mis-dispatch.
+
+        ``cache_category`` must be exactly one of ``"attention"``,
+        ``"mamba"``, or ``"unknown"`` (see ``EngineGroupInfo.cache_category``).
+        Only ``"mamba"`` may carry a non-``None`` ``mamba_layout``.
+        ``"unknown"`` is rejected unconditionally: it exists so that a
+        caller who failed to resolve a group's real category fails loudly
+        here instead of silently falling into the attention path (the
+        historical incident this guards against: a Mamba group's opaque
+        page-view chunk shape happens to be compatible with the attention
+        codec's fused K/V shape, so a shape-based dispatch would silently
+        corrupt the recurrent state instead of raising -- see
+        MIGRATION_PLAN.md R1/R6).
+
+        Args:
+            cache_category: The group's declared category.
+            mamba_layout: The group's real conv/ssm sub-state layout, or
+                ``None`` for a non-Mamba group.
+
+        Raises:
+            ValueError: If ``cache_category`` is not one of the three
+                valid values, if ``cache_category != "mamba"`` but
+                ``mamba_layout`` is provided, if ``cache_category ==
+                "mamba"`` but ``mamba_layout`` is missing, or if
+                ``cache_category == "unknown"``.
+        """
+        if cache_category not in _KVWeaveCodec._VALID_CACHE_CATEGORIES:
+            raise ValueError(
+                f"Unknown cache_category {cache_category!r}; expected one "
+                f"of {sorted(_KVWeaveCodec._VALID_CACHE_CATEGORIES)}"
+            )
+        if cache_category == "unknown":
+            raise ValueError(
+                "cache_category='unknown' must never be passed to "
+                "encode_chunk/decode_chunk -- quantization dispatch "
+                "requires an explicitly classified group (see "
+                "EngineGroupInfo.cache_category); resolve the category "
+                "before calling"
+            )
+        if cache_category == "mamba" and mamba_layout is None:
+            raise ValueError(
+                "cache_category='mamba' requires a non-None mamba_layout "
+                "(conv, ssm); the caller must resolve "
+                "EngineGroupInfo.mamba_real_layout before calling "
+                "encode_chunk/decode_chunk"
+            )
+        if cache_category != "mamba" and mamba_layout is not None:
+            raise ValueError(
+                f"mamba_layout was provided but cache_category="
+                f"{cache_category!r} is not 'mamba'; this would misroute "
+                "a non-Mamba chunk into the Mamba split/merge codec"
+            )
+
     def encode_chunk(
         self,
         cache_category: str,
@@ -576,7 +636,13 @@ class _KVWeaveCodec:
         codec). Applying the attention codec to a Mamba group's opaque
         page-view chunk would silently corrupt its recurrent state -- see
         Phase 6 in MIGRATION_PLAN.md.
+
+        Raises:
+            ValueError: If ``cache_category``/``mamba_layout`` do not form
+                a valid, unambiguous dispatch -- see
+                :meth:`_validate_cache_category_dispatch`.
         """
+        self._validate_cache_category_dispatch(cache_category, mamba_layout)
         if mamba_layout is not None:
             if mamba_options is None:
                 raise RuntimeError("Mamba codec options are not initialized")
@@ -627,7 +693,13 @@ class _KVWeaveCodec:
         ``deserialize_tensor`` writes into a caller-provided destination
         internally, so callers of this method never need to know which
         convention the underlying codec uses).
+
+        Raises:
+            ValueError: If ``cache_category``/``mamba_layout`` do not form
+                a valid, unambiguous dispatch -- see
+                :meth:`_validate_cache_category_dispatch`.
         """
+        self._validate_cache_category_dispatch(cache_category, mamba_layout)
         if mamba_layout is not None:
             conv_layout, ssm_layout = mamba_layout
             conv_payload, ssm_payload = self.unpack_mamba_payloads(

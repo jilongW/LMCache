@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 # Third Party
 import msgspec
@@ -12,6 +12,10 @@ from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.platform.base.ipc_wrapper import (  # noqa: E402,F401
     DeviceIPCWrapper,
 )
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
 
 """
 Defines the types and the customized encoder/decoders for inter-process
@@ -160,6 +164,78 @@ class IPCCacheServerKey:
 KVCache = list[DeviceIPCWrapper]
 
 
+class SerializedMemoryLayoutDesc(msgspec.Struct, frozen=True):
+    """Message-pack-safe mirror of ``MemoryLayoutDesc``.
+
+    ``MemoryLayoutDesc`` (``lmcache.v1.distributed.api``) holds real
+    ``torch.Size``/``torch.dtype`` objects, which msgspec cannot encode when
+    nested inside another struct (the ``torch.dtype``/``torch.Size``
+    encode/decode hooks in this module only apply when ``MemoryLayoutDesc``
+    is itself the top-level payload/response class for an RPC, not when it
+    is a field of another struct -- see ``mq.py``'s
+    ``_SPECIAL_ENCODER_DECODERS``). This struct carries the same
+    information with wire-safe primitives so it can be embedded in
+    ``RegisterEngineDrivenContextPayload.group_layout_descs``.
+
+    Attributes:
+        shapes: One entry per tensor in the described layout, as plain
+            ``list[int]`` (mirrors ``MemoryLayoutDesc.shapes``).
+        dtypes: One entry per tensor, as ``str(torch.dtype)`` (mirrors
+            ``MemoryLayoutDesc.dtypes``).
+    """
+
+    shapes: list[list[int]]
+    dtypes: list[str]
+
+
+def serialize_memory_layout_desc(
+    layout_desc: "MemoryLayoutDesc",
+) -> SerializedMemoryLayoutDesc:
+    """Encode a memory layout for the engine-driven registration payload.
+
+    Args:
+        layout_desc: The layout to encode.
+
+    Returns:
+        A wire-safe ``SerializedMemoryLayoutDesc`` with the same shapes and
+        dtypes.
+    """
+    return SerializedMemoryLayoutDesc(
+        shapes=[list(shape) for shape in layout_desc.shapes],
+        dtypes=[str(dtype) for dtype in layout_desc.dtypes],
+    )
+
+
+def deserialize_memory_layout_desc(
+    payload: SerializedMemoryLayoutDesc,
+) -> "MemoryLayoutDesc":
+    """Decode a serialized layout descriptor from an IPC payload.
+
+    Args:
+        payload: The wire-safe struct produced by
+            ``serialize_memory_layout_desc``.
+
+    Returns:
+        The equivalent ``MemoryLayoutDesc`` with real ``torch.Size``/
+        ``torch.dtype`` values.
+
+    Raises:
+        ValueError: If any entry in ``payload.dtypes`` does not name a
+            valid ``torch.dtype``.
+    """
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
+
+    dtypes: list[torch.dtype] = []
+    for dtype_name in payload.dtypes:
+        dtype = getattr(torch, dtype_name.removeprefix("torch."), None)
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"Unsupported torch dtype in payload: {dtype_name}")
+        dtypes.append(dtype)
+    return MemoryLayoutDesc(
+        shapes=[torch.Size(shape) for shape in payload.shapes], dtypes=dtypes
+    )
+
+
 class RegisterEngineDrivenContextPayload(msgspec.Struct):
     """Payload for the REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT protocol message.
 
@@ -181,6 +257,21 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         group_hidden_dim_sizes: Per-group override of ``hidden_dim_size``,
             aligned with ``engine_group_infos``. Missing entries fall back
             to the shared ``hidden_dim_size``.
+        group_layout_descs: Per-group override of the layout descriptor the
+            server would otherwise derive from ``hidden_dim_size``/
+            ``group_hidden_dim_sizes``, aligned with ``engine_group_infos``.
+            An entry is non-``None`` only for a group the worker has
+            decided to quantize (KVWeave), where it carries the encoded
+            ``uint8`` byte layout so the server allocates SHM chunks sized
+            for the quantized payload rather than the raw KV tensor.
+            ``None`` (whole field or a given entry) means the server
+            derives the layout as before.
+        enable_l1_kvweave_quant: Worker's declared intent to quantize at
+            least one group's chunks for this registration. The server is
+            the sole authority on whether this is actually permitted --
+            see ``StorageManager.is_l1_variable_size()`` -- and rejects
+            registration via ``RegisterEngineDrivenContextResponse.error``
+            when it is not.
     """
 
     instance_id: int
@@ -194,14 +285,28 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     num_physical_slots: int | None = None
     engine_group_infos: list[EngineGroupInfo] = msgspec.field(default_factory=list)
     group_hidden_dim_sizes: list[int] | None = None
+    group_layout_descs: list[SerializedMemoryLayoutDesc | None] | None = None
+    enable_l1_kvweave_quant: bool = False
 
 
 @dataclass
 class RegisterEngineDrivenContextResponse:
-    """Shared response for engine-driven context registration."""
+    """Shared response for engine-driven context registration.
+
+    Attributes:
+        shm_name: Name of the shared-memory pool to attach to. Only
+            meaningful when ``error`` is ``None``.
+        pool_size: Size in bytes of the shared-memory pool. Only
+            meaningful when ``error`` is ``None``.
+        error: Human-readable rejection reason set when the server declines
+            this registration (e.g. quantization requested on a
+            fixed-size L1). ``None`` on success. Callers must check this
+            field before trusting ``shm_name``/``pool_size``.
+    """
 
     shm_name: str = ""
     pool_size: int = 0
+    error: str | None = None
 
 
 @dataclass

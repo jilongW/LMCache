@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from typing import Any, Callable, Generic, Optional, TypeVar, get_type_hints
 import enum
 import inspect
@@ -541,13 +541,38 @@ class MessageQueueServer:
         """
         Call the sync handler and send the response back to the client.
 
+        If the handler raises and its response class is a dataclass with
+        an ``error`` field, the exception is caught and converted into a
+        response carrying the error message instead of being swallowed by
+        the main loop's bare ``except Exception: logger.exception(...)``
+        (which never sends a response frame, so the caller would otherwise
+        just see a timeout with no diagnostic). Handlers whose response
+        class has no ``error`` field keep today's behavior: the exception
+        propagates to the main loop unchanged.
+
         Args:
             handler_entry (SyncRequestHandler[Any]): The handler entry.
             payloads (list[bytes]): The payloads of the request.
             prefix_frames (list[bytes]): The prefix frames to send back.
         """
-        response = handler_entry(payloads)
         response_cls = handler_entry.get_response_class()
+        try:
+            response = handler_entry(payloads)
+        except Exception as exc:
+            error_field_names = (
+                {f.name for f in fields(response_cls)}
+                if is_dataclass(response_cls)
+                else set()
+            )
+            if "error" not in error_field_names:
+                raise
+            logger.warning(
+                "Sync handler for %s raised %s; returning an error response: %s",
+                response_cls.__name__,
+                type(exc).__name__,
+                exc,
+            )
+            response = response_cls(error=str(exc))
         b_response = msgspec_encode(response, cls=response_cls)
         if response is not None:
             self.socket.send_multipart(prefix_frames + [b_response])

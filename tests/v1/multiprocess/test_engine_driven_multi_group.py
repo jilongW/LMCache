@@ -14,6 +14,8 @@ import torch
 
 # First Party
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.distributed.serde.kvweave.kvweave_config import KVWeaveRuntimeConfig
+from lmcache.v1.distributed.serde.kvweave.kvweave_serde import KVWeaveCodec
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocols.engine import (
@@ -30,6 +32,14 @@ from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     null_chunk_mask_from_groups,
 )
+
+
+def _disabled_kvweave_config() -> KVWeaveRuntimeConfig:
+    """A KVWeaveRuntimeConfig with quantization off, for plan-building tests
+    that are not exercising the quantization decision itself."""
+    return KVWeaveRuntimeConfig(
+        enabled=False, linear_quant_enabled=False, linear_max_size_ratio=1.2
+    )
 
 
 def _make_kv_caches(
@@ -127,7 +137,7 @@ class TestGroupChunkShape:
         layout_desc = MemoryLayoutDesc(
             shapes=[torch.Size([2, 4, 64, 16])], dtypes=[torch.float16]
         )
-        shape = worker_transfer._group_chunk_shape(None, layout_desc, 4)
+        shape = worker_transfer._group_chunk_shape(None, layout_desc, 4, 16, {}, None)
         assert shape == torch.Size([2, 4, 64, 16])
 
     def test_substitutes_group_layer_count(self) -> None:
@@ -136,8 +146,10 @@ class TestGroupChunkShape:
         layout_desc = MemoryLayoutDesc(
             shapes=[torch.Size([2, 24, 64, 16])], dtypes=[torch.float16]
         )
-        group = EngineGroupInfo(engine_group_id=0, layer_indices=tuple(range(6)))
-        shape = worker_transfer._group_chunk_shape(group, layout_desc, 24)
+        group = EngineGroupInfo(
+            engine_group_id=0, layer_indices=tuple(range(6)), recurrent_state=True
+        )
+        shape = worker_transfer._group_chunk_shape(group, layout_desc, 24, 16, {}, None)
         assert shape == torch.Size([2, 6, 64, 16])
 
     def test_substitutes_group_layer_count_mla_shape(self) -> None:
@@ -146,8 +158,12 @@ class TestGroupChunkShape:
         layout_desc = MemoryLayoutDesc(
             shapes=[torch.Size([24, 64, 16])], dtypes=[torch.float16]
         )
-        group = EngineGroupInfo(engine_group_id=1, layer_indices=tuple(range(6, 24)))
-        shape = worker_transfer._group_chunk_shape(group, layout_desc, 24)
+        group = EngineGroupInfo(
+            engine_group_id=1,
+            layer_indices=tuple(range(6, 24)),
+            recurrent_state=True,
+        )
+        shape = worker_transfer._group_chunk_shape(group, layout_desc, 24, 16, {}, None)
         assert shape == torch.Size([18, 64, 16])
 
 
@@ -165,7 +181,17 @@ class TestBuildGroupTransferPlans:
             shapes=[torch.Size([2, 2, 8, 16])], dtypes=[torch.float32]
         )
         plans = worker_transfer._build_group_transfer_plans(
-            [], kv_caches, 2, 4, layout_desc, 2, None
+            [],
+            kv_caches,
+            2,
+            4,
+            layout_desc,
+            2,
+            16,
+            None,
+            False,
+            _disabled_kvweave_config(),
+            KVWeaveCodec(),
         )
         assert len(plans) == 1
         assert plans[0].group_info is None
@@ -190,7 +216,17 @@ class TestBuildGroupTransferPlans:
             shapes=[torch.Size([2, 4, 8, 16])], dtypes=[torch.float32]
         )
         plans = worker_transfer._build_group_transfer_plans(
-            groups, kv_caches, 2, 4, layout_desc, 4, None
+            groups,
+            kv_caches,
+            2,
+            4,
+            layout_desc,
+            4,
+            16,
+            None,
+            False,
+            _disabled_kvweave_config(),
+            KVWeaveCodec(),
         )
         assert len(plans) == 2
         assert list(plans[0].select_kv_caches(kv_caches).keys()) == [
@@ -218,7 +254,17 @@ class TestBuildGroupTransferPlans:
             shapes=[torch.Size([2, 4, 8, 16])], dtypes=[torch.float32]
         )
         plans = worker_transfer._build_group_transfer_plans(
-            groups, kv_caches, 2, 4, layout_desc, 4, None
+            groups,
+            kv_caches,
+            2,
+            4,
+            layout_desc,
+            4,
+            16,
+            None,
+            False,
+            _disabled_kvweave_config(),
+            KVWeaveCodec(),
         )
         assert [p.engine_kv_format for p in plans] == [
             worker_transfer._detect_group_kv_format(p.select_kv_caches(kv_caches), None)
@@ -250,8 +296,186 @@ class TestBuildGroupTransferPlans:
         )
         with pytest.raises(ValueError, match="must be a multiple of"):
             worker_transfer._build_group_transfer_plans(
-                groups, kv_caches, 4, 16, layout_desc, 2, None
+                groups,
+                kv_caches,
+                4,
+                16,
+                layout_desc,
+                2,
+                16,
+                None,
+                False,
+                _disabled_kvweave_config(),
+                KVWeaveCodec(),
             )
+
+
+def _mamba_layouts():
+    # First Party
+    from lmcache.v1.multiprocess.group_view import MambaSubStateWireLayout
+
+    return (
+        MambaSubStateWireLayout(0, 16, "torch.float32", (2, 2)),
+        MambaSubStateWireLayout(16, 48, "torch.float32", (3, 4)),
+    )
+
+
+def _enabled_kvweave_config(**overrides: object) -> KVWeaveRuntimeConfig:
+    kwargs = {
+        "enabled": True,
+        "linear_quant_enabled": True,
+        "linear_max_size_ratio": 1.20,
+    }
+    kwargs.update(overrides)
+    return KVWeaveRuntimeConfig(**kwargs)
+
+
+class TestDecideGroupQuantization:
+    """The per-group quantization decision made once at register() time.
+
+    A wrong decision here either silently ships unquantized chunks (no
+    savings) or corrupts data (see MIGRATION_PLAN.md R1/R6): codec dispatch
+    must be driven only by ``cache_category``, never tensor shape.
+    """
+
+    def test_disabled_config_never_quantizes(self) -> None:
+        group = EngineGroupInfo(
+            engine_group_id=0, layer_indices=(0, 1), cache_category="attention"
+        )
+        quantized, quant_layout, mamba_options = (
+            worker_transfer._decide_group_quantization(
+                group,
+                torch.Size([2, 2, 8, 16]),
+                torch.float32,
+                4,
+                False,
+                _disabled_kvweave_config(),
+                KVWeaveCodec(),
+            )
+        )
+        assert quantized is False
+        assert quant_layout is None
+        assert mamba_options is None
+
+    def test_unknown_category_never_quantizes(self) -> None:
+        """A group whose category was never resolved must never be
+        quantized, regardless of what its tensor shape looks like."""
+        group = EngineGroupInfo(
+            engine_group_id=0, layer_indices=(0, 1), cache_category="unknown"
+        )
+        quantized, _, _ = worker_transfer._decide_group_quantization(
+            group,
+            torch.Size([2, 2, 8, 16]),
+            torch.float32,
+            4,
+            False,
+            _enabled_kvweave_config(),
+            KVWeaveCodec(),
+        )
+        assert quantized is False
+
+    def test_mla_attention_group_never_quantizes(self) -> None:
+        """MLA/fused-K/V (single-plane) formats are excluded from the
+        attention quantization branch."""
+        group = EngineGroupInfo(
+            engine_group_id=0, layer_indices=(0, 1), cache_category="attention"
+        )
+        quantized, _, _ = worker_transfer._decide_group_quantization(
+            group,
+            torch.Size([2, 8, 16]),
+            torch.float32,
+            4,
+            True,
+            _enabled_kvweave_config(),
+            KVWeaveCodec(),
+        )
+        assert quantized is False
+
+    def test_attention_group_quantizes_when_estimate_is_smaller(self) -> None:
+        """A large-enough attention chunk's 4-bit estimate must beat the
+        fp32 raw size, and the resulting quant_layout_desc is a uint8 byte
+        count, not the original shape."""
+        group = EngineGroupInfo(
+            engine_group_id=0, layer_indices=(0, 1), cache_category="attention"
+        )
+        # Large enough that per-channel scale overhead is amortized.
+        raw_shape = torch.Size([2, 2, 4096, 16])
+        codec = KVWeaveCodec({"num_kv_heads": 2, "head_dim": 8})
+        quantized, quant_layout, mamba_options = (
+            worker_transfer._decide_group_quantization(
+                group,
+                raw_shape,
+                torch.float32,
+                4,
+                False,
+                _enabled_kvweave_config(),
+                codec,
+            )
+        )
+        assert quantized is True
+        assert mamba_options is None
+        assert quant_layout is not None
+        assert quant_layout.dtypes[0] == torch.uint8
+        raw_size = 2 * 2 * 4096 * 16 * 4
+        assert quant_layout.shapes[0][0] < raw_size
+
+    def test_mamba_group_without_real_layout_falls_back_unquantized(self) -> None:
+        """A Mamba group missing mamba_real_layout must safely fall back to
+        unquantized transfer, not raise (MIGRATION_PLAN.md Phase D item 2)."""
+        group = EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=(0, 1),
+            cache_category="mamba",
+            mamba_real_layout=None,
+        )
+        quantized, quant_layout, mamba_options = (
+            worker_transfer._decide_group_quantization(
+                group,
+                torch.Size([2, 2, 8, 16]),
+                torch.float32,
+                4,
+                False,
+                _enabled_kvweave_config(),
+                KVWeaveCodec(),
+            )
+        )
+        assert quantized is False
+        assert quant_layout is None
+        assert mamba_options is None
+
+    def test_mamba_group_disabled_by_linear_quant_enabled_flag(self) -> None:
+        """``linear_quant_enabled=False`` disables Mamba quantization
+        independently of the overall ``enabled`` switch."""
+        group = EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=(0, 1),
+            cache_category="mamba",
+            mamba_real_layout=_mamba_layouts(),
+        )
+        quantized, _, _ = worker_transfer._decide_group_quantization(
+            group,
+            torch.Size([2, 2, 8, 16]),
+            torch.float32,
+            4,
+            False,
+            _enabled_kvweave_config(linear_quant_enabled=False),
+            KVWeaveCodec(),
+        )
+        assert quantized is False
+
+    def test_none_group_info_never_quantizes(self) -> None:
+        """The single-group (no cache_category) fallback predates the
+        cache_category field and must never be quantized."""
+        quantized, _, _ = worker_transfer._decide_group_quantization(
+            None,
+            torch.Size([2, 2, 8, 16]),
+            torch.float32,
+            4,
+            False,
+            _enabled_kvweave_config(),
+            KVWeaveCodec(),
+        )
+        assert quantized is False
 
 
 class TestIterTransferGroups:
@@ -979,6 +1203,147 @@ def test_submit_store_skips_group_with_no_selected_chunks(
     assert torch.allclose(fake_context.out_buffers[0], expected_group1)
 
 
+class _SpyCodec:
+    """Records every encode_chunk/decode_chunk call's chunk count, so tests
+    can assert quantization only ran on the selection actually passed in
+    (MIGRATION_PLAN.md R2/V3), without depending on native quantization."""
+
+    def __init__(self) -> None:
+        self.encode_calls: list[torch.Tensor] = []
+        self.decode_calls: list[torch.Tensor] = []
+
+    def encode_chunk(
+        self, cache_category, mamba_layout, tokens_per_block, mamba_options, raw_chunk
+    ) -> bytes:
+        self.encode_calls.append(raw_chunk)
+        return raw_chunk.numpy().tobytes()
+
+    def decode_chunk(
+        self,
+        cache_category,
+        mamba_layout,
+        tokens_per_block,
+        raw_shape,
+        raw_dtype,
+        chunk,
+    ) -> torch.Tensor:
+        self.decode_calls.append(chunk)
+        flat = torch.frombuffer(bytearray(chunk.numpy().tobytes()), dtype=raw_dtype)
+        return flat.view(raw_shape)
+
+
+def test_submit_store_quantizes_only_selected_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quantized group's server-filtered-out chunks (already cached, or
+    null-masked -- SHM mode's ``chunk_indices`` excludes both the same way)
+    must never reach encode_chunk: the quantization loop must reuse the
+    same ``selection`` the gather loop used, not re-enumerate chunks
+    (MIGRATION_PLAN.md R2/V3)."""
+
+    class _ShmFakeContext(_FakeEngineDrivenContext):
+        def __init__(self) -> None:
+            super().__init__()
+            # Only flat chunk index 1 (group 0's second chunk) is selected;
+            # group 0's first chunk and group 1's chunk are already cached.
+            self.out_buffers = [torch.zeros(2, 2, 8, 16)]
+
+        def prepare_store(self, _key: object, _instance_id: int):
+            return self.out_buffers, [1]
+
+    fake_context = _ShmFakeContext()
+    kv_caches = _make_kv_caches(4, num_blocks=8, block_size=4, num_heads=2, head_size=8)
+    ctx = _register_context(
+        monkeypatch, fake_context, kv_caches, shm_name="pool", pool_size=4096
+    )
+
+    spy_codec = _SpyCodec()
+    ctx._kvweave_codec = spy_codec  # noqa: SLF001
+    # Group 0: quantized. Group 1: unquantized.
+    quantized_group0 = worker_transfer.GroupTransferPlan(
+        group_info=EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=(0, 1),
+            tokens_per_block=4,
+            cache_category="mamba",
+        ),
+        layer_indices=frozenset({0, 1}),
+        blocks_per_chunk=ctx._group_plans[0].blocks_per_chunk,  # noqa: SLF001
+        chunk_shape=ctx._group_plans[0].chunk_shape,  # noqa: SLF001
+        engine_kv_format=ctx._group_plans[0].engine_kv_format,  # noqa: SLF001
+        quantized=True,
+        raw_layout_desc=MemoryLayoutDesc(
+            shapes=[ctx._group_plans[0].chunk_shape],  # noqa: SLF001
+            dtypes=[torch.float32],
+        ),
+    )
+    ctx._group_plans[0] = quantized_group0  # noqa: SLF001
+
+    # Group 0 has 2 chunks ([0,1] and [4,5]); only flat index 1 (its second
+    # chunk) is selected. Group 1 is not quantized, so it is irrelevant to
+    # the selected chunk_indices=[1] here (index 1 falls in group 0's range).
+    result = ctx.submit_store(
+        "req", MagicMock(), 1, kv_caches, [[0, 1, 4, 5], [8, 9]], MagicMock(), 2
+    )
+
+    assert result.result() is True
+    # Only the one selected chunk was encoded.
+    assert len(spy_codec.encode_calls) == 1
+    assert fake_context.committed_chunks is not None
+    assert len(fake_context.committed_chunks) == 1
+    assert fake_context.committed_chunks[0].dtype == torch.uint8
+
+
+def test_submit_retrieve_decodes_only_live_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quantized group's decode must run on exactly the live (non-null)
+    chunks the server returned, symmetric with the store-side selection."""
+    fake_context = _FakeEngineDrivenContext()
+    kv_caches = _make_kv_caches(4, num_blocks=8, block_size=4, num_heads=2, head_size=8)
+    ctx = _register_context(monkeypatch, fake_context, kv_caches)
+
+    spy_codec = _SpyCodec()
+    ctx._kvweave_codec = spy_codec  # noqa: SLF001
+    raw_shape = ctx._group_plans[0].chunk_shape  # noqa: SLF001
+    quantized_group0 = worker_transfer.GroupTransferPlan(
+        group_info=EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=(0, 1),
+            tokens_per_block=4,
+            recurrent_state=True,
+            cache_category="mamba",
+        ),
+        layer_indices=frozenset({0, 1}),
+        blocks_per_chunk=ctx._group_plans[0].blocks_per_chunk,  # noqa: SLF001
+        chunk_shape=raw_shape,
+        engine_kv_format=ctx._group_plans[0].engine_kv_format,  # noqa: SLF001
+        quantized=True,
+        raw_layout_desc=MemoryLayoutDesc(shapes=[raw_shape], dtypes=[torch.float32]),
+    )
+    ctx._group_plans[0] = quantized_group0  # noqa: SLF001
+
+    key = IPCCacheServerKey.from_token_ids(
+        "m", 1, 0, list(range(16)), start=0, end=16, request_id="req"
+    )
+    # Group 0 (recurrent): one live chunk only (server already dropped the
+    # null one from src_buffers). Group 1: both chunks real.
+    live_encoded_chunk = torch.zeros(raw_shape, dtype=torch.float32).view(torch.uint8)
+    fake_context.retrieve_chunks = [
+        live_encoded_chunk,
+        torch.zeros(2, 2, 8, 16),
+        torch.zeros(2, 2, 8, 16),
+    ]
+
+    result = ctx.submit_retrieve(
+        "req", key, 1, kv_caches, [[0, 0, 0, 7], [4, 5, 6, 7]], MagicMock(), 2
+    )
+
+    assert result.result() is True
+    assert len(spy_codec.decode_calls) == 1
+    assert spy_codec.decode_calls[0] is live_encoded_chunk
+
+
 class _FakeAsyncEvent:
     """Device event stub for the async store path (no real stream)."""
 
@@ -1069,6 +1434,87 @@ def test_async_submit_store_gathers_every_group(
     )[0]
     assert torch.allclose(fake_context.committed_chunks[0], expected_group0)
     assert torch.allclose(fake_context.committed_chunks[1], expected_group1)
+
+
+def test_async_submit_store_quantizes_only_selected_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The async store path's quantization must reuse the exact same
+    ``_encode_group_chunks`` method the sync path calls, and must only
+    encode the server-selected chunks (MIGRATION_PLAN.md R2/R3)."""
+
+    class _ShmFakeContext(_FakeEngineDrivenContext):
+        def __init__(self) -> None:
+            super().__init__()
+            self.out_buffers = [torch.zeros(2, 2, 8, 16)]
+
+        def prepare_store(self, _key: object, _instance_id: int):
+            return self.out_buffers, [1]
+
+    fake_context = _ShmFakeContext()
+    kv_caches = _make_kv_caches(4, num_blocks=8, block_size=4, num_heads=2, head_size=8)
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeAsyncTorchDev())
+    monkeypatch.setattr(worker_transfer, "torch_dev", _FakeAsyncTorchDev())
+    monkeypatch.setattr(
+        worker_transfer, "create_engine_driven_context", lambda *a, **k: fake_context
+    )
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse(
+        shm_name="pool", pool_size=4096
+    )
+    req_client = MagicMock()
+    req_client.register_kv_cache_engine_driven_context.return_value = future
+
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    ctx.register(
+        instance_id=1,
+        kv_caches=kv_caches,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        req_client=req_client,
+        mq_timeout=1.0,
+        engine_group_infos=_two_groups(),
+    )
+    spy_codec = _SpyCodec()
+    ctx._kvweave_codec = spy_codec  # noqa: SLF001
+    quantized_group0 = worker_transfer.GroupTransferPlan(
+        group_info=EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=(0, 1),
+            tokens_per_block=4,
+            cache_category="mamba",
+        ),
+        layer_indices=frozenset({0, 1}),
+        blocks_per_chunk=ctx._group_plans[0].blocks_per_chunk,  # noqa: SLF001
+        chunk_shape=ctx._group_plans[0].chunk_shape,  # noqa: SLF001
+        engine_kv_format=ctx._group_plans[0].engine_kv_format,  # noqa: SLF001
+        quantized=True,
+        raw_layout_desc=MemoryLayoutDesc(
+            shapes=[ctx._group_plans[0].chunk_shape],  # noqa: SLF001
+            dtypes=[torch.float32],
+        ),
+    )
+    ctx._group_plans[0] = quantized_group0  # noqa: SLF001
+
+    try:
+        future_result = ctx.submit_store(
+            "req",
+            MagicMock(),
+            1,
+            kv_caches,
+            [[0, 1, 4, 5], [8, 9]],
+            _FakeAsyncEvent(),
+            2,
+        )
+        assert future_result.result(timeout=10) is True
+    finally:
+        ctx.close()
+
+    assert len(spy_codec.encode_calls) == 1
+    assert fake_context.committed_chunks is not None
+    assert len(fake_context.committed_chunks) == 1
+    assert fake_context.committed_chunks[0].dtype == torch.uint8
 
 
 def test_async_submit_store_attaches_null_chunk_mask_for_recurrent_group(

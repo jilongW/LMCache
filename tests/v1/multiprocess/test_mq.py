@@ -20,6 +20,7 @@ from lmcache.utils import EngineType
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheServerKey,
+    RegisterEngineDrivenContextResponse,
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.modules.p2p_controller import P2PController
@@ -27,6 +28,8 @@ from lmcache.v1.multiprocess.mq import (
     BlockingRequestHandler,
     MessageQueueClient,
     MessageQueueServer,
+    SyncRequestHandler,
+    msgspec_decode,
 )
 from lmcache.v1.multiprocess.protocol import (
     RequestType,
@@ -871,6 +874,53 @@ def test_add_affinity_thread_pool():
     assert isinstance(store_handler.executor, AffinityThreadPool)
     assert store_handler.executor is retrieve_handler.executor
     assert len(server.extra_pools) == 1
+
+    server.close()
+
+
+def test_call_sync_handler_converts_exception_to_error_response():
+    """A sync handler raising, with an ``error``-bearing response class,
+    must send back a decodable error response instead of dropping the
+    request (see mq.py's ``_call_sync_handler``)."""
+    context = zmq.Context.instance()
+    server = MessageQueueServer("tcp://127.0.0.1:15710", context)
+    server.socket = MagicMock()
+
+    def _raising_handler() -> RegisterEngineDrivenContextResponse:
+        raise ValueError("L1 is not variable-size")
+
+    handler_entry = SyncRequestHandler(
+        payload_clss=[],
+        response_cls=RegisterEngineDrivenContextResponse,
+        handler=_raising_handler,
+    )
+
+    server._call_sync_handler(handler_entry, payloads=[], prefix_frames=[b"id"])
+
+    sent_frames = server.socket.send_multipart.call_args[0][0]
+    response = msgspec_decode(sent_frames[-1], cls=RegisterEngineDrivenContextResponse)
+    assert response.error == "L1 is not variable-size"
+
+    server.close()
+
+
+def test_call_sync_handler_reraises_when_response_has_no_error_field():
+    """A sync handler raising, with a response class that has no ``error``
+    field, must keep today's behavior: the exception propagates instead of
+    being silently converted."""
+    context = zmq.Context.instance()
+    server = MessageQueueServer("tcp://127.0.0.1:15711", context)
+    server.socket = MagicMock()
+
+    def _raising_handler() -> str:
+        raise ValueError("boom")
+
+    handler_entry = SyncRequestHandler(
+        payload_clss=[], response_cls=str, handler=_raising_handler
+    )
+
+    with pytest.raises(ValueError, match="boom"):
+        server._call_sync_handler(handler_entry, payloads=[], prefix_frames=[b"id"])
 
     server.close()
 
