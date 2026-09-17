@@ -251,9 +251,6 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
             def _prepare_gather_and_commit() -> None:
                 gather_done: Any | None = None
                 ok = False
-                # Whether we gathered directly into SHM views (True) or into
-                # pinned staging buffers that need to be released later (False).
-                used_shm_direct = False
                 staged_chunks: list[torch.Tensor] = []
                 try:
                     # --- Phase 1: prepare_store ---
@@ -269,9 +266,6 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                         ok = True
                         return
 
-                    # Latch SHM vs. pickle mode once here, since it's the
-                    # same for every group in this store.
-                    used_shm_direct = out_buffers is not None
                     if out_buffers is None:
                         layout_desc = engine_driven_context.layout_desc
                         if not layout_desc.shapes:
@@ -292,7 +286,12 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     # encoded in Phase 2.5 below without re-enumerating them
                     # (MIGRATION_PLAN.md R2).
                     gather_target: list[torch.Tensor] = []
-                    group_ranges: list[tuple[Any, int, int]] = []
+                    # Quantized groups' real SHM slots (``None`` entry when
+                    # not quantized or in pickle mode), so Phase 2.5 can
+                    # copy_ the encoded bytes back into them.
+                    group_ranges: list[
+                        tuple[Any, int, int, list[torch.Tensor] | None]
+                    ] = []
                     group_offset = 0
                     with torch.inference_mode(), torch_dev.stream(self._copy_stream):
                         _event.wait(stream=self._copy_stream)
@@ -311,19 +310,27 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                             if selection.is_empty:
                                 continue
 
+                            group_slots = (
+                                [
+                                    out_buffers[out_idx]
+                                    for out_idx in selection.out_indices
+                                ]
+                                if out_buffers is not None
+                                else None
+                            )
                             # A quantized group's SHM slot is sized for the
                             # *quantized* (uint8) payload, not this group's
                             # raw KV tensor shape/dtype -- gathering the raw
                             # tensor straight into that slot would overflow
                             # it. Quantized groups always gather into pinned
-                            # staging at the raw shape and are encoded into
-                            # the commit list in Phase 2.5; only
-                            # non-quantized groups use the SHM slot directly.
-                            if out_buffers is not None and not plan.quantized:
-                                group_out = [
-                                    out_buffers[out_idx]
-                                    for out_idx in selection.out_indices
-                                ]
+                            # staging at the raw shape; the encoded bytes are
+                            # copy_'d into ``group_slots`` (this group's real
+                            # SHM slots) in Phase 2.5 below, since
+                            # ``EngineDrivenContextShm.commit_store`` never
+                            # transmits ``chunks`` -- only non-quantized
+                            # groups use the SHM slot directly here.
+                            if group_slots is not None and not plan.quantized:
+                                group_out = group_slots
                             else:
                                 group_out = self._alloc_pinned_staging(
                                     plan.chunk_shape,
@@ -346,7 +353,14 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                     chunk_indices=selection.chunk_indices,
                                 )
                             )
-                            group_ranges.append((plan, start_idx, len(gather_target)))
+                            group_ranges.append(
+                                (
+                                    plan,
+                                    start_idx,
+                                    len(gather_target),
+                                    group_slots if plan.quantized else None,
+                                )
+                            )
 
                         gather_done = torch_dev.Event()
                         gather_done.record(self._copy_stream)
@@ -364,14 +378,30 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     # encode_chunk() must not run until gather_done has been
                     # synchronized above: gather issues async device->CPU
                     # copies, and encoding reads the gathered tensor's bytes.
-                    commit_target = list(gather_target)
-                    for plan, start_idx, end_idx in group_ranges:
-                        if plan.quantized:
-                            commit_target[start_idx:end_idx] = (
-                                self._encode_group_chunks(
-                                    plan, gather_target[start_idx:end_idx]
-                                )
-                            )
+                    # Built fresh (not a patched copy of gather_target) so
+                    # that SHM-quantized ranges -- already copy_'d into their
+                    # real slots below -- are dropped entirely rather than
+                    # left in with their raw, un-encoded bytes.
+                    commit_target = []
+                    for plan, start_idx, end_idx, quant_slots in group_ranges:
+                        if not plan.quantized:
+                            commit_target.extend(gather_target[start_idx:end_idx])
+                            continue
+                        encoded = self._encode_group_chunks(
+                            plan, gather_target[start_idx:end_idx]
+                        )
+                        if quant_slots is not None:
+                            # SHM mode: write the encoded uint8 bytes into
+                            # this group's real slot now, since commit_store
+                            # won't transmit them. The slot is sized to
+                            # ``estimate_serialized_size``'s upper bound;
+                            # ``encoded`` may be shorter -- decode_chunk()
+                            # parses a self-describing payload, so the
+                            # untouched tail is inert.
+                            for slot, chunk in zip(quant_slots, encoded, strict=True):
+                                slot.view(-1)[: chunk.numel()].copy_(chunk)
+                        else:
+                            commit_target.extend(encoded)
 
                     # --- Phase 3: commit ---
                     with self._commit_lock:
@@ -391,7 +421,13 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     )
                     ok = False
                 finally:
-                    if not used_shm_direct:
+                    # ``staged_chunks`` (not ``used_shm_direct``) is the
+                    # source of truth for what needs releasing: in SHM mode,
+                    # non-quantized groups gather straight into SHM views
+                    # (nothing staged), but quantized groups still stage into
+                    # pinned buffers above, so ``used_shm_direct`` alone would
+                    # skip releasing them back to the pool.
+                    if staged_chunks:
                         self._release_staging(staged_chunks)
                     with self._inflight_lock:
                         if gather_done is not None:

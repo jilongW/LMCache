@@ -1241,12 +1241,17 @@ def test_submit_store_quantizes_only_selected_chunks(
     same ``selection`` the gather loop used, not re-enumerate chunks
     (MIGRATION_PLAN.md R2/V3)."""
 
+    # A quantized group's real SHM slot is a flat uint8 buffer sized to
+    # quant_layout_desc (see _decide_group_quantization), not the raw KV
+    # dtype/shape -- large enough here for _SpyCodec's 1:1 byte encoding.
+    quant_slot = torch.zeros(2048, dtype=torch.uint8)
+
     class _ShmFakeContext(_FakeEngineDrivenContext):
         def __init__(self) -> None:
             super().__init__()
             # Only flat chunk index 1 (group 0's second chunk) is selected;
             # group 0's first chunk and group 1's chunk are already cached.
-            self.out_buffers = [torch.zeros(2, 2, 8, 16)]
+            self.out_buffers = [quant_slot]
 
         def prepare_store(self, _key: object, _instance_id: int):
             return self.out_buffers, [1]
@@ -1276,6 +1281,9 @@ def test_submit_store_quantizes_only_selected_chunks(
             shapes=[ctx._group_plans[0].chunk_shape],  # noqa: SLF001
             dtypes=[torch.float32],
         ),
+        quant_layout_desc=MemoryLayoutDesc(
+            shapes=[torch.Size([2048])], dtypes=[torch.uint8]
+        ),
     )
     ctx._group_plans[0] = quantized_group0  # noqa: SLF001
 
@@ -1289,9 +1297,15 @@ def test_submit_store_quantizes_only_selected_chunks(
     assert result.result() is True
     # Only the one selected chunk was encoded.
     assert len(spy_codec.encode_calls) == 1
-    assert fake_context.committed_chunks is not None
-    assert len(fake_context.committed_chunks) == 1
-    assert fake_context.committed_chunks[0].dtype == torch.uint8
+    # SHM mode: EngineDrivenContextShm.commit_store never transmits chunks
+    # (data must already be in the slot), so the encoded bytes must have
+    # been copy_'d into the group's real SHM slot instead of committed --
+    # the quantized group's chunk never reaches the (empty) commit list.
+    assert fake_context.committed_chunks == []
+    expected = torch.frombuffer(
+        bytearray(spy_codec.encode_calls[0].numpy().tobytes()), dtype=torch.uint8
+    )
+    assert torch.equal(quant_slot[: expected.numel()], expected)
 
 
 def test_submit_retrieve_decodes_only_live_chunks(
@@ -1443,10 +1457,15 @@ def test_async_submit_store_quantizes_only_selected_chunks(
     ``_encode_group_chunks`` method the sync path calls, and must only
     encode the server-selected chunks (MIGRATION_PLAN.md R2/R3)."""
 
+    # A quantized group's real SHM slot is a flat uint8 buffer sized to
+    # quant_layout_desc (see _decide_group_quantization), not the raw KV
+    # dtype/shape -- large enough here for _SpyCodec's 1:1 byte encoding.
+    quant_slot = torch.zeros(2048, dtype=torch.uint8)
+
     class _ShmFakeContext(_FakeEngineDrivenContext):
         def __init__(self) -> None:
             super().__init__()
-            self.out_buffers = [torch.zeros(2, 2, 8, 16)]
+            self.out_buffers = [quant_slot]
 
         def prepare_store(self, _key: object, _instance_id: int):
             return self.out_buffers, [1]
@@ -1494,6 +1513,9 @@ def test_async_submit_store_quantizes_only_selected_chunks(
             shapes=[ctx._group_plans[0].chunk_shape],  # noqa: SLF001
             dtypes=[torch.float32],
         ),
+        quant_layout_desc=MemoryLayoutDesc(
+            shapes=[torch.Size([2048])], dtypes=[torch.uint8]
+        ),
     )
     ctx._group_plans[0] = quantized_group0  # noqa: SLF001
 
@@ -1512,9 +1534,15 @@ def test_async_submit_store_quantizes_only_selected_chunks(
         ctx.close()
 
     assert len(spy_codec.encode_calls) == 1
-    assert fake_context.committed_chunks is not None
-    assert len(fake_context.committed_chunks) == 1
-    assert fake_context.committed_chunks[0].dtype == torch.uint8
+    # SHM mode: EngineDrivenContextShm.commit_store never transmits chunks
+    # (data must already be in the slot), so the encoded bytes must have
+    # been copy_'d into the group's real SHM slot instead of committed --
+    # the quantized group's chunk never reaches the (empty) commit list.
+    assert fake_context.committed_chunks == []
+    expected = torch.frombuffer(
+        bytearray(spy_codec.encode_calls[0].numpy().tobytes()), dtype=torch.uint8
+    )
+    assert torch.equal(quant_slot[: expected.numel()], expected)
 
 
 def test_async_submit_store_attaches_null_chunk_mask_for_recurrent_group(

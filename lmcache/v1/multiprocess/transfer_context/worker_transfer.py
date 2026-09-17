@@ -1657,7 +1657,12 @@ class EngineDrivenTransferContext(TransferContext):
         # below, after the single synchronize -- this keeps the "gather,
         # then encode-or-passthrough" split explicit and reuses `selection`
         # for both stages without re-enumerating chunks (MIGRATION_PLAN.md R2).
-        gathered_by_group: list[tuple[GroupTransferPlan, list[torch.Tensor]]] = []
+        # Quantized groups' encoded bytes: (per-chunk SHM slot view, encoded
+        # tensor) pairs to copy_ back after encoding, only populated when
+        # ``out_buffers is not None`` (SHM mode -- see below).
+        gathered_by_group: list[
+            tuple[GroupTransferPlan, list[torch.Tensor], list[torch.Tensor] | None]
+        ] = []
         group_offset = 0
         for plan, group_kv_caches, group_block_ids in transfer_groups:
             selection = _select_group_chunks(
@@ -1670,13 +1675,24 @@ class EngineDrivenTransferContext(TransferContext):
                 continue
             if chunk_indices is None:
                 # No selection: server wants every chunk, already in group order.
-                group_out_buffers = out_buffers
+                group_slots = out_buffers
             else:
-                group_out_buffers = (
+                group_slots = (
                     [out_buffers[out_idx] for out_idx in selection.out_indices]
                     if out_buffers is not None
                     else None
                 )
+            # A quantized group's SHM slot is sized for the *quantized*
+            # (uint8) payload, not this group's raw KV tensor shape/dtype --
+            # gathering the raw tensor straight into that slot would
+            # overflow it (see async_engine_driven.py's identical guard).
+            # Quantized groups always gather into a freshly allocated CPU
+            # buffer at the raw shape; the encoded bytes are copy_'d into
+            # ``group_slots`` (this group's real SHM slots) after encoding
+            # below, since ``EngineDrivenContextShm.commit_store`` never
+            # transmits ``chunks`` -- SHM mode only releases the write lock,
+            # so data must already be in the slot by the time it's called.
+            group_out_buffers = None if plan.quantized else group_slots
             gathered = gather_paged_kv_to_cpu(
                 group_kv_caches,
                 group_block_ids,
@@ -1687,7 +1703,9 @@ class EngineDrivenTransferContext(TransferContext):
                 out=group_out_buffers,
                 chunk_indices=selection.chunk_indices,
             )
-            gathered_by_group.append((plan, gathered))
+            gathered_by_group.append(
+                (plan, gathered, group_slots if plan.quantized else None)
+            )
         # Gather issues async device->CPU copies on BOTH transports: into the
         # SHM slots when out_buffers is given, otherwise into fresh buffers that
         # commit_store serializes immediately. Either way the copies must be
@@ -1698,8 +1716,18 @@ class EngineDrivenTransferContext(TransferContext):
         torch_dev.synchronize()
 
         cpu_chunks: list[torch.Tensor] = []
-        for plan, gathered in gathered_by_group:
-            cpu_chunks.extend(self._encode_group_chunks(plan, gathered))
+        for plan, gathered, quant_slots in gathered_by_group:
+            encoded = self._encode_group_chunks(plan, gathered)
+            if quant_slots is not None:
+                # SHM mode: write the encoded uint8 bytes into this group's
+                # real slot now, since commit_store won't transmit them.
+                # The slot is sized to ``estimate_serialized_size``'s upper
+                # bound; ``encoded`` may be shorter -- decode_chunk() parses
+                # a self-describing payload, so the untouched tail is inert.
+                for slot, chunk in zip(quant_slots, encoded, strict=True):
+                    slot.view(-1)[: chunk.numel()].copy_(chunk)
+            else:
+                cpu_chunks.extend(encoded)
         ok = self._engine_driven_context.commit_store(key, instance_id, cpu_chunks)
 
         future = MessagingFuture()
