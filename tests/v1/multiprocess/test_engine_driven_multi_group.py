@@ -479,6 +479,39 @@ class TestDecideGroupQuantization:
         assert quant_layout.dtypes[0] == torch.uint8
         assert quant_layout.shapes[0][0] < raw_shape.numel() * 4
 
+    @pytest.mark.parametrize(
+        ("layout", "config_override"),
+        [
+            (AttentionPlaneLayout.SPLIT_KV, "split_attention_quant_enabled"),
+            (AttentionPlaneLayout.FUSED_KV, "fused_attention_quant_enabled"),
+        ],
+    )
+    def test_attention_layout_debug_switch_disables_only_selected_layout(
+        self, layout: AttentionPlaneLayout, config_override: str
+    ) -> None:
+        group = EngineGroupInfo(
+            engine_group_id=0, layer_indices=(0, 1), cache_category="attention"
+        )
+        raw_shape = (
+            torch.Size([2, 2, 4096, 16])
+            if layout == AttentionPlaneLayout.SPLIT_KV
+            else torch.Size([2, 4096, 32])
+        )
+        config = _enabled_kvweave_config(**{config_override: False})
+
+        quantized, quant_layout, _ = worker_transfer._decide_group_quantization(
+            group,
+            raw_shape,
+            torch.float32,
+            4,
+            layout,
+            config,
+            KVWeaveCodec({"num_kv_heads": 2, "head_dim": 8}),
+        )
+
+        assert quantized is False
+        assert quant_layout is None
+
     def test_mamba_group_without_real_layout_falls_back_unquantized(self) -> None:
         """A Mamba group missing mamba_real_layout must safely fall back to
         unquantized transfer, not raise (MIGRATION_PLAN.md Phase D item 2)."""

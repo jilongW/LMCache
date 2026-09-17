@@ -831,8 +831,12 @@ def _decide_group_quantization(
     if category == "attention":
         try:
             if attention_plane_layout == AttentionPlaneLayout.SPLIT_KV:
+                if not kvweave_config.split_attention_quant_enabled:
+                    return False, None, None
                 quant_size = codec.estimate_serialized_size(raw_layout_desc)
             elif attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
+                if not kvweave_config.fused_attention_quant_enabled:
+                    return False, None, None
                 quant_size = codec.estimate_fused_serialized_size(raw_layout_desc)
             else:
                 return False, None, None
@@ -1715,6 +1719,18 @@ class EngineDrivenTransferContext(TransferContext):
             [str(plan.engine_kv_format) for plan in self._group_plans],
             enable_l1_kvweave_quant,
         )
+        for group_idx, plan in enumerate(self._group_plans):
+            logger.info(
+                "KVWeave group %d: engine_group_id=%s category=%s format=%s "
+                "attention_layout=%s raw_shape=%s quantized=%s",
+                group_idx,
+                plan.group_info.engine_group_id if plan.group_info is not None else None,
+                plan.group_info.cache_category if plan.group_info is not None else "unknown",
+                plan.engine_kv_format,
+                plan.attention_plane_layout,
+                tuple(plan.chunk_shape),
+                plan.quantized,
+            )
 
     def create_recorded_event(self) -> IPCEvent | None:
         """Return no event for the synchronous engine-driven transfer path.

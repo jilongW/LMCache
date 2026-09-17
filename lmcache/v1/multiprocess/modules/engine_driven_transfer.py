@@ -44,6 +44,29 @@ from .server_transfer import (
 logger = init_logger(__name__)
 
 
+def _linear_attention_quant_status(
+    group_infos: Sequence[EngineGroupInfo],
+    group_layout_descs: Sequence[object | None] | None,
+) -> str:
+    """Report whether this registration actually quantizes a linear group."""
+    linear_group_indices = [
+        idx
+        for idx, group_info in enumerate(group_infos)
+        if group_info.cache_category == "mamba"
+    ]
+    if not linear_group_indices:
+        return "n/a"
+    layouts = group_layout_descs or ()
+    return (
+        "1"
+        if any(
+            idx < len(layouts) and layouts[idx] is not None
+            for idx in linear_group_indices
+        )
+        else "0"
+    )
+
+
 def _group_null_chunk_mask(
     null_chunk_mask: tuple[tuple[bool, ...], ...] | None,
     group_id: int,
@@ -631,14 +654,18 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             self._engine_driven_contexts[payload.instance_id] = entry
             self._strategies[payload.instance_id] = strategy
 
+        linear_attention_quant = _linear_attention_quant_status(
+            payload.engine_group_infos, payload.group_layout_descs
+        )
         logger.info(
             "Registered non-GPU context for instance %d (model=%s, world_size=%d, "
-            "num_groups=%d, kvweave_quant=%s)",
+            "num_groups=%d, kvweave_quant=%s, linear_attention_quant=%s)",
             payload.instance_id,
             payload.model_name,
             payload.world_size,
             max(1, len(metadata_by_group)),
             payload.enable_l1_kvweave_quant,
+            linear_attention_quant,
         )
 
         if metadata_by_group:

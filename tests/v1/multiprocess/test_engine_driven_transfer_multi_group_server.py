@@ -27,6 +27,7 @@ from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
     EngineDrivenTransferModule,
+    _linear_attention_quant_status,
 )
 from lmcache.v1.multiprocess.modules.server_transfer import (
     PickleTransferStrategy,
@@ -83,6 +84,20 @@ def _hybrid_register_payload(
         num_physical_slots=8,
         engine_group_infos=_hybrid_groups(),
     )
+
+
+def test_linear_attention_quant_status() -> None:
+    attention = EngineGroupInfo(engine_group_id=0, cache_category="attention")
+    linear = EngineGroupInfo(engine_group_id=1, cache_category="mamba")
+    quantized_layout = serialize_memory_layout_desc(
+        MemoryLayoutDesc(shapes=[torch.Size([128])], dtypes=[torch.uint8])
+    )
+
+    assert _linear_attention_quant_status([attention], [quantized_layout]) == "n/a"
+    assert _linear_attention_quant_status([attention, linear], [None, None]) == "0"
+    assert _linear_attention_quant_status(
+        [attention, linear], [None, quantized_layout]
+    ) == "1"
 
 
 def _make_group_object_keys(

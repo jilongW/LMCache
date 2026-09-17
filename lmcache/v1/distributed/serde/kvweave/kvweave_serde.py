@@ -97,13 +97,7 @@ class _KVWeaveCodec:
     def estimate_fused_serialized_size(
         self, layout_desc: MemoryLayoutDesc, scaling_method: Optional[str] = None
     ) -> int:
-        """Estimate the upper bound for one serialized fused-K/V KV buffer.
-
-        For groups whose K and V are packed into one tensor's trailing
-        content axis (no leading K/V axis of 2 -- see
-        :meth:`serialize_fused_tensor`), rather than the standard split-K/V
-        layout :meth:`estimate_serialized_size` assumes.
-        """
+        """Estimate the upper bound for one serialized fused-K/V KV buffer."""
         return sum(
             self._estimate_fused_shape(
                 tuple(int(dim) for dim in shape), dtype, scaling_method
@@ -202,15 +196,7 @@ class _KVWeaveCodec:
     def serialize_fused_tensor(
         self, tensor: torch.Tensor, scaling_method: str | None = None
     ) -> bytes:
-        """Serialize a fused-K/V attention chunk (no leading K/V axis).
-
-        For groups where K and V are packed into one tensor's trailing
-        content axis (e.g. vLLM's non-MLA blocks-first fused backends, used
-        by models like gemma) -- still per-head K/V data, just packed, so it
-        is quantized as one opaque tensor via the same native single-tensor
-        kernels Mamba's conv/ssm sub-states use, rather than the K/V-paired
-        kernels :meth:`serialize_tensor` uses.
-        """
+        """Serialize a fused-K/V attention chunk (no leading K/V axis)."""
         if tensor.dim() != 3:
             raise ValueError(
                 f"KVWeave fused-K/V tensor expects [L, T, H], got {tuple(tensor.shape)}"
@@ -220,7 +206,7 @@ class _KVWeaveCodec:
         layers, tokens, hidden = shape
         method = scaling_method or self.scaling_method
         rh, asym = (False, False) if method == "per_tensor" else (self.rh, self.asym)
-        head_num = self._head_num(hidden)
+        head_num = self._fused_head_num(hidden)
         head_dim = self._fused_head_dim(hidden)
         flags = (1 if rh else 0) | (2 if asym else 0)
         header = self._config.MAGIC_QUANT_FUSED + struct.pack(
@@ -232,7 +218,7 @@ class _KVWeaveCodec:
             len(shape),
             *shape,
         )
-        payload = bytes(
+        return bytes(
             self._native().kvweave_serialize_chunk_state(
                 cpu.view(-1), header, KVWeaveCodecConfig.next_scale_id(),
                 qbit=self.qbit, blocks_num=max(1, tokens // self.block_size),
@@ -241,14 +227,6 @@ class _KVWeaveCodec:
                 num_threads=self.num_threads,
             )
         )
-        raw_bytes = cpu.numel() * cpu.element_size()
-        logger.debug(
-            "KVWeave fused quantize store shape=%s dtype=%s qbit=%d scaling=%s "
-            "raw_bytes=%d payload_bytes=%d ratio=%.4f",
-            shape, cpu.dtype, self.qbit, method, raw_bytes,
-            len(payload), len(payload) / raw_bytes if raw_bytes else 0.0,
-        )
-        return payload
 
     def deserialize_fused_tensor(self, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Decode a fused-K/V payload and restore it into the destination tensor."""
@@ -292,7 +270,7 @@ class _KVWeaveCodec:
             "dtype": self._config.CODE_TO_DTYPE.get(dtype_code, torch.float16),
             "scales": scales,
             "q_data": stream.read(),
-            "head_num": self._head_num(hidden),
+            "head_num": self._fused_head_num(hidden),
             "head_dim": self._fused_head_dim(hidden),
         }
 
@@ -344,14 +322,22 @@ class _KVWeaveCodec:
         return self.head_dim or hidden // self._head_num(hidden)
 
     def _fused_head_dim(self, hidden: int) -> int:
-        """Per-head width for a fused-K/V tensor's packed content axis.
+        """Width of one K or V plane in a fused ``[K|V]`` content axis."""
+        return hidden // self._fused_head_num(hidden)
 
-        Unlike :meth:`_head_dim`, this never falls back to the configured
-        ``self.head_dim`` (the un-doubled, split-K/V per-plane head size):
-        ``hidden`` already includes the packed K/V width for a fused
-        tensor, so the configured value would be wrong here.
+    def _fused_head_num(self, hidden: int) -> int:
+        """Treat each packed K/V half as its own native quantization head.
+
+        vLLM stores fused attention as ``[NH, K|V, HS]`` flattened to a
+        trailing ``CS = 2 * HS`` axis. Passing ``NH`` and ``2*HS`` to the
+        native codec incorrectly groups each K/V pair under one scale/RH
+        transform. ``2*NH`` heads of width ``HS`` preserves the byte order
+        while keeping K and V as independent quantization planes.
         """
-        return hidden // self._head_num(hidden)
+        heads = self._head_num(hidden)
+        if hidden % (2 * heads) == 0:
+            return 2 * heads
+        return 1
 
     def _fused_scale_count(
         self, tokens: int, hidden: int, layers: int, method: str

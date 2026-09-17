@@ -114,6 +114,15 @@ def _env_scaling_method(name: str, default: str) -> str:
     return value
 
 
+def _env_attention_qbit() -> int:
+    qbit = int(os.environ.get("LMCACHE_MP_KVWEAVE_QBIT", "8"))
+    if qbit not in {4, 8}:
+        raise ValueError(
+            f"LMCACHE_MP_KVWEAVE_QBIT={qbit!r} is not one of [4, 8]"
+        )
+    return qbit
+
+
 @dataclass(frozen=True)
 class MambaCodecOptions:
     """Resolved per-substate quantization parameters for Mamba groups.
@@ -141,8 +150,9 @@ class MambaCodecOptions:
         """Resolve Mamba conv/ssm quantization options from the environment.
 
         ``LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD`` and
-        ``SSM_SCALING_METHOD`` have independent defaults
-        (``per_channel``), not derived from ``LINEAR_*``. ``CONV_RH`` still
+        ``SSM_SCALING_METHOD`` both default to ``per_token``, independently
+        of ``LINEAR_*``.
+        ``CONV_RH`` still
         falls back to ``LINEAR_RH`` (now defaulting to ``true``) while
         ``SSM_RH`` defaults to ``true`` independently.
 
@@ -152,22 +162,16 @@ class MambaCodecOptions:
         for isolating which sub-state's quantization causes an accuracy
         regression.
 
-        Note: with the default ``conv_scaling_method="per_channel"``,
-        conv_state's RH transform length is always the kernel_history
-        dimension (typically 3, never a power of 2) -- so ``conv_rh=True``
-        here is downgraded back to ``False`` for essentially every real
-        model by ``worker_transfer._resolve_mamba_options_for_group()`` at
-        registration time (see ``mamba_conv_ssm_layout_params.md`` §3.1).
-        It only takes effect if the caller also sets
-        ``LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD=per_token`` on a model
-        whose conv_dim happens to be a power of 2.
+        With the default ``conv_scaling_method="per_token"``, RH operates
+        across each Q/K/V segment's last dimension. It remains enabled when
+        those widths are powers of 2, as they are for Qwen3.5-9B.
         """
         _env_scaling_method(
             "LMCACHE_MP_KVWEAVE_LINEAR_SCALING_METHOD", "per_channel"
         )
         linear_rh = _env_flag("LMCACHE_MP_KVWEAVE_LINEAR_RH", True)
         conv_scaling = _env_scaling_method(
-            "LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD", "per_channel"
+            "LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD", "per_token"
         )
         conv_rh = _env_flag("LMCACHE_MP_KVWEAVE_CONV_RH", linear_rh)
         text_config = _load_model_text_config()
@@ -181,7 +185,7 @@ class MambaCodecOptions:
             conv_scaling_method=conv_scaling,
             conv_rh=conv_rh,
             ssm_scaling_method=_env_scaling_method(
-                "LMCACHE_MP_KVWEAVE_SSM_SCALING_METHOD", "per_channel"
+                "LMCACHE_MP_KVWEAVE_SSM_SCALING_METHOD", "per_token"
             ),
             ssm_rh=_env_flag("LMCACHE_MP_KVWEAVE_SSM_RH", True),
             asym=_env_flag("LMCACHE_MP_KVWEAVE_LINEAR_ASYM", True),
@@ -211,12 +215,14 @@ class KVWeaveRuntimeConfig:
     enabled: bool
     linear_quant_enabled: bool
     linear_max_size_ratio: float
+    split_attention_quant_enabled: bool = True
+    fused_attention_quant_enabled: bool = True
     attention_codec_kwargs: dict[str, Any] = field(default_factory=dict)
     mamba_options: MambaCodecOptions = field(
         default_factory=lambda: MambaCodecOptions(
-            conv_scaling_method="per_channel",
+            conv_scaling_method="per_token",
             conv_rh=False,
-            ssm_scaling_method="per_channel",
+            ssm_scaling_method="per_token",
             ssm_rh=True,
             asym=True,
             conv_qbit=4,
@@ -247,9 +253,15 @@ class KVWeaveRuntimeConfig:
             linear_max_size_ratio=float(
                 os.environ.get("LMCACHE_MP_KVWEAVE_LINEAR_MAX_SIZE_RATIO", "1.20")
             ),
+            split_attention_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_SPLIT_ATTENTION_QUANT_ENABLED", True
+            ),
+            fused_attention_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_FUSED_ATTENTION_QUANT_ENABLED", True
+            ),
             attention_codec_kwargs={
                 "quantize": True,
-                "qbit": 4,
+                "qbit": _env_attention_qbit(),
                 "num_kv_heads": text_config["num_key_value_heads"],
                 "head_dim": text_config["head_dim"],
                 "scaling_method": os.environ.get(

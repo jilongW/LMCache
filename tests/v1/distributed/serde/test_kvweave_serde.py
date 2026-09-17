@@ -89,6 +89,25 @@ def test_estimate_serialized_size_is_an_upper_bound():
     assert codec.estimate_serialized_size(layout) >= len(codec.serialize_tensor(source))
 
 
+def test_qwen35_fused_attention_keeps_kv_planes_separate():
+    codec = _codec(num_kv_heads=4, head_dim=256)
+    hidden = 4 * 2 * 256
+
+    assert codec._fused_head_num(hidden) == 8
+    assert codec._fused_head_dim(hidden) == 256
+
+
+def test_qwen35_fused_attention_estimate_covers_payload():
+    codec = _codec(num_kv_heads=4, head_dim=256)
+    source = torch.randn(8, 64, 2048, dtype=torch.float16)
+    layout = MemoryLayoutDesc([source.shape], [source.dtype])
+
+    payload = codec.serialize_fused_tensor(source)
+
+    assert payload[:4] == b"KVW4"
+    assert codec.estimate_fused_serialized_size(layout) >= len(payload)
+
+
 def test_rejects_non_kv_shape():
     with pytest.raises(ValueError, match="KVWeave"):
         _codec().serialize_tensor(torch.randn(1, 64, 8))
@@ -127,11 +146,12 @@ def test_runtime_config_resolves_environment(monkeypatch, tmp_path):
     assert config.linear_max_size_ratio == 1.5
     assert config.attention_codec_kwargs["num_kv_heads"] == 8
     assert config.attention_codec_kwargs["head_dim"] == 128
+    assert config.attention_codec_kwargs["qbit"] == 8
     assert config.attention_codec_kwargs["precond"]
     assert config.mamba_options == MambaCodecOptions(
         conv_scaling_method="per_token",
         conv_rh=True,
-        ssm_scaling_method="per_channel",
+        ssm_scaling_method="per_token",
         ssm_rh=True,
         asym=True,
         ssm_qbit=4,
@@ -147,9 +167,26 @@ def test_runtime_config_falls_back_to_qwen35_9b_defaults(monkeypatch):
 
     assert config.attention_codec_kwargs["num_kv_heads"] == 4
     assert config.attention_codec_kwargs["head_dim"] == 256
+    assert config.mamba_options.conv_scaling_method == "per_token"
+    assert config.mamba_options.ssm_scaling_method == "per_token"
     assert config.mamba_options.conv_qkv_split == ConvQKVSplit(
         key_dim=2048, value_dim=4096
     )
+
+
+def test_runtime_config_accepts_attention_qbit_4(monkeypatch):
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_QBIT", "4")
+
+    config = KVWeaveRuntimeConfig.from_env()
+
+    assert config.attention_codec_kwargs["qbit"] == 4
+
+
+def test_runtime_config_rejects_invalid_attention_qbit(monkeypatch):
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_QBIT", "16")
+
+    with pytest.raises(ValueError, match="LMCACHE_MP_KVWEAVE_QBIT"):
+        KVWeaveRuntimeConfig.from_env()
 
 
 def test_runtime_config_falls_back_when_config_json_missing_fields(
