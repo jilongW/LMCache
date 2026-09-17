@@ -164,6 +164,34 @@ def test_conv_qkv_split_respects_non_default_key_value_dims():
     assert conv_mean_abs_err < 0.5
 
 
+def test_encode_chunk_rejects_mismatched_conv_qkv_split():
+    """A conv_qkv_split that disagrees with the real conv_dim must raise,
+    not silently mis-slice query/key/value (which would corrupt the
+    recurrent state)."""
+    block_size = 64
+    conv_shape = (3, 6144)
+    ssm_shape = (16, 128, 128)
+    conv_bytes = torch.Size(conv_shape).numel() * 4
+    ssm_bytes = torch.Size(ssm_shape).numel() * 4
+    layouts = (
+        MambaSubStateWireLayout(0, conv_bytes, "torch.float32", conv_shape),
+        MambaSubStateWireLayout(conv_bytes, ssm_bytes, "torch.float32", ssm_shape),
+    )
+    raw = torch.randn(1, block_size, (conv_bytes + ssm_bytes) // (block_size * 4))
+    options = MambaCodecOptions(
+        conv_scaling_method="per_channel",
+        conv_rh=False,
+        ssm_scaling_method="per_channel",
+        ssm_rh=False,
+        asym=True,
+        # 6144's real split is key_dim=2048, value_dim=2048; this implies 8192.
+        conv_qkv_split=ConvQKVSplit(key_dim=2048, value_dim=4096),
+    )
+
+    with pytest.raises(ValueError, match="conv_state last dim"):
+        _KVWeaveCodec().encode_chunk("mamba", layouts, block_size, options, raw)
+
+
 def test_split_accepts_noncontiguous_chunks():
     raw = torch.randn(2, 2, 16, 8, dtype=torch.float32)[:, :, ::2, :]
     assert not raw.is_contiguous()
@@ -312,5 +340,117 @@ def test_mamba_options_preserve_explicit_conv_rh_true(
 
     assert options.conv_scaling_method == scaling_method
     assert options.conv_rh is True
+
+
+def test_resolve_mamba_options_downgrades_rh_for_non_power_of_two_conv_dim():
+    """A group whose real conv_state shape (Qwen3.5-0.8B's per-block
+    ``(3, 6144)``, i.e. ``kernel_history=3`` x ``conv_dim=6144``) yields a
+    non-power-of-2 RH transform length under per_channel scaling (see
+    ``mamba_conv_ssm_layout_params.md`` §3.1: real shape ``[6,1,3,6144]`` ->
+    transform length 3) must have conv_rh safely downgraded to False at
+    registration time, not crash on the first store with ``rh`` now
+    defaulting to True (see ``env_vars.md``'s
+    ``LMCACHE_MP_KVWEAVE_LINEAR_RH``/``CONV_RH`` note)."""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+        _resolve_mamba_options_for_group,
+    )
+
+    layers = 6
+    block_size = 64
+    conv_shape = (3, 6144)  # per_channel's RH transform length here is 3
+    ssm_shape = (128, 128)  # per_channel's RH transform length here is 2048
+    layouts = (
+        MambaSubStateWireLayout(0, 3 * 6144 * 4, "torch.float32", conv_shape),
+        MambaSubStateWireLayout(
+            3 * 6144 * 4, 128 * 128 * 4, "torch.float32", ssm_shape
+        ),
+    )
+    group_info = EngineGroupInfo(
+        engine_group_id=0,
+        layer_indices=tuple(range(layers)),
+        tokens_per_block=block_size,
+        cache_category="mamba",
+        mamba_real_layout=layouts,
+    )
+    options = MambaCodecOptions(
+        conv_scaling_method="per_channel",
+        conv_rh=True,
+        ssm_scaling_method="per_channel",
+        ssm_rh=True,
+        asym=True,
+        # Qwen3.5-0.8B: key_dim=value_dim=2048, so conv_dim=2048*2+2048=6144,
+        # matching this test's conv_shape.
+        conv_qkv_split=ConvQKVSplit(key_dim=2048, value_dim=2048),
+    )
+    # [L, T, H]; layers and tokens (= one block) are what the resolver reads.
+    chunk_shape = torch.Size([layers, block_size, 1])
+
+    resolved = _resolve_mamba_options_for_group(
+        group_info, chunk_shape, block_size, options
+    )
+
+    assert resolved.conv_rh is False
+    assert resolved.ssm_rh is True
+    # Untouched fields (including the input's own conv_rh) must not mutate.
+    assert options.conv_rh is True
+
+
+def test_resolve_mamba_options_keeps_rh_for_power_of_two_shapes():
+    """A group whose real conv/ssm shapes both yield a power-of-2 RH
+    transform length must keep the environment-resolved rh=True untouched.
+
+    Per ``mamba_conv_ssm_layout_params.md`` §3.1, ``per_channel`` conv_state
+    (the default scaling method) yields transform length = kernel_history
+    (here 3), which is *never* a power of 2 regardless of model size -- so
+    this uses ``per_token`` for conv (the one combination the doc's real
+    9B measurement, shape ``[6,1,3,8192]``, confirms passes: transform
+    length 8192 = 2^13) to exercise the "stays True" branch honestly. ssm's
+    ``per_channel`` (§3.2) is a power of 2 on both 0.8B and 9B, so it keeps
+    the default scaling method.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+        _resolve_mamba_options_for_group,
+    )
+
+    layers = 6
+    block_size = 64
+    conv_shape = (3, 8192)  # per_token's RH transform length here is 8192
+    ssm_shape = (128, 128)  # per_channel's RH transform length here is 4096
+    layouts = (
+        MambaSubStateWireLayout(0, 3 * 8192 * 4, "torch.float32", conv_shape),
+        MambaSubStateWireLayout(
+            3 * 8192 * 4, 128 * 128 * 4, "torch.float32", ssm_shape
+        ),
+    )
+    group_info = EngineGroupInfo(
+        engine_group_id=0,
+        layer_indices=tuple(range(layers)),
+        tokens_per_block=block_size,
+        cache_category="mamba",
+        mamba_real_layout=layouts,
+    )
+    options = MambaCodecOptions(
+        conv_scaling_method="per_token",
+        conv_rh=True,
+        ssm_scaling_method="per_channel",
+        ssm_rh=True,
+        asym=True,
+        # Qwen3.5-9B: key_dim=2048, value_dim=4096, so conv_dim=8192,
+        # matching this test's conv_shape.
+        conv_qkv_split=ConvQKVSplit(key_dim=2048, value_dim=4096),
+    )
+    chunk_shape = torch.Size([layers, block_size, 1])
+
+    resolved = _resolve_mamba_options_for_group(
+        group_info, chunk_shape, block_size, options
+    )
+
+    assert resolved is options
+    assert resolved.conv_rh is True
+    assert resolved.ssm_rh is True
 
 

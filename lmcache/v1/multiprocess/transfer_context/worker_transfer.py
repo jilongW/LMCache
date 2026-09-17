@@ -10,6 +10,7 @@ from typing import Any, Protocol, cast
 import os
 
 # Third Party
+import msgspec
 import torch
 
 # First Party
@@ -17,17 +18,23 @@ from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
+    AttentionPlaneLayout,
+    KVWeaveCodecConfig,
     KVWeaveRuntimeConfig,
     MambaCodecOptions,
 )
 from lmcache.v1.distributed.serde.kvweave.kvweave_serde import KVWeaveCodec
+from lmcache.v1.gpu_connector.kv_format.specs.registry import get_spec_class
 from lmcache.v1.gpu_connector.utils import LayoutHints, get_device
 from lmcache.v1.multiprocess.custom_types import (
     RegisterEngineDrivenContextPayload,
     serialize_memory_layout_desc,
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
-from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.group_view import (
+    EngineGroupInfo,
+    MambaSubStateWireLayout,
+)
 from lmcache.v1.multiprocess.protocols.engine import RegisterEngineDrivenContextResponse
 from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContext,
@@ -276,15 +283,23 @@ def _group_chunk_shape(
     default_hidden_dim_size: int,
     group_kv_caches: dict[str, torch.Tensor],
     layout_hints: LayoutHints | None,
-) -> torch.Size:
-    """Return one chunk's tensor shape for a group's own layer count and
-    hidden dimension.
+) -> tuple[torch.Size, bool | None]:
+    """Return one chunk's tensor shape and single-plane flag for a group's
+    own layer count and hidden dimension.
 
-    Non-recurrent groups also get their own recomputed ``hidden_dim_size``,
-    since hybrid groups can pack K/V differently and reusing the default
-    group's width can mis-size this group's SHM chunk buffer. Recurrent
-    groups skip that recompute: their tensor is a synthetic addressing view
-    whose split has no real hidden-dim semantics to recompute from.
+    Non-recurrent groups also get their own recomputed ``hidden_dim_size``
+    and ``kv_size``, since hybrid groups can pack K/V differently and reusing
+    the default group's width (or worker-wide single-plane flag) can mis-size
+    this group's SHM chunk buffer or wrongly exclude it from quantization --
+    a worker mixing MLA-shaped mamba state tensors with regular dual-plane
+    attention tensors can otherwise have its overall ``kv_size`` skewed by the
+    mamba tensors alone. ``chunk_shape``'s rank is rebuilt from this group's
+    own ``kv_size`` rather than borrowed from ``default_layout_desc``'s rank,
+    since a hybrid worker's whole-model default detection can disagree with
+    an individual group's own plane count. Recurrent groups skip that
+    recompute: their tensor is a synthetic addressing view whose split has no
+    real hidden-dim semantics to recompute from, and ``use_mla_flag`` is
+    unused for mamba groups.
 
     Args:
         group_info: The LMCache group, or ``None`` for the single-group
@@ -299,30 +314,47 @@ def _group_chunk_shape(
         layout_hints: Optional engine layout hints.
 
     Returns:
-        This group's chunk shape, with its own layer count and (for
-        non-recurrent groups) hidden dimension substituted in.
+        A ``(chunk_shape, group_use_mla_flag)`` tuple. ``chunk_shape`` has
+        this group's own layer count and (for non-recurrent groups) hidden
+        dimension substituted in. ``group_use_mla_flag`` is this group's own
+        single-plane flag (``kv_size == 1``) for non-recurrent groups, or
+        ``None`` when it was not recomputed (recurrent groups and the
+        single-group fallback), in which case callers should fall back to
+        the worker-wide flag.
     """
     default_shape = default_layout_desc.shapes[0]
     if group_info is None or not group_info.layer_indices:
-        return default_shape
+        return default_shape, None
     num_layers = len(group_info.layer_indices)
     if group_info.recurrent_state:
         if num_layers == default_num_layers:
-            return default_shape
+            return default_shape, None
         layer_dim = 0 if len(default_shape) == 3 else 1
         dims = list(default_shape)
         dims[layer_dim] = num_layers
-        return torch.Size(dims)
-    _, _, hidden_dim_size, _, _, _ = compute_kv_layout(
+        return torch.Size(dims), None
+    _, _, hidden_dim_size, _, _, kv_size = compute_kv_layout(
         group_kv_caches, layout_hints=layout_hints
     )
-    if num_layers == default_num_layers and hidden_dim_size == default_hidden_dim_size:
-        return default_shape
-    layer_dim = 0 if len(default_shape) == 3 else 1
-    dims = list(default_shape)
-    dims[layer_dim] = num_layers
-    dims[-1] = hidden_dim_size
-    return torch.Size(dims)
+    group_use_mla_flag = kv_size == 1
+    # Rank must come from this group's own kv_size, not from default_shape's
+    # rank: a hybrid worker's default (whole-model) detection can disagree
+    # with an individual group's own plane count, which previously left
+    # chunk_shape at the wrong rank for that group's real layout (e.g. a
+    # single-plane group stuck with the default's dual-plane leading "2").
+    tokens = int(default_shape[-2])
+    if (
+        num_layers == default_num_layers
+        and hidden_dim_size == default_hidden_dim_size
+        and (len(default_shape) == 3) == group_use_mla_flag
+    ):
+        return default_shape, group_use_mla_flag
+    dims = (
+        [num_layers, tokens, hidden_dim_size]
+        if group_use_mla_flag
+        else [2, num_layers, tokens, hidden_dim_size]
+    )
+    return torch.Size(dims), group_use_mla_flag
 
 
 @dataclass(frozen=True)
@@ -349,6 +381,8 @@ class GroupTransferPlan:
             gather / scatter so they skip re-detection. ``None`` when it
             could not be resolved up front, which makes them detect it per
             transfer as before.
+        attention_plane_layout: Classified attention K/V object-plane layout
+            for this group, or ``None`` for non-attention groups.
         quantized: Whether ``register()`` decided to KVWeave-quantize this
             group's chunks on store and decode them on retrieve. ``False``
             for every group when quantization is disabled or was not
@@ -373,6 +407,7 @@ class GroupTransferPlan:
     blocks_per_chunk: int
     chunk_shape: torch.Size
     engine_kv_format: Any
+    attention_plane_layout: AttentionPlaneLayout | None = None
     quantized: bool = False
     raw_layout_desc: MemoryLayoutDesc | None = None
     quant_layout_desc: MemoryLayoutDesc | None = None
@@ -564,6 +599,37 @@ def _detect_group_kv_format(
     return engine_kv_format
 
 
+def _attention_plane_layout_for_group(
+    group_info: EngineGroupInfo | None,
+    engine_kv_format: Any,
+) -> AttentionPlaneLayout | None:
+    """Classify an attention group's physical K/V plane layout.
+
+    Returns ``None`` for non-attention groups. Attention groups with an
+    undetected or unknown format are classified as ``UNKNOWN`` so quantized
+    dispatch never guesses from tensor shape.
+    """
+    if group_info is None or group_info.cache_category != "attention":
+        return None
+    if engine_kv_format is None:
+        return AttentionPlaneLayout.UNKNOWN
+    try:
+        spec = get_spec_class(engine_kv_format)
+    except ValueError:
+        logger.warning(
+            "Could not classify attention plane layout for KV format %s; "
+            "falling back to unquantized transfer for this group",
+            engine_kv_format,
+            exc_info=True,
+        )
+        return AttentionPlaneLayout.UNKNOWN
+    if spec.is_mla:
+        return AttentionPlaneLayout.MLA
+    if spec.is_fused_packed:
+        return AttentionPlaneLayout.FUSED_KV
+    return AttentionPlaneLayout.SPLIT_KV
+
+
 def _raw_chunk_byte_size(shape: torch.Size, dtype: torch.dtype) -> int:
     """Return the byte size of one un-quantized chunk tensor.
 
@@ -580,12 +646,146 @@ def _raw_chunk_byte_size(shape: torch.Size, dtype: torch.dtype) -> int:
     return numel * torch.empty((), dtype=dtype).element_size()
 
 
+def _mamba_rh_transform_length(
+    substate: str,
+    sub_layout: MambaSubStateWireLayout,
+    layers: int,
+    blocks: int,
+    scaling_method: str,
+) -> int:
+    """Compute the RH (randomized Hadamard) transform length for one Mamba
+    sub-state, without needing the real tensor's data.
+
+    Mirrors ``_KVWeaveCodec._quantize_mamba_substate_payload``'s
+    ``max(cpu.numel() // shape[0] // chunks, 1)``: ``cpu.numel() // shape[0]``
+    is ``blocks * prod(sub_layout.shape)`` (one layer's worth of elements),
+    and ``chunks`` comes from the same ``mamba_layout()`` grouping the actual
+    quantization call uses -- computable purely from shape/scaling_method,
+    which is already known at registration time.
+
+    Args:
+        substate: ``"conv"`` or ``"ssm"``.
+        sub_layout: This sub-state's real per-block byte layout.
+        layers: Number of layers in this group.
+        blocks: Number of paged blocks in one chunk.
+        scaling_method: This sub-state's configured scaling method.
+
+    Returns:
+        The transform length ``mamba_precond_tensors()`` would be called
+        with for this sub-state.
+    """
+    numel_per_layer = blocks
+    for dim in sub_layout.shape:
+        numel_per_layer *= int(dim)
+    shape = (layers, blocks, *sub_layout.shape)
+    _, _, _, chunks = KVWeaveCodecConfig.mamba_layout(substate, shape, scaling_method)
+    return max(numel_per_layer // chunks, 1)
+
+
+def _resolve_mamba_options_for_group(
+    group_info: EngineGroupInfo,
+    chunk_shape: torch.Size,
+    block_size: int,
+    mamba_options: MambaCodecOptions,
+) -> MambaCodecOptions:
+    """Downgrade ``conv_rh``/``ssm_rh`` to ``False`` when this group's real
+    shape can't satisfy RH's power-of-2 transform-length requirement.
+
+    ``mamba_precond_tensors()`` hard-``raise``s on a non-power-of-2 length
+    (see ``KVWeaveCodecConfig.mamba_precond_tensors``); with ``rh`` now
+    defaulting to ``True`` (see ``env_vars.md``), a model whose conv/ssm
+    shapes don't happen to produce a power-of-2 transform length would fail
+    every store. Checking here, once at registration time when the real
+    ``mamba_real_layout`` is known, turns that into a safe per-group,
+    per-substate downgrade with a log line instead of a runtime crash.
+
+    Args:
+        group_info: The Mamba group being decided (must have
+            ``mamba_real_layout`` set by the caller).
+        chunk_shape: This group's raw chunk shape (``[2,L,T,H]`` or ``[L,T,H]``).
+        block_size: This group's tokens-per-block.
+        mamba_options: The environment-resolved options to downgrade from.
+
+    Returns:
+        ``mamba_options``, or a copy with ``conv_rh``/``ssm_rh`` cleared for
+        whichever sub-state(s) fail the power-of-2 check.
+    """
+    assert group_info.mamba_real_layout is not None
+    conv_layout, ssm_layout = group_info.mamba_real_layout
+    tokens = int(chunk_shape[-2])
+    layers = int(chunk_shape[1]) if len(chunk_shape) == 4 else int(chunk_shape[0])
+    blocks = max(tokens // block_size, 1)
+
+    updates: dict[str, bool] = {}
+
+    if mamba_options.conv_rh:
+        # conv_state is quantized as three independent query/key/value
+        # sub-tensors (see kvweave_serde.py's _split_conv_qkv), each with
+        # its own RH transform length -- check all three, since encode_chunk
+        # applies the same conv_rh flag to every sub-tensor and any one of
+        # them failing the power-of-2 check would crash that sub-tensor's
+        # quantize call.
+        split = mamba_options.conv_qkv_split
+        conv_dim = conv_layout.shape[-1]
+        expected_conv_dim = split.key_dim * 2 + split.value_dim
+        if conv_dim != expected_conv_dim:
+            raise ValueError(
+                f"conv_state last dim ({conv_dim}) does not match "
+                f"conv_qkv_split's key_dim*2 + value_dim ({expected_conv_dim}) "
+                f"for group (engine_group_id={group_info.engine_group_id}); "
+                "MODEL_PATH/MODEL's config.json disagrees with the real "
+                "registered conv_state layout"
+            )
+        for sub_name, sub_dim in (
+            ("conv.query", split.key_dim),
+            ("conv.key", split.key_dim),
+            ("conv.value", split.value_dim),
+        ):
+            sub_layout = msgspec.structs.replace(
+                conv_layout, shape=(*conv_layout.shape[:-1], sub_dim)
+            )
+            length = _mamba_rh_transform_length(
+                "conv", sub_layout, layers, blocks, mamba_options.conv_scaling_method
+            )
+            if length <= 0 or length & (length - 1):
+                logger.info(
+                    "Disabling conv RH for group (engine_group_id=%s): %s "
+                    "transform length %d is not a power of 2 "
+                    "(scaling_method=%s, conv_dim=%d)",
+                    group_info.engine_group_id,
+                    sub_name,
+                    length,
+                    mamba_options.conv_scaling_method,
+                    conv_dim,
+                )
+                updates["conv_rh"] = False
+                break
+
+    if mamba_options.ssm_rh:
+        length = _mamba_rh_transform_length(
+            "ssm", ssm_layout, layers, blocks, mamba_options.ssm_scaling_method
+        )
+        if length <= 0 or length & (length - 1):
+            logger.info(
+                "Disabling ssm RH for group (engine_group_id=%s): transform "
+                "length %d is not a power of 2 (scaling_method=%s)",
+                group_info.engine_group_id,
+                length,
+                mamba_options.ssm_scaling_method,
+            )
+            updates["ssm_rh"] = False
+
+    if not updates:
+        return mamba_options
+    return replace(mamba_options, **updates)
+
+
 def _decide_group_quantization(
     group_info: EngineGroupInfo | None,
     chunk_shape: torch.Size,
     dtype: torch.dtype,
     block_size: int,
-    use_mla_flag: bool,
+    attention_plane_layout: AttentionPlaneLayout | None,
     kvweave_config: KVWeaveRuntimeConfig,
     codec: KVWeaveCodec,
 ) -> tuple[bool, MemoryLayoutDesc | None, MambaCodecOptions | None]:
@@ -607,9 +807,10 @@ def _decide_group_quantization(
         chunk_shape: This group's raw (un-quantized) chunk shape.
         dtype: This group's raw chunk dtype.
         block_size: This group's tokens-per-block, for Mamba size estimation.
-        use_mla_flag: Whether the worker's overall KV format is single-plane
-            (MLA or fused-K/V). Excludes every group from the attention
-            quantization branch when true.
+        attention_plane_layout: This group's classified attention K/V plane
+            layout. ``FUSED_KV`` uses the fused single-tensor codec;
+            ``SPLIT_KV`` uses the standard split K/V codec; ``MLA`` and
+            ``UNKNOWN`` are never quantized.
         kvweave_config: Resolved runtime configuration (call
             ``KVWeaveRuntimeConfig.from_env()`` once per registration, not
             per group).
@@ -627,8 +828,29 @@ def _decide_group_quantization(
     raw_layout_desc = MemoryLayoutDesc(shapes=[chunk_shape], dtypes=[dtype])
     raw_size = _raw_chunk_byte_size(chunk_shape, dtype)
 
-    if category == "attention" and not use_mla_flag:
-        quant_size = codec.estimate_serialized_size(raw_layout_desc)
+    if category == "attention":
+        try:
+            if attention_plane_layout == AttentionPlaneLayout.SPLIT_KV:
+                quant_size = codec.estimate_serialized_size(raw_layout_desc)
+            elif attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
+                quant_size = codec.estimate_fused_serialized_size(raw_layout_desc)
+            else:
+                return False, None, None
+        except ValueError:
+            # The group's classified plane layout (SPLIT_KV/FUSED_KV) does not
+            # match the actual chunk_shape rank -- a KV-format misdetection
+            # for this model/attention backend. Fall back to unquantized
+            # transfer for this group instead of failing engine startup.
+            logger.warning(
+                "KVWeave size estimate rejected chunk_shape=%s for "
+                "attention_plane_layout=%s (engine_group_id=%s); falling "
+                "back to unquantized transfer for this group",
+                tuple(chunk_shape),
+                attention_plane_layout,
+                group_info.engine_group_id if group_info is not None else None,
+                exc_info=True,
+            )
+            return False, None, None
         if quant_size < raw_size:
             quant_layout_desc = MemoryLayoutDesc(
                 shapes=[torch.Size([quant_size])], dtypes=[torch.uint8]
@@ -645,7 +867,12 @@ def _decide_group_quantization(
                 group_info.engine_group_id if group_info is not None else None,
             )
             return False, None, None
-        mamba_options = kvweave_config.mamba_options
+        mamba_options = _resolve_mamba_options_for_group(
+            cast(EngineGroupInfo, group_info),
+            chunk_shape,
+            block_size,
+            kvweave_config.mamba_options,
+        )
         quant_size = KVWeaveCodec.estimate_mamba_serialized_size(
             raw_layout_desc,
             mamba_layout,
@@ -655,6 +882,11 @@ def _decide_group_quantization(
                 mamba_options.ssm_scaling_method,
             ),
             qbits=(mamba_options.conv_qbit, mamba_options.ssm_qbit),
+            conv_qkv_split=mamba_options.conv_qkv_split,
+            quant_enabled=(
+                mamba_options.conv_quant_enabled,
+                mamba_options.ssm_quant_enabled,
+            ),
         )
         if quant_size <= raw_size * kvweave_config.linear_max_size_ratio:
             quant_layout_desc = MemoryLayoutDesc(
@@ -663,8 +895,8 @@ def _decide_group_quantization(
             return True, quant_layout_desc, mamba_options
         return False, None, None
 
-    # "unknown" (or "attention" with use_mla_flag True, or "mamba" with
-    # linear quantization disabled): never quantized.
+    # "unknown" (or MLA/unknown attention layout, or "mamba" with linear
+    # quantization disabled): never quantized.
     return False, None, None
 
 
@@ -677,7 +909,7 @@ def _build_group_transfer_plans(
     num_layers: int,
     hidden_dim_size: int,
     layout_hints: LayoutHints | None,
-    use_mla_flag: bool,
+    _use_mla_flag: bool,
     kvweave_config: KVWeaveRuntimeConfig,
     codec: KVWeaveCodec,
 ) -> list[GroupTransferPlan]:
@@ -702,8 +934,10 @@ def _build_group_transfer_plans(
         hidden_dim_size: The default (single-group) hidden dimension that
             ``layout_desc`` was built from.
         layout_hints: Optional engine layout hints.
-        use_mla_flag: Whether the worker's overall KV format is single-plane
-            (MLA or fused-K/V). See :func:`_decide_group_quantization`.
+        _use_mla_flag: Legacy caller argument retained for positional
+            compatibility. Per-group attention layout classification now
+            decides whether attention chunks are split-K/V, fused-K/V, MLA,
+            or unknown.
         kvweave_config: Resolved KVWeave runtime configuration, read once by
             the caller via ``KVWeaveRuntimeConfig.from_env()``.
         codec: A ``KVWeaveCodec`` instance used for per-group size
@@ -722,7 +956,7 @@ def _build_group_transfer_plans(
     plans: list[GroupTransferPlan] = []
     for group_info in group_infos:
         group_kv_caches = _kv_caches_for_group(kv_caches, group_info)
-        chunk_shape = _group_chunk_shape(
+        chunk_shape, _group_use_mla_flag = _group_chunk_shape(
             group_info,
             layout_desc,
             num_layers,
@@ -730,12 +964,17 @@ def _build_group_transfer_plans(
             group_kv_caches,
             layout_hints,
         )
+        del _group_use_mla_flag
+        engine_kv_format = _detect_group_kv_format(group_kv_caches, layout_hints)
+        attention_plane_layout = _attention_plane_layout_for_group(
+            group_info, engine_kv_format
+        )
         quantized, quant_layout_desc, mamba_options = _decide_group_quantization(
             group_info,
             chunk_shape,
             layout_desc.dtypes[0],
             group_info.tokens_per_block if group_info is not None else block_size,
-            use_mla_flag,
+            attention_plane_layout,
             kvweave_config,
             codec,
         )
@@ -749,7 +988,8 @@ def _build_group_transfer_plans(
                     group_info, blocks_in_chunk, block_size
                 ),
                 chunk_shape=chunk_shape,
-                engine_kv_format=_detect_group_kv_format(group_kv_caches, layout_hints),
+                engine_kv_format=engine_kv_format,
+                attention_plane_layout=attention_plane_layout,
                 quantized=quantized,
                 raw_layout_desc=MemoryLayoutDesc(
                     shapes=[chunk_shape], dtypes=[layout_desc.dtypes[0]]
@@ -1551,6 +1791,7 @@ class EngineDrivenTransferContext(TransferContext):
                         tokens_per_block,
                         plan.mamba_options,
                         raw_chunk,
+                        plan.attention_plane_layout,
                     )
                 ),
                 dtype=torch.uint8,
@@ -1613,6 +1854,7 @@ class EngineDrivenTransferContext(TransferContext):
                 raw_shape,
                 raw_dtype,
                 encoded_chunk,
+                plan.attention_plane_layout,
             )
             for encoded_chunk in group_chunks
         ]

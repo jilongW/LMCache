@@ -13,6 +13,8 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
+    AttentionPlaneLayout,
+    ConvQKVSplit,
     KVWeaveCodecConfig,
     MambaCodecOptions,
 )
@@ -92,6 +94,42 @@ class _KVWeaveCodec:
             for shape, dtype in zip(layout_desc.shapes, layout_desc.dtypes, strict=True)
         )
 
+    def estimate_fused_serialized_size(
+        self, layout_desc: MemoryLayoutDesc, scaling_method: Optional[str] = None
+    ) -> int:
+        """Estimate the upper bound for one serialized fused-K/V KV buffer.
+
+        For groups whose K and V are packed into one tensor's trailing
+        content axis (no leading K/V axis of 2 -- see
+        :meth:`serialize_fused_tensor`), rather than the standard split-K/V
+        layout :meth:`estimate_serialized_size` assumes.
+        """
+        return sum(
+            self._estimate_fused_shape(
+                tuple(int(dim) for dim in shape), dtype, scaling_method
+            )
+            for shape, dtype in zip(layout_desc.shapes, layout_desc.dtypes, strict=True)
+        )
+
+    def _estimate_fused_shape(
+        self, shape: tuple[int, ...], dtype: torch.dtype, method: str | None
+    ) -> int:
+        if len(shape) != 3:
+            raise ValueError(
+                f"KVWeave fused-K/V estimate expects [L, T, H], got {shape}"
+            )
+        layers, tokens, hidden = shape
+        method = method or self.scaling_method
+        elements = int(layers) * int(tokens) * int(hidden)
+        if not self.quantize:
+            return 32 + elements * dtype.itemsize
+        scales = self._fused_scale_count(tokens, hidden, layers, method)
+        header = 32 + 4 * len(shape)
+        return int(
+            (header + 4 + scales * 12 + KVWeaveCodecConfig.quantized_bytes(elements, self.qbit))
+            * 1.02
+        ) + 4096
+
     def _estimate_shape(self, shape: tuple[int, ...], dtype: torch.dtype, method: str | None) -> int:
         if len(shape) == 3:
             tokens, kv_size, hidden = shape
@@ -161,6 +199,103 @@ class _KVWeaveCodec:
             restored = restored.squeeze(1).permute(1, 0, 2)
         dst.copy_(restored.to(dtype=dst.dtype, device=dst.device))
 
+    def serialize_fused_tensor(
+        self, tensor: torch.Tensor, scaling_method: str | None = None
+    ) -> bytes:
+        """Serialize a fused-K/V attention chunk (no leading K/V axis).
+
+        For groups where K and V are packed into one tensor's trailing
+        content axis (e.g. vLLM's non-MLA blocks-first fused backends, used
+        by models like gemma) -- still per-head K/V data, just packed, so it
+        is quantized as one opaque tensor via the same native single-tensor
+        kernels Mamba's conv/ssm sub-states use, rather than the K/V-paired
+        kernels :meth:`serialize_tensor` uses.
+        """
+        if tensor.dim() != 3:
+            raise ValueError(
+                f"KVWeave fused-K/V tensor expects [L, T, H], got {tuple(tensor.shape)}"
+            )
+        cpu = tensor.detach().to("cpu").contiguous()
+        shape = tuple(int(dim) for dim in cpu.shape)
+        layers, tokens, hidden = shape
+        method = scaling_method or self.scaling_method
+        rh, asym = (False, False) if method == "per_tensor" else (self.rh, self.asym)
+        head_num = self._head_num(hidden)
+        head_dim = self._fused_head_dim(hidden)
+        flags = (1 if rh else 0) | (2 if asym else 0)
+        header = self._config.MAGIC_QUANT_FUSED + struct.pack(
+            ">BBBBB" + "i" * len(shape),
+            self.qbit,
+            self._config.DTYPE_TO_CODE.get(cpu.dtype, 0),
+            flags,
+            self._config.SCALING_TO_CODE.get(method, 1),
+            len(shape),
+            *shape,
+        )
+        payload = bytes(
+            self._native().kvweave_serialize_chunk_state(
+                cpu.view(-1), header, KVWeaveCodecConfig.next_scale_id(),
+                qbit=self.qbit, blocks_num=max(1, tokens // self.block_size),
+                block_size=self.block_size, head_num=head_num, head_dim=head_dim,
+                num_layers=layers, rh=rh, asym=asym, scaling_method=method,
+                num_threads=self.num_threads,
+            )
+        )
+        raw_bytes = cpu.numel() * cpu.element_size()
+        logger.debug(
+            "KVWeave fused quantize store shape=%s dtype=%s qbit=%d scaling=%s "
+            "raw_bytes=%d payload_bytes=%d ratio=%.4f",
+            shape, cpu.dtype, self.qbit, method, raw_bytes,
+            len(payload), len(payload) / raw_bytes if raw_bytes else 0.0,
+        )
+        return payload
+
+    def deserialize_fused_tensor(self, src: torch.Tensor, dst: torch.Tensor) -> None:
+        """Decode a fused-K/V payload and restore it into the destination tensor."""
+        parsed = self._parse_fused(self._tensor_bytes(src))
+        layers, tokens, hidden = parsed["shape"]
+        q = torch.frombuffer(bytearray(parsed["q_data"]), dtype=torch.int8)
+        restored = self._native().kvweave_dequantize_chunk_state(
+            q, parsed["scales"], layers, tokens, hidden,
+            qbit=parsed["qbit"], blocks_num=max(1, tokens // self.block_size),
+            block_size=self.block_size, head_num=parsed["head_num"],
+            head_dim=parsed["head_dim"], rh=parsed["rh"], asym=parsed["asym"],
+            scaling_method=parsed["scaling"], output_dtype=dst.dtype,
+            num_threads=self.num_threads,
+        )
+        dst.copy_(restored.reshape(dst.shape).to(dtype=dst.dtype, device=dst.device))
+
+    def _parse_fused(self, raw: bytes) -> dict[str, object]:
+        """Parse a fused-K/V self-describing header for decode."""
+        stream = io.BytesIO(raw)
+        magic = stream.read(4)
+        if magic != self._config.MAGIC_QUANT_FUSED:
+            raise ValueError(f"invalid KVWeave fused payload magic: {magic!r}")
+        qbit, dtype_code, flags, scaling_code, ndim = struct.unpack(
+            ">BBBBB", stream.read(5)
+        )
+        shape = tuple(struct.unpack(">" + "i" * ndim, stream.read(4 * ndim)))
+        if len(shape) != 3:
+            raise ValueError(f"KVWeave fused payload expects 3-D shape, got {shape}")
+        (scale_len,) = struct.unpack(">I", stream.read(4))
+        scales = stream.read(scale_len)
+        method = {
+            value: key for key, value in self._config.SCALING_TO_CODE.items()
+        }.get(scaling_code, self.scaling_method)
+        hidden = shape[2]
+        return {
+            "shape": shape,
+            "qbit": qbit,
+            "rh": bool(flags & 1),
+            "asym": bool(flags & 2),
+            "scaling": method,
+            "dtype": self._config.CODE_TO_DTYPE.get(dtype_code, torch.float16),
+            "scales": scales,
+            "q_data": stream.read(),
+            "head_num": self._head_num(hidden),
+            "head_dim": self._fused_head_dim(hidden),
+        }
+
     def _normalize(self, tensor: torch.Tensor) -> _KVShape:
         """Convert supported 3D/4D KV layouts to canonical 4D metadata."""
         if tensor.dim() == 3:
@@ -207,6 +342,28 @@ class _KVWeaveCodec:
 
     def _head_dim(self, hidden: int) -> int:
         return self.head_dim or hidden // self._head_num(hidden)
+
+    def _fused_head_dim(self, hidden: int) -> int:
+        """Per-head width for a fused-K/V tensor's packed content axis.
+
+        Unlike :meth:`_head_dim`, this never falls back to the configured
+        ``self.head_dim`` (the un-doubled, split-K/V per-plane head size):
+        ``hidden`` already includes the packed K/V width for a fused
+        tensor, so the configured value would be wrong here.
+        """
+        return hidden // self._head_num(hidden)
+
+    def _fused_scale_count(
+        self, tokens: int, hidden: int, layers: int, method: str
+    ) -> int:
+        base = (
+            tokens
+            if method == "per_token"
+            else self._fused_head_dim(hidden)
+            if method == "per_channel"
+            else 1
+        )
+        return max(1, base * layers if layers > 1 else base)
 
     def _scale_count(self, tokens: int, hidden: int, layers: int, method: str) -> int:
         base = tokens if method == "per_token" else self._head_dim(hidden) if method == "per_channel" else 1
@@ -350,6 +507,43 @@ class _KVWeaveCodec:
         return _KVWeaveCodec.dequantize_mamba_substate_4bit(payload)
 
     @staticmethod
+    def _decode_conv_substate(
+        flagged_payload: bytes,
+        layout: MambaSubStateWireLayout,
+        layers: int,
+        blocks: int,
+    ) -> torch.Tensor:
+        """Decode conv_state's payload, honoring its leading quant-enabled flag.
+
+        Mirrors :meth:`_decode_mamba_substate`, except the ``\\x01``
+        (quantized) branch's payload is a 3-way query/key/value bundle (see
+        :meth:`_split_conv_qkv`/:meth:`pack_conv_qkv_payloads`) rather than a
+        single MQ01 payload: each sub-tensor is self-describing and decoded
+        independently, then concatenated back along the last (``conv_dim``)
+        dimension. conv never produces flag ``2`` (that fp16 fallback is
+        ssm-only, see ``encode_chunk``), but it's handled the same way as
+        ``_decode_mamba_substate`` for symmetry.
+        """
+        flag, payload = flagged_payload[0], flagged_payload[1:]
+        if flag == 0:
+            dtype = KVWeaveCodecConfig.mamba_dtype(layout.dtype_str)
+            return torch.frombuffer(bytearray(payload), dtype=dtype).reshape(
+                layers, blocks, *layout.shape
+            )
+        if flag == 2:
+            return torch.frombuffer(bytearray(payload), dtype=torch.float16).reshape(
+                layers, blocks, *layout.shape
+            ).to(dtype=KVWeaveCodecConfig.mamba_dtype(layout.dtype_str))
+        query, key, value = _KVWeaveCodec.unpack_conv_qkv_payloads(payload)
+        return torch.cat(
+            [
+                _KVWeaveCodec.dequantize_mamba_substate_4bit(sub)
+                for sub in (query, key, value)
+            ],
+            dim=-1,
+        )
+
+    @staticmethod
     def dequantize_mamba_substate_4bit(payload: bytes) -> torch.Tensor:
         """Decode a self-describing native Mamba sub-state payload."""
         if kvweave_quant is None:
@@ -415,12 +609,78 @@ class _KVWeaveCodec:
         )
 
     @staticmethod
+    def _estimate_substate_quantized_size(
+        substate_name: str,
+        shape: tuple[int, ...],
+        dtype_str: str,
+        scaling_method: str,
+        qbit: int,
+        quant_enabled: bool = True,
+    ) -> int:
+        """Estimate one sub-state tensor's upper-bound serialized byte size.
+
+        Shared by :meth:`estimate_mamba_serialized_size`'s ssm branch and its
+        per-sub-tensor conv q/k/v branch (see :meth:`_split_conv_qkv`) --
+        both need the same native-payload-size formula, just applied to a
+        differently-shaped tensor.
+
+        Args:
+            substate_name: ``"conv"`` or ``"ssm"`` (selects the native
+                ``mamba_layout`` grouping rule).
+            shape: The full ``(layers, blocks, *tail)`` shape being sized.
+            dtype_str: The tensor's real wire dtype, as ``str(torch.dtype)``.
+            scaling_method: This sub-state's configured scaling method.
+            qbit: This sub-state's configured quantization bit width.
+            quant_enabled: This sub-state's resolved
+                ``LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED``/``SSM_QUANT_ENABLED``
+                value (read once via ``MambaCodecOptions.from_env()`` at
+                registration and fixed for the group's lifetime -- it is not
+                re-read per store call, so ``encode_chunk`` can never switch
+                branches after registration). When ``True`` (the default),
+                only the quantized-payload upper bound is sized, since
+                ``encode_chunk`` will never fall back to raw bytes for this
+                sub-state. When ``False``, only the raw byte size is sized.
+
+        Returns:
+            The quantized-payload upper bound, or the raw (unquantized)
+            byte size when ``quant_enabled`` is ``False`` -- whichever
+            branch ``encode_chunk`` will actually take for this sub-state.
+        """
+        layers, blocks = shape[0], shape[1]
+        elements = layers * blocks * max(
+            int(np.prod(shape[2:])) if len(shape) > 2 else 1, 1
+        )
+        raw_size = elements * KVWeaveCodecConfig.mamba_dtype(dtype_str).itemsize
+        if not quant_enabled:
+            return raw_size
+        native_blocks, _, native_head_dim, _ = _KVWeaveCodec._mamba_layout(
+            substate_name, shape, scaling_method
+        )
+        if scaling_method == "per_tensor":
+            native_chunks = 1
+        elif scaling_method == "per_channel":
+            native_chunks = native_head_dim
+        else:
+            native_chunks = native_blocks
+        scale_blob = 4 + layers * (4 + native_chunks * 12)
+        quantized_size = (
+            elements * 2
+            if qbit == 16
+            else 10 + 4 * len(shape) + scale_blob + KVWeaveCodecConfig.quantized_bytes(
+                elements, qbit
+            )
+        )
+        return quantized_size
+
+    @staticmethod
     def estimate_mamba_serialized_size(
         raw_layout: MemoryLayoutDesc,
         mamba_layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout],
         block_size: int,
+        conv_qkv_split: ConvQKVSplit,
         scaling_methods: tuple[str, str] = ("per_channel", "per_channel"),
         qbits: tuple[int, int] = (4, 8),
+        quant_enabled: tuple[bool, bool] = (True, True),
     ) -> int:
         """Estimate the upper bound needed for one packed conv+ssm Mamba chunk.
 
@@ -429,9 +689,22 @@ class _KVWeaveCodec:
         the element count for each sub-state directly from its own
         ``MambaSubStateWireLayout.shape`` and the group's ``layers``/``tokens``
         (recovered from ``raw_layout``), scaled by the native 4-bit packing
-        rate. The result is a conservative upper bound (matching the safety
-        margin used by ``_estimate_shape``), since it also sizes the SHM
-        slot / pickle chunk buffer the quantized payload is copied into.
+        rate. The result sizes whichever branch (quantized or raw)
+        ``encode_chunk`` will actually take per ``quant_enabled`` -- these
+        flags are resolved once at registration and fixed for the group's
+        lifetime, so there is no need to reserve for both branches at once.
+
+        Args:
+            conv_qkv_split: This model's ``key_dim``/``value_dim`` boundary.
+                conv_state's last dimension is sized as three
+                independently-quantized query/key/value payloads (see
+                :meth:`_split_conv_qkv`/:meth:`pack_conv_qkv_payloads`) plus
+                their 3-way length-prefix framing, matching
+                ``encode_chunk``'s actual conv encoding -- ``encode_chunk``
+                always splits conv when quantizing, so this must always
+                match the split it will actually use.
+            quant_enabled: ``(conv_quant_enabled, ssm_quant_enabled)`` --
+                see :meth:`_estimate_substate_quantized_size`.
         """
         shape = tuple(int(dim) for dim in raw_layout.shapes[0])
         if len(shape) == 4:
@@ -446,39 +719,35 @@ class _KVWeaveCodec:
             )
         blocks = tokens // block_size
         total = 8  # pack_mamba_payloads() conv + ssm length-prefix framing
-        for substate_name, substate_layout, scaling_method, qbit in zip(
-            ("conv", "ssm"),
-            mamba_layout, scaling_methods, qbits, strict=True
+        conv_layout, ssm_layout = mamba_layout
+        conv_scaling, ssm_scaling = scaling_methods
+        conv_qbit, ssm_qbit = qbits
+        conv_quant_enabled, ssm_quant_enabled = quant_enabled
+
+        conv_dim = conv_layout.shape[-1]
+        expected_conv_dim = conv_qkv_split.key_dim * 2 + conv_qkv_split.value_dim
+        if conv_dim != expected_conv_dim:
+            raise ValueError(
+                f"conv_state last dim ({conv_dim}) does not match "
+                f"key_dim*2 + value_dim ({expected_conv_dim})"
+            )
+        total += 12  # pack_conv_qkv_payloads() 3-way length-prefix framing
+        for sub_dim in (
+            conv_qkv_split.key_dim,
+            conv_qkv_split.key_dim,
+            conv_qkv_split.value_dim,
         ):
-            elements = layers * blocks * max(
-                int(np.prod(substate_layout.shape)) if substate_layout.shape else 1, 1
+            sub_shape = (layers, blocks, *conv_layout.shape[:-1], sub_dim)
+            total += 1 + _KVWeaveCodec._estimate_substate_quantized_size(
+                "conv", sub_shape, conv_layout.dtype_str, conv_scaling, conv_qbit,
+                quant_enabled=conv_quant_enabled,
             )
-            full_shape = (layers, blocks, *substate_layout.shape)
-            native_blocks, _, native_head_dim, _ = _KVWeaveCodec._mamba_layout(
-                substate_name, full_shape, scaling_method
-            )
-            if scaling_method == "per_tensor":
-                native_chunks = 1
-            elif scaling_method == "per_channel":
-                native_chunks = native_head_dim
-            else:
-                native_chunks = native_blocks
-            scale_blob = 4 + layers * (4 + native_chunks * 12)
-            quantized_size = (
-                elements * 2
-                if qbit == 16
-                else 10 + 4 * len(full_shape) + scale_blob + KVWeaveCodecConfig.quantized_bytes(
-                    elements, qbit
-                )
-            )
-            # DEBUG ONLY: LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED/SSM_QUANT_ENABLED
-            # can make encode_chunk skip quantization and write raw bytes
-            # instead -- size the slot for whichever is larger so toggling
-            # either off at runtime never overflows the reserved slot.
-            raw_size = elements * KVWeaveCodecConfig.mamba_dtype(
-                substate_layout.dtype_str
-            ).itemsize
-            total += 1 + max(quantized_size, raw_size)
+
+        ssm_shape = (layers, blocks, *ssm_layout.shape)
+        total += 1 + _KVWeaveCodec._estimate_substate_quantized_size(
+            "ssm", ssm_shape, ssm_layout.dtype_str, ssm_scaling, ssm_qbit,
+            quant_enabled=ssm_quant_enabled,
+        )
         return total
 
     @staticmethod
@@ -516,6 +785,43 @@ class _KVWeaveCodec:
         if ssm_size > len(blob) - offset:
             raise ValueError("Mamba payload bundle is truncated")
         return conv, blob[offset : offset + ssm_size]
+
+    @staticmethod
+    def _split_conv_qkv(
+        conv: torch.Tensor, split: ConvQKVSplit
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Slice a fused conv_state tensor into its query/key/value sub-tensors.
+
+        ``conv``'s last dimension is ``conv_dim = key_dim*2 + value_dim``
+        (query and key share ``key_dim``, see ``mamba_conv_ssm_layout_params.md``
+        §1's ``torch.split(mixed_qkv, [key_dim, key_dim, value_dim], dim=-1)``).
+        Slicing (not splitting into new storage) keeps this a view until
+        ``quantize_mamba_substate_4bit`` makes each sub-tensor contiguous.
+
+        Args:
+            conv: Fused conv_state, shape ``(layers, blocks, kernel_hist, conv_dim)``.
+            split: This model's ``key_dim``/``value_dim`` boundary.
+
+        Returns:
+            ``(query, key, value)`` views, each ``key_dim`` (query/key) or
+            ``value_dim`` (value) wide on the last dimension.
+
+        Raises:
+            ValueError: If ``conv``'s last dimension does not match
+                ``key_dim*2 + value_dim``.
+        """
+        key_dim, value_dim = split.key_dim, split.value_dim
+        conv_dim = conv.shape[-1]
+        if conv_dim != key_dim * 2 + value_dim:
+            raise ValueError(
+                f"conv_state last dim ({conv_dim}) does not match "
+                f"key_dim*2 + value_dim ({key_dim * 2 + value_dim})"
+            )
+        return (
+            conv[..., :key_dim],
+            conv[..., key_dim : 2 * key_dim],
+            conv[..., 2 * key_dim :],
+        )
 
     @staticmethod
     def pack_conv_qkv_payloads(query: bytes, key: bytes, value: bytes) -> bytes:
@@ -565,12 +871,14 @@ class _KVWeaveCodec:
     def _validate_cache_category_dispatch(
         cache_category: str,
         mamba_layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None,
+        attention_plane_layout: AttentionPlaneLayout | None = None,
     ) -> None:
         """Reject any category/layout combination that would mis-dispatch.
 
         ``cache_category`` must be exactly one of ``"attention"``,
         ``"mamba"``, or ``"unknown"`` (see ``EngineGroupInfo.cache_category``).
-        Only ``"mamba"`` may carry a non-``None`` ``mamba_layout``.
+        Only ``"mamba"`` may carry a non-``None`` ``mamba_layout``. Only
+        ``"attention"`` may carry a non-``None`` ``attention_plane_layout``.
         ``"unknown"`` is rejected unconditionally: it exists so that a
         caller who failed to resolve a group's real category fails loudly
         here instead of silently falling into the attention path (the
@@ -584,13 +892,17 @@ class _KVWeaveCodec:
             cache_category: The group's declared category.
             mamba_layout: The group's real conv/ssm sub-state layout, or
                 ``None`` for a non-Mamba group.
+            attention_plane_layout: The group's classified attention K/V
+                plane layout, or ``None`` for a non-attention group.
 
         Raises:
             ValueError: If ``cache_category`` is not one of the three
                 valid values, if ``cache_category != "mamba"`` but
                 ``mamba_layout`` is provided, if ``cache_category ==
-                "mamba"`` but ``mamba_layout`` is missing, or if
-                ``cache_category == "unknown"``.
+                "mamba"`` but ``mamba_layout`` is missing, if
+                ``cache_category == "unknown"``, or if
+                ``attention_plane_layout`` is provided but
+                ``cache_category != "attention"``.
         """
         if cache_category not in _KVWeaveCodec._VALID_CACHE_CATEGORIES:
             raise ValueError(
@@ -618,6 +930,12 @@ class _KVWeaveCodec:
                 f"{cache_category!r} is not 'mamba'; this would misroute "
                 "a non-Mamba chunk into the Mamba split/merge codec"
             )
+        if cache_category != "attention" and attention_plane_layout is not None:
+            raise ValueError(
+                f"attention_plane_layout was provided but cache_category="
+                f"{cache_category!r} is not 'attention'; this would "
+                "misroute a non-attention chunk into the fused-K/V codec"
+            )
 
     def encode_chunk(
         self,
@@ -626,35 +944,48 @@ class _KVWeaveCodec:
         tokens_per_block: int,
         mamba_options: MambaCodecOptions | None,
         raw_chunk: torch.Tensor,
+        attention_plane_layout: AttentionPlaneLayout | None = None,
     ) -> bytes:
         """Encode one gathered raw chunk into its wire-quantized byte payload.
 
         Dispatches on ``cache_category``: Mamba groups are split into their
         real ``conv``/``ssm`` sub-states and quantized independently (Phase
-        4's dedicated Mamba codec); every other category is quantized as an
-        attention K/V tensor via ``self.serialize_tensor`` (Phase 3's
-        codec). Applying the attention codec to a Mamba group's opaque
+        4's dedicated Mamba codec); attention groups are quantized via
+        ``self.serialize_fused_tensor`` when ``attention_plane_layout`` is
+        ``AttentionPlaneLayout.FUSED_KV`` (K/V packed into one tensor, no
+        leading K/V axis), or ``self.serialize_tensor`` (Phase 3's codec)
+        otherwise. Applying the attention codec to a Mamba group's opaque
         page-view chunk would silently corrupt its recurrent state -- see
         Phase 6 in MIGRATION_PLAN.md.
 
         Raises:
-            ValueError: If ``cache_category``/``mamba_layout`` do not form
-                a valid, unambiguous dispatch -- see
-                :meth:`_validate_cache_category_dispatch`.
+            ValueError: If ``cache_category``/``mamba_layout``/
+                ``attention_plane_layout`` do not form a valid, unambiguous
+                dispatch -- see :meth:`_validate_cache_category_dispatch`.
         """
-        self._validate_cache_category_dispatch(cache_category, mamba_layout)
+        self._validate_cache_category_dispatch(
+            cache_category, mamba_layout, attention_plane_layout
+        )
         if mamba_layout is not None:
             if mamba_options is None:
                 raise RuntimeError("Mamba codec options are not initialized")
             split = self.split_mamba_chunk(raw_chunk, mamba_layout, tokens_per_block)
             if getattr(mamba_options, "conv_quant_enabled", True):
-                conv_payload = b"\x01" + self.quantize_mamba_substate_4bit(
-                    split.conv,
-                    substate="conv",
-                    scaling_method=mamba_options.conv_scaling_method,
-                    rh=mamba_options.conv_rh,
-                    asym=mamba_options.asym,
-                    qbit=mamba_options.conv_qbit,
+                query, key, value = self._split_conv_qkv(
+                    split.conv, mamba_options.conv_qkv_split
+                )
+                conv_payload = b"\x01" + self.pack_conv_qkv_payloads(
+                    *(
+                        self.quantize_mamba_substate_4bit(
+                            sub,
+                            substate="conv",
+                            scaling_method=mamba_options.conv_scaling_method,
+                            rh=mamba_options.conv_rh,
+                            asym=mamba_options.asym,
+                            qbit=mamba_options.conv_qbit,
+                        )
+                        for sub in (query, key, value)
+                    )
                 )
             else:
                 conv_payload = b"\x00" + self._tensor_bytes(split.conv)
@@ -675,6 +1006,8 @@ class _KVWeaveCodec:
             else:
                 ssm_payload = b"\x00" + self._tensor_bytes(split.ssm)
             return self.pack_mamba_payloads(conv_payload, ssm_payload)
+        if attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
+            return self.serialize_fused_tensor(raw_chunk)
         return self.serialize_tensor(raw_chunk)
 
     def decode_chunk(
@@ -685,21 +1018,24 @@ class _KVWeaveCodec:
         raw_shape: torch.Size,
         raw_dtype: torch.dtype,
         chunk: torch.Tensor,
+        attention_plane_layout: AttentionPlaneLayout | None = None,
     ) -> torch.Tensor:
         """Decode one retrieved wire-quantized byte chunk back to its raw shape.
 
-        Mirrors :meth:`encode_chunk`'s dispatch. Both branches return a
-        freshly allocated tensor (the attention branch's
-        ``deserialize_tensor`` writes into a caller-provided destination
-        internally, so callers of this method never need to know which
-        convention the underlying codec uses).
+        Mirrors :meth:`encode_chunk`'s dispatch. All branches return a
+        freshly allocated tensor (the attention branches' ``deserialize_*``
+        methods write into a caller-provided destination internally, so
+        callers of this method never need to know which convention the
+        underlying codec uses).
 
         Raises:
-            ValueError: If ``cache_category``/``mamba_layout`` do not form
-                a valid, unambiguous dispatch -- see
-                :meth:`_validate_cache_category_dispatch`.
+            ValueError: If ``cache_category``/``mamba_layout``/
+                ``attention_plane_layout`` do not form a valid, unambiguous
+                dispatch -- see :meth:`_validate_cache_category_dispatch`.
         """
-        self._validate_cache_category_dispatch(cache_category, mamba_layout)
+        self._validate_cache_category_dispatch(
+            cache_category, mamba_layout, attention_plane_layout
+        )
         if mamba_layout is not None:
             conv_layout, ssm_layout = mamba_layout
             conv_payload, ssm_payload = self.unpack_mamba_payloads(
@@ -708,7 +1044,7 @@ class _KVWeaveCodec:
             layers = raw_shape[1] if len(raw_shape) == 4 else raw_shape[0]
             tokens = raw_shape[-2]
             blocks = max(tokens // tokens_per_block, 1)
-            conv = self._decode_mamba_substate(conv_payload, conv_layout, layers, blocks)
+            conv = self._decode_conv_substate(conv_payload, conv_layout, layers, blocks)
             ssm = self._decode_mamba_substate(ssm_payload, ssm_layout, layers, blocks)
             hidden_dim = raw_shape[-1]
             merged = self.merge_mamba_chunk(
@@ -721,7 +1057,10 @@ class _KVWeaveCodec:
             # fp16 (the normal Qwen3.5 layout).
             return merged
         destination = torch.empty(raw_shape, dtype=raw_dtype)
-        self.deserialize_tensor(chunk, destination)
+        if attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
+            self.deserialize_fused_tensor(chunk, destination)
+        else:
+            self.deserialize_tensor(chunk, destination)
         return destination
 
 

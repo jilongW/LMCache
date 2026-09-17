@@ -13,8 +13,12 @@ import pytest
 import torch
 
 # First Party
+import lmcache.lmcache_native as lmcache_native
 from lmcache.v1.distributed.api import MemoryLayoutDesc
-from lmcache.v1.distributed.serde.kvweave.kvweave_config import KVWeaveRuntimeConfig
+from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
+    AttentionPlaneLayout,
+    KVWeaveRuntimeConfig,
+)
 from lmcache.v1.distributed.serde.kvweave.kvweave_serde import KVWeaveCodec
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
@@ -137,8 +141,11 @@ class TestGroupChunkShape:
         layout_desc = MemoryLayoutDesc(
             shapes=[torch.Size([2, 4, 64, 16])], dtypes=[torch.float16]
         )
-        shape = worker_transfer._group_chunk_shape(None, layout_desc, 4, 16, {}, None)
+        shape, group_use_mla = worker_transfer._group_chunk_shape(
+            None, layout_desc, 4, 16, {}, None
+        )
         assert shape == torch.Size([2, 4, 64, 16])
+        assert group_use_mla is None
 
     def test_substitutes_group_layer_count(self) -> None:
         """A group with 6 of the 24 registered layers gets a chunk shape
@@ -149,8 +156,11 @@ class TestGroupChunkShape:
         group = EngineGroupInfo(
             engine_group_id=0, layer_indices=tuple(range(6)), recurrent_state=True
         )
-        shape = worker_transfer._group_chunk_shape(group, layout_desc, 24, 16, {}, None)
+        shape, group_use_mla = worker_transfer._group_chunk_shape(
+            group, layout_desc, 24, 16, {}, None
+        )
         assert shape == torch.Size([2, 6, 64, 16])
+        assert group_use_mla is None
 
     def test_substitutes_group_layer_count_mla_shape(self) -> None:
         """MLA/fused-K/V layouts have no leading kv-plane dim; layer count is
@@ -163,8 +173,11 @@ class TestGroupChunkShape:
             layer_indices=tuple(range(6, 24)),
             recurrent_state=True,
         )
-        shape = worker_transfer._group_chunk_shape(group, layout_desc, 24, 16, {}, None)
+        shape, group_use_mla = worker_transfer._group_chunk_shape(
+            group, layout_desc, 24, 16, {}, None
+        )
         assert shape == torch.Size([18, 64, 16])
+        assert group_use_mla is None
 
 
 class TestBuildGroupTransferPlans:
@@ -272,6 +285,30 @@ class TestBuildGroupTransferPlans:
         ]
         assert all(p.engine_kv_format is not None for p in plans)
 
+    def test_classifies_attention_plane_layout_from_detected_format(self) -> None:
+        group = EngineGroupInfo(
+            engine_group_id=0, layer_indices=(0, 1), cache_category="attention"
+        )
+
+        assert (
+            worker_transfer._attention_plane_layout_for_group(
+                group, lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS
+            )
+            == AttentionPlaneLayout.SPLIT_KV
+        )
+        assert (
+            worker_transfer._attention_plane_layout_for_group(
+                group, lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_TWO_HS
+            )
+            == AttentionPlaneLayout.FUSED_KV
+        )
+        assert (
+            worker_transfer._attention_plane_layout_for_group(
+                group, lmcache_native.EngineKVFormat.NL_X_NB_BS_HS
+            )
+            == AttentionPlaneLayout.MLA
+        )
+
     def test_undetectable_group_falls_back_to_per_transfer_detection(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -348,7 +385,7 @@ class TestDecideGroupQuantization:
                 torch.Size([2, 2, 8, 16]),
                 torch.float32,
                 4,
-                False,
+                AttentionPlaneLayout.SPLIT_KV,
                 _disabled_kvweave_config(),
                 KVWeaveCodec(),
             )
@@ -368,15 +405,14 @@ class TestDecideGroupQuantization:
             torch.Size([2, 2, 8, 16]),
             torch.float32,
             4,
-            False,
+            None,
             _enabled_kvweave_config(),
             KVWeaveCodec(),
         )
         assert quantized is False
 
     def test_mla_attention_group_never_quantizes(self) -> None:
-        """MLA/fused-K/V (single-plane) formats are excluded from the
-        attention quantization branch."""
+        """MLA formats are excluded from the attention quantization branch."""
         group = EngineGroupInfo(
             engine_group_id=0, layer_indices=(0, 1), cache_category="attention"
         )
@@ -385,7 +421,7 @@ class TestDecideGroupQuantization:
             torch.Size([2, 8, 16]),
             torch.float32,
             4,
-            True,
+            AttentionPlaneLayout.MLA,
             _enabled_kvweave_config(),
             KVWeaveCodec(),
         )
@@ -407,7 +443,7 @@ class TestDecideGroupQuantization:
                 raw_shape,
                 torch.float32,
                 4,
-                False,
+                AttentionPlaneLayout.SPLIT_KV,
                 _enabled_kvweave_config(),
                 codec,
             )
@@ -418,6 +454,30 @@ class TestDecideGroupQuantization:
         assert quant_layout.dtypes[0] == torch.uint8
         raw_size = 2 * 2 * 4096 * 16 * 4
         assert quant_layout.shapes[0][0] < raw_size
+
+    def test_fused_attention_group_quantizes_when_estimate_is_smaller(self) -> None:
+        group = EngineGroupInfo(
+            engine_group_id=0, layer_indices=(0, 1), cache_category="attention"
+        )
+        raw_shape = torch.Size([2, 4096, 32])
+        codec = KVWeaveCodec({"num_kv_heads": 2, "head_dim": 8})
+        quantized, quant_layout, mamba_options = (
+            worker_transfer._decide_group_quantization(
+                group,
+                raw_shape,
+                torch.float32,
+                4,
+                AttentionPlaneLayout.FUSED_KV,
+                _enabled_kvweave_config(),
+                codec,
+            )
+        )
+
+        assert quantized is True
+        assert mamba_options is None
+        assert quant_layout is not None
+        assert quant_layout.dtypes[0] == torch.uint8
+        assert quant_layout.shapes[0][0] < raw_shape.numel() * 4
 
     def test_mamba_group_without_real_layout_falls_back_unquantized(self) -> None:
         """A Mamba group missing mamba_real_layout must safely fall back to
@@ -434,7 +494,7 @@ class TestDecideGroupQuantization:
                 torch.Size([2, 2, 8, 16]),
                 torch.float32,
                 4,
-                False,
+                None,
                 _enabled_kvweave_config(),
                 KVWeaveCodec(),
             )
@@ -457,7 +517,7 @@ class TestDecideGroupQuantization:
             torch.Size([2, 2, 8, 16]),
             torch.float32,
             4,
-            False,
+            None,
             _enabled_kvweave_config(linear_quant_enabled=False),
             KVWeaveCodec(),
         )
@@ -471,7 +531,7 @@ class TestDecideGroupQuantization:
             torch.Size([2, 2, 8, 16]),
             torch.float32,
             4,
-            False,
+            None,
             _enabled_kvweave_config(),
             KVWeaveCodec(),
         )
@@ -1211,11 +1271,20 @@ class _SpyCodec:
     def __init__(self) -> None:
         self.encode_calls: list[torch.Tensor] = []
         self.decode_calls: list[torch.Tensor] = []
+        self.encode_layouts: list[AttentionPlaneLayout | None] = []
+        self.decode_layouts: list[AttentionPlaneLayout | None] = []
 
     def encode_chunk(
-        self, cache_category, mamba_layout, tokens_per_block, mamba_options, raw_chunk
+        self,
+        cache_category,
+        mamba_layout,
+        tokens_per_block,
+        mamba_options,
+        raw_chunk,
+        attention_plane_layout=None,
     ) -> bytes:
         self.encode_calls.append(raw_chunk)
+        self.encode_layouts.append(attention_plane_layout)
         return raw_chunk.numpy().tobytes()
 
     def decode_chunk(
@@ -1226,8 +1295,10 @@ class _SpyCodec:
         raw_shape,
         raw_dtype,
         chunk,
+        attention_plane_layout=None,
     ) -> torch.Tensor:
         self.decode_calls.append(chunk)
+        self.decode_layouts.append(attention_plane_layout)
         flat = torch.frombuffer(bytearray(chunk.numpy().tobytes()), dtype=raw_dtype)
         return flat.view(raw_shape)
 

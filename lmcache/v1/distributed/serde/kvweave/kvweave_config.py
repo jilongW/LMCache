@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from itertools import count
 import json
 import os
@@ -15,6 +16,27 @@ import torch
 from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
+
+
+class AttentionPlaneLayout(Enum):
+    """How one attention group's KV object plane(s) are physically laid out.
+
+    ``SPLIT_KV``: the standard two-plane layout (K and V as separate
+    tensors/axis), quantized via the existing K/V-paired codec path.
+    ``FUSED_KV``: K and V packed into one tensor's trailing content axis
+    (e.g. vLLM's non-MLA blocks-first fused backends) -- still per-head K/V
+    data, just packed; quantized via the single-tensor fused codec path.
+    ``MLA``: a true compressed latent vector (Multi-head Latent Attention)
+    with no per-head K/V structure for the codec to exploit -- never
+    quantized.
+    ``UNKNOWN``: single-plane (``kv_size == 1``) but the engine KV format
+    could not be classified -- never quantized (safe default, no guessing).
+    """
+
+    SPLIT_KV = "split_kv"
+    FUSED_KV = "fused_kv"
+    MLA = "mla"
+    UNKNOWN = "unknown"
 
 # Fallback model text-config, used when MODEL_PATH/MODEL are unset or the
 # model's config.json is missing the fields KVWeave needs. Mirrors
@@ -121,18 +143,29 @@ class MambaCodecOptions:
         ``LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD`` and
         ``SSM_SCALING_METHOD`` have independent defaults
         (``per_channel``), not derived from ``LINEAR_*``. ``CONV_RH`` still
-        falls back to ``LINEAR_RH`` while ``SSM_RH`` defaults to ``true``.
+        falls back to ``LINEAR_RH`` (now defaulting to ``true``) while
+        ``SSM_RH`` defaults to ``true`` independently.
 
         ``LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED``/``SSM_QUANT_ENABLED``
         (DEBUG ONLY, default ``true``) independently disable
         quantization for one sub-state while leaving the other quantized --
         for isolating which sub-state's quantization causes an accuracy
         regression.
+
+        Note: with the default ``conv_scaling_method="per_channel"``,
+        conv_state's RH transform length is always the kernel_history
+        dimension (typically 3, never a power of 2) -- so ``conv_rh=True``
+        here is downgraded back to ``False`` for essentially every real
+        model by ``worker_transfer._resolve_mamba_options_for_group()`` at
+        registration time (see ``mamba_conv_ssm_layout_params.md`` §3.1).
+        It only takes effect if the caller also sets
+        ``LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD=per_token`` on a model
+        whose conv_dim happens to be a power of 2.
         """
         _env_scaling_method(
-            "LMCACHE_MP_KVWEAVE_LINEAR_SCALING_METHOD", "per_tensor"
+            "LMCACHE_MP_KVWEAVE_LINEAR_SCALING_METHOD", "per_channel"
         )
-        linear_rh = _env_flag("LMCACHE_MP_KVWEAVE_LINEAR_RH", False)
+        linear_rh = _env_flag("LMCACHE_MP_KVWEAVE_LINEAR_RH", True)
         conv_scaling = _env_scaling_method(
             "LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD", "per_channel"
         )
@@ -199,7 +232,10 @@ class KVWeaveRuntimeConfig:
         ``linear_quant_enabled`` (``LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED``,
         default ``true``) independently gates Mamba/linear groups under it.
         ``attention_codec_kwargs`` is ready to pass straight into
-        ``KVWeaveCodec(...)``.
+        ``KVWeaveCodec(...)``. ``rh``/``asym`` were previously only settable
+        by constructing ``_KVWeaveCodec`` directly (its own default is
+        ``True`` for both); ``LMCACHE_MP_KVWEAVE_RH``/``LMCACHE_MP_KVWEAVE_ASYM``
+        expose that same default as an environment override.
         """
         enabled = _env_flag("LMCACHE_MP_L1_KVWEAVE_QUANT", False)
         text_config = _load_model_text_config()
@@ -219,7 +255,9 @@ class KVWeaveRuntimeConfig:
                 "scaling_method": os.environ.get(
                     "LMCACHE_MP_KVWEAVE_SCALING_METHOD", "per_channel"
                 ),
-                "precond": _env_flag("LMCACHE_MP_KVWEAVE_PRECOND", False),
+                "rh": _env_flag("LMCACHE_MP_KVWEAVE_RH", True),
+                "asym": _env_flag("LMCACHE_MP_KVWEAVE_ASYM", True),
+                "precond": _env_flag("LMCACHE_MP_KVWEAVE_PRECOND", True),
             },
             mamba_options=MambaCodecOptions.from_env(),
         )
@@ -241,6 +279,7 @@ class KVWeaveCodecConfig:
     precond_path: Optional[str] = None
     MAGIC_RAW: ClassVar[bytes] = b"KVW0"
     MAGIC_QUANT: ClassVar[bytes] = b"KVW3"
+    MAGIC_QUANT_FUSED: ClassVar[bytes] = b"KVW4"
     MAMBA_MAGIC: ClassVar[bytes] = b"MQ01"
     MAMBA_QBIT: ClassVar[int] = 4
     MAMBA_FLAG_RH: ClassVar[int] = 1
