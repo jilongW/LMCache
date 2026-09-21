@@ -127,6 +127,9 @@ class L1MemoryManagerConfig:
     """ Optional Device-DAX path to use as the L1 backing arena. """
 
     devdax_size_in_bytes: int = 0
+
+    shm_pool_size_in_bytes: int | None = None
+    """Backing SHM size when it includes a non-L1 scratch tail."""
     """ Optional Device-DAX overflow size for hybrid DRAM + DAX L1. """
 
     def __post_init__(self):

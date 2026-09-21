@@ -15,9 +15,12 @@ from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
+from lmcache.v1.multiprocess.scratch_allocator import ScratchAllocation
+from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     IPCEvent,
+    _raw_gather_shape,
     _select_group_chunks,
     null_chunk_mask_from_groups,
 )
@@ -252,6 +255,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 gather_done: Any | None = None
                 ok = False
                 staged_chunks: list[torch.Tensor] = []
+                scratch_allocations: list[ScratchAllocation] = []
                 try:
                     # --- Phase 1: prepare_store ---
                     # In pickle mode this is the costliest step (sync RPC
@@ -331,9 +335,50 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                             # groups use the SHM slot directly here.
                             if group_slots is not None and not plan.quantized:
                                 group_out = group_slots
+                            elif plan.quantized and isinstance(
+                                engine_driven_context, EngineDrivenContextShm
+                            ):
+                                raw_shape = _raw_gather_shape(plan)
+                                raw_dtype = plan.raw_layout_desc.dtypes[0]  # type: ignore[union-attr]
+                                scratch = (
+                                    engine_driven_context.allocate_scratch_tensors(
+                                        raw_shape,
+                                        raw_dtype,
+                                        len(selection.chunk_indices),
+                                        wait=True,
+                                    )
+                                )
+                                if scratch is not None:
+                                    group_out, allocation = scratch
+                                    scratch_allocations.append(allocation)
+                                else:
+                                    requested_bytes = (
+                                        int(raw_shape.numel())
+                                        * torch.empty((), dtype=raw_dtype).element_size()
+                                        * len(selection.chunk_indices)
+                                    )
+                                    logger.info(
+                                        "Async engine-driven scratch allocation "
+                                        "unavailable for request_id=%s group=%s "
+                                        "chunks=%d requested=%.3f MiB after "
+                                        "wait/retry; falling back to pinned "
+                                        "staging buffers",
+                                        _request_id,
+                                        plan.group_info.engine_group_id
+                                        if plan.group_info is not None
+                                        else -1,
+                                        len(selection.chunk_indices),
+                                        requested_bytes / (1 << 20),
+                                    )
+                                    group_out = self._alloc_pinned_staging(
+                                        raw_shape,
+                                        raw_dtype,
+                                        len(selection.out_indices),
+                                    )
+                                    staged_chunks.extend(group_out)
                             else:
                                 group_out = self._alloc_pinned_staging(
-                                    plan.chunk_shape,
+                                    _raw_gather_shape(plan),
                                     engine_driven_context.layout_desc.dtypes[0],
                                     len(selection.out_indices),
                                 )
@@ -429,6 +474,10 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     # skip releasing them back to the pool.
                     if staged_chunks:
                         self._release_staging(staged_chunks)
+                    if scratch_allocations:
+                        assert isinstance(engine_driven_context, EngineDrivenContextShm)
+                        for allocation in scratch_allocations:
+                            engine_driven_context.free_scratch(allocation)
                     with self._inflight_lock:
                         if gather_done is not None:
                             self._inflight_gather_events.discard(gather_done)

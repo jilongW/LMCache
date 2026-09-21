@@ -4,6 +4,7 @@
 # Standard
 from dataclasses import dataclass, replace
 from typing import TypedDict
+import os
 import threading
 
 # First Party
@@ -34,6 +35,49 @@ class ShmPoolInfo(TypedDict):
 
     shm_name: str
     pool_size: int
+    scratch_offset: int
+    scratch_size: int
+
+
+def _engine_driven_scratch_size_bytes(l1_size: int, shm_name: str) -> int:
+    """Return the reserved scratch size for an engine-driven SHM pool."""
+    if not shm_name:
+        return 0
+    raw = os.environ.get("LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_GB", "5")
+    try:
+        requested = max(0.0, float(raw)) * (1 << 30)
+    except ValueError:
+        logger.warning("Invalid engine-driven scratch size in GB %r; disabling", raw)
+        return 0
+    requested_size = int(requested)
+    if requested_size <= 0:
+        return 0
+
+    try:
+        shm_stats = os.statvfs("/dev/shm")
+        shm_available = shm_stats.f_bavail * shm_stats.f_frsize
+    except OSError as exc:
+        logger.warning(
+            "Failed to read /dev/shm available capacity for engine-driven "
+            "scratch sizing: %s; using requested scratch size %.3f GiB",
+            exc,
+            requested_size / (1 << 30),
+        )
+        return requested_size
+
+    max_scratch_size = max(0, shm_available - l1_size)
+    scratch_size = min(requested_size, max_scratch_size)
+    if scratch_size < requested_size:
+        logger.info(
+            "Engine-driven scratch requested %.3f GiB, reduced to %.3f GiB "
+            "because /dev/shm has %.3f GiB available and L1 is configured "
+            "for %.3f GiB",
+            requested_size / (1 << 30),
+            scratch_size / (1 << 30),
+            shm_available / (1 << 30),
+            l1_size / (1 << 30),
+        )
+    return scratch_size
 
 
 @dataclass
@@ -218,6 +262,11 @@ class MPCacheServerContext:
         self.shm_pool_info: ShmPoolInfo = self._compute_shm_pool_info(
             storage_manager_config
         )
+        if self.shm_pool_info["scratch_size"]:
+            memory_config = storage_manager_config.l1_manager_config.memory_config
+            memory_config.shm_pool_size_in_bytes = (
+                self.shm_pool_info["pool_size"]
+            )
         self._storage_manager = StorageManager(storage_manager_config)
         self._token_hasher = TokenHasher(
             chunk_size=chunk_size, hash_algorithm=hash_algorithm
@@ -319,8 +368,21 @@ class MPCacheServerContext:
         mem_cfg = storage_manager_config.l1_manager_config.memory_config
         shm_name = mem_cfg.shm_name or ""
         if not shm_name or mem_cfg.use_lazy or mem_cfg.devdax_path:
-            return {"shm_name": "", "pool_size": 0}
+            return {
+                "shm_name": "",
+                "pool_size": 0,
+                "scratch_offset": 0,
+                "scratch_size": 0,
+            }
         bare = shm_name.lstrip("/")
         if not bare.startswith("lmcache_l1_pool_"):
             shm_name = f"lmcache_l1_pool_{bare}"
-        return {"shm_name": shm_name, "pool_size": mem_cfg.size_in_bytes}
+        scratch_size = _engine_driven_scratch_size_bytes(
+            mem_cfg.size_in_bytes, shm_name
+        )
+        return {
+            "shm_name": shm_name,
+            "pool_size": mem_cfg.size_in_bytes + scratch_size,
+            "scratch_offset": mem_cfg.size_in_bytes,
+            "scratch_size": scratch_size,
+        }

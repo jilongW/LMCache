@@ -5,6 +5,7 @@
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 import pickle
+import os
 import threading
 import time
 
@@ -250,6 +251,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         ] = {}
         self._pending_shm_lock = threading.Lock()
         self._shm_pool_info: ShmPoolInfo = self._ctx.shm_pool_info
+        self._scratch_slots: dict[int, tuple[int, int]] = {}
 
     @property
     def context(self) -> MPCacheServerContext:
@@ -404,6 +406,51 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 self._ctx.storage_manager.finish_read_prefetched(obj_keys)
 
         self._ctx.layout_desc_registry.unregister(entry.model_name, entry.world_size)
+        with self._lock:
+            self._scratch_slots.pop(instance_id, None)
+
+    def _allocate_scratch_slot(
+        self, instance_id: int, default_max_instances: int
+    ) -> tuple[int, int]:
+        """Assign one non-overlapping scratch partition to an instance."""
+        scratch_start = self._shm_pool_info["scratch_offset"]
+        scratch_total = self._shm_pool_info["scratch_size"]
+        if not scratch_total:
+            return 0, 0
+        default_max_instances = max(1, default_max_instances)
+        raw_max_instances = os.environ.get(
+            "LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_MAX_INSTANCES"
+        )
+        try:
+            max_instances = max(
+                1,
+                int(raw_max_instances)
+                if raw_max_instances is not None
+                else default_max_instances,
+            )
+        except ValueError:
+            logger.warning(
+                "Invalid LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_MAX_INSTANCES=%r; "
+                "using registered world_size=%d",
+                raw_max_instances,
+                default_max_instances,
+            )
+            max_instances = default_max_instances
+        slot_size = scratch_total // max_instances
+        if slot_size <= 0:
+            return 0, 0
+        used = set(self._scratch_slots.values())
+        for slot_index in range(max_instances):
+            slot = (scratch_start + slot_index * slot_size, slot_size)
+            if slot not in used:
+                self._scratch_slots[instance_id] = slot
+                return slot
+        logger.warning(
+            "No engine-driven scratch partition available for instance %d; "
+            "falling back to temporary CPU buffers",
+            instance_id,
+        )
+        return 0, 0
 
     @staticmethod
     def _make_transfer_key(
@@ -547,8 +594,12 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                     "Instance %d already registered (non-GPU); refreshing liveness",
                     payload.instance_id,
                 )
+                scratch_slot = self._scratch_slots.get(payload.instance_id, (0, 0))
                 return RegisterEngineDrivenContextResponse(
-                    shm_name=shm_name, pool_size=pool_size
+                    shm_name=shm_name,
+                    pool_size=pool_size,
+                    scratch_offset=scratch_slot[0],
+                    scratch_size=scratch_slot[1],
                 )
 
         dtype = getattr(torch, payload.dtype_str, None)
@@ -583,6 +634,11 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                     )
                 )
             self._ctx.storage_manager.mark_l1_kvweave_quant_enabled()
+
+        with self._lock:
+            scratch_offset, scratch_size = self._allocate_scratch_slot(
+                payload.instance_id, payload.world_size
+            )
 
         layout_desc = self._make_group_layout_desc(
             payload.num_layers,
@@ -686,7 +742,10 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 payload.model_name, payload.world_size, layout_desc
             )
         return RegisterEngineDrivenContextResponse(
-            shm_name=shm_name, pool_size=pool_size
+            shm_name=shm_name,
+            pool_size=pool_size,
+            scratch_offset=scratch_offset,
+            scratch_size=scratch_size,
         )
 
     def unregister_kv_cache(self, instance_id: int) -> None:
@@ -699,6 +758,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             entry = self._engine_driven_contexts.pop(instance_id, None)
             if entry is not None:
                 self._strategies.pop(instance_id, None)
+                self._scratch_slots.pop(instance_id, None)
         if entry is None:
             logger.warning(
                 "No registered non-GPU context found for instance ID %d",

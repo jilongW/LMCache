@@ -306,6 +306,8 @@ class RegisterEngineDrivenContextResponse:
 
     shm_name: str = ""
     pool_size: int = 0
+    scratch_offset: int = 0
+    scratch_size: int = 0
     error: str | None = None
 
 

@@ -1209,12 +1209,31 @@ def server_module_factory(
 
 
 @pytest.mark.parametrize(
-    ("config_kwargs", "expected_pool_info"),
+    ("config_kwargs", "scratch_gb", "shm_available", "expected_pool_info"),
     [
         pytest.param(
             {"shm_name": "/test_pool", "pool_size": 1024},
-            {"shm_name": "lmcache_l1_pool_test_pool", "pool_size": 1024},
-            id="non-lazy",
+            str(512 / (1 << 30)),
+            4096,
+            {
+                "shm_name": "lmcache_l1_pool_test_pool",
+                "pool_size": 1536,
+                "scratch_offset": 1024,
+                "scratch_size": 512,
+            },
+            id="non-lazy-scratch-fits",
+        ),
+        pytest.param(
+            {"shm_name": "/test_pool", "pool_size": 1024},
+            str(2048 / (1 << 30)),
+            2304,
+            {
+                "shm_name": "lmcache_l1_pool_test_pool",
+                "pool_size": 2304,
+                "scratch_offset": 1024,
+                "scratch_size": 1280,
+            },
+            id="non-lazy-scratch-clamped-to-dev-shm",
         ),
         pytest.param(
             {
@@ -1222,20 +1241,27 @@ def server_module_factory(
                 "pool_size": 2048,
                 "use_lazy": True,
             },
-            {"shm_name": "", "pool_size": 0},
+            str(512 / (1 << 30)),
+            4096,
+            {"shm_name": "", "pool_size": 0, "scratch_offset": 0, "scratch_size": 0},
             id="lazy",
         ),
     ],
 )
 def test_engine_context_shm_pool_info(
     stub_lmcache_native: Any,
+    monkeypatch: pytest.MonkeyPatch,
     config_kwargs: dict[str, Any],
+    scratch_gb: str,
+    shm_available: int,
     expected_pool_info: dict[str, Any],
 ) -> None:
     """Ensure engine context computes SHM pool metadata for lazy and non-lazy modes."""
     # First Party
     from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 
+    monkeypatch.setenv("LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_GB", scratch_gb)
+    statvfs_result = MagicMock(f_bavail=shm_available, f_frsize=1)
     with patch(
         "lmcache.v1.distributed.config.current_device_spec",
         MagicMock(is_pin_supported=True),
@@ -1247,6 +1273,7 @@ def test_engine_context_shm_pool_info(
         patch("lmcache.v1.multiprocess.engine_context.TokenHasher"),
         patch("lmcache.v1.multiprocess.engine_context.SessionManager"),
         patch("lmcache.v1.multiprocess.engine_context.get_event_bus"),
+        patch("lmcache.v1.multiprocess.engine_context.os.statvfs", return_value=statvfs_result),
     ):
         ctx = MPCacheServerContext(storage_manager_config=config, chunk_size=16)
 

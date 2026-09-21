@@ -21,6 +21,10 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContextMetadata,
 )
 from lmcache.v1.multiprocess.transport.base import RequestClient
+from lmcache.v1.multiprocess.scratch_allocator import (
+    ScratchAllocation,
+    ScratchAllocator,
+)
 from lmcache.v1.platform import current_device_spec
 
 logger = init_logger(__name__)
@@ -89,6 +93,8 @@ class EngineDrivenContextShm(EngineDrivenContext):
         mq_timeout: float,
         shm_name: str,
         pool_size: int,
+        scratch_offset: int = 0,
+        scratch_size: int = 0,
     ) -> None:
         super().__init__(metadata, req_client, mq_timeout)
         if not shm_name or pool_size <= 0:
@@ -101,6 +107,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
         self._pinned = False
         self._pinned_ptr = 0
         self._pinned_size = 0
+        self._scratch_allocator = ScratchAllocator(scratch_offset, scratch_size)
         try:
             self._shm = shared_memory.SharedMemory(
                 name=shm_name.lstrip("/"), create=False
@@ -155,6 +162,42 @@ class EngineDrivenContextShm(EngineDrivenContext):
             )
             for descriptor in descriptors
         ]
+
+    def allocate_scratch_tensors(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        count: int,
+        *,
+        wait: bool,
+        max_retries: int = 3,
+        timeout_s: float = 0.5,
+    ) -> tuple[list[torch.Tensor], ScratchAllocation] | None:
+        """Allocate raw chunk views from this worker's scratch range."""
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        chunk_bytes = int(shape.numel()) * itemsize
+        allocation = self._scratch_allocator.allocate(
+            chunk_bytes * count,
+            wait=wait,
+            max_retries=max_retries,
+            timeout_s=timeout_s,
+        )
+        if allocation is None:
+            return None
+        tensors = [
+            self._make_tensor_view(
+                allocation.offset + index * chunk_bytes,
+                chunk_bytes,
+                list(shape),
+                str(dtype).removeprefix("torch."),
+            )
+            for index in range(count)
+        ]
+        return tensors, allocation
+
+    def free_scratch(self, allocation: ScratchAllocation) -> None:
+        """Return a previously allocated scratch range."""
+        self._scratch_allocator.free(allocation)
 
     def prepare_store(
         self, key: IPCCacheServerKey, instance_id: int

@@ -36,6 +36,8 @@ from lmcache.v1.multiprocess.group_view import (
     MambaSubStateWireLayout,
 )
 from lmcache.v1.multiprocess.protocols.engine import RegisterEngineDrivenContextResponse
+from lmcache.v1.multiprocess.scratch_allocator import ScratchAllocation
+from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
 from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContext,
     EngineDrivenContextMetadata,
@@ -430,6 +432,16 @@ class GroupTransferPlan:
             single-group fallback.
         """
         return _select_kv_caches_by_index(kv_caches, self.layer_indices)
+
+
+def _raw_gather_shape(plan: GroupTransferPlan) -> torch.Size:
+    """Return the tensor shape emitted by gather for one transfer plan."""
+    if len(plan.chunk_shape) == 4 and plan.chunk_shape[0] == 2:
+        # The plan already describes split K/V storage as [2, L, T, H].
+        return plan.chunk_shape
+    if plan.engine_kv_format is not None and "TWO" in str(plan.engine_kv_format):
+        return torch.Size([2, *plan.chunk_shape[:-1], plan.chunk_shape[-1] // 2])
+    return plan.chunk_shape
 
 
 @dataclass(frozen=True)
@@ -1688,6 +1700,8 @@ class EngineDrivenTransferContext(TransferContext):
         response = future.result(timeout=mq_timeout)
         shm_name = ""
         pool_size = 0
+        scratch_offset = 0
+        scratch_size = 0
         if isinstance(response, RegisterEngineDrivenContextResponse):
             if response.error:
                 raise RuntimeError(
@@ -1696,6 +1710,8 @@ class EngineDrivenTransferContext(TransferContext):
                 )
             shm_name = response.shm_name
             pool_size = response.pool_size
+            scratch_offset = response.scratch_offset
+            scratch_size = response.scratch_size
 
         metadata = EngineDrivenContextMetadata(
             layout_desc=layout_desc,
@@ -1708,6 +1724,8 @@ class EngineDrivenTransferContext(TransferContext):
             mq_timeout,
             shm_name=shm_name,
             pool_size=pool_size,
+            scratch_offset=scratch_offset,
+            scratch_size=scratch_size,
         )
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
         logger.info(
@@ -1919,7 +1937,12 @@ class EngineDrivenTransferContext(TransferContext):
         # tensor) pairs to copy_ back after encoding, only populated when
         # ``out_buffers is not None`` (SHM mode -- see below).
         gathered_by_group: list[
-            tuple[GroupTransferPlan, list[torch.Tensor], list[torch.Tensor] | None]
+            tuple[
+                GroupTransferPlan,
+                list[torch.Tensor],
+                list[torch.Tensor] | None,
+                ScratchAllocation | None,
+            ]
         ] = []
         group_offset = 0
         for plan, group_kv_caches, group_block_ids in transfer_groups:
@@ -1950,7 +1973,41 @@ class EngineDrivenTransferContext(TransferContext):
             # below, since ``EngineDrivenContextShm.commit_store`` never
             # transmits ``chunks`` -- SHM mode only releases the write lock,
             # so data must already be in the slot by the time it's called.
-            group_out_buffers = None if plan.quantized else group_slots
+            scratch_allocation: ScratchAllocation | None = None
+            group_out_buffers = group_slots
+            if plan.quantized and isinstance(
+                self._engine_driven_context, EngineDrivenContextShm
+            ):
+                raw_shape = _raw_gather_shape(plan)
+                raw_dtype = plan.raw_layout_desc.dtypes[0]  # type: ignore[union-attr]
+                scratch = self._engine_driven_context.allocate_scratch_tensors(
+                    raw_shape,
+                    raw_dtype,
+                    len(selection.chunk_indices),
+                    wait=False,
+                )
+                if scratch is not None:
+                    group_out_buffers, scratch_allocation = scratch
+                else:
+                    requested_bytes = (
+                        int(raw_shape.numel())
+                        * torch.empty((), dtype=raw_dtype).element_size()
+                        * len(selection.chunk_indices)
+                    )
+                    logger.info(
+                        "Engine-driven scratch allocation unavailable for "
+                        "request_id=%s group=%s chunks=%d requested=%.3f MiB; "
+                        "falling back to temporary CPU buffers",
+                        _request_id,
+                        plan.group_info.engine_group_id
+                        if plan.group_info is not None
+                        else -1,
+                        len(selection.chunk_indices),
+                        requested_bytes / (1 << 20),
+                    )
+                    group_out_buffers = None
+            elif plan.quantized:
+                group_out_buffers = None
             gathered = gather_paged_kv_to_cpu(
                 group_kv_caches,
                 group_block_ids,
@@ -1962,7 +2019,12 @@ class EngineDrivenTransferContext(TransferContext):
                 chunk_indices=selection.chunk_indices,
             )
             gathered_by_group.append(
-                (plan, gathered, group_slots if plan.quantized else None)
+                (
+                    plan,
+                    gathered,
+                    group_slots if plan.quantized else None,
+                    scratch_allocation,
+                )
             )
         # Gather issues async device->CPU copies on BOTH transports: into the
         # SHM slots when out_buffers is given, otherwise into fresh buffers that
@@ -1974,18 +2036,21 @@ class EngineDrivenTransferContext(TransferContext):
         torch_dev.synchronize()
 
         cpu_chunks: list[torch.Tensor] = []
-        for plan, gathered, quant_slots in gathered_by_group:
-            encoded = self._encode_group_chunks(plan, gathered)
-            if quant_slots is not None:
-                # SHM mode: write the encoded uint8 bytes into this group's
-                # real slot now, since commit_store won't transmit them.
-                # The slot is sized to ``estimate_serialized_size``'s upper
-                # bound; ``encoded`` may be shorter -- decode_chunk() parses
-                # a self-describing payload, so the untouched tail is inert.
-                for slot, chunk in zip(quant_slots, encoded, strict=True):
-                    slot.view(-1)[: chunk.numel()].copy_(chunk)
-            else:
-                cpu_chunks.extend(encoded)
+        for plan, gathered, quant_slots, scratch_allocation in gathered_by_group:
+            try:
+                encoded = self._encode_group_chunks(plan, gathered)
+                if quant_slots is not None:
+                    # SHM mode: write encoded bytes into the real slots.
+                    for slot, chunk in zip(quant_slots, encoded, strict=True):
+                        slot.view(-1)[: chunk.numel()].copy_(chunk)
+                else:
+                    cpu_chunks.extend(encoded)
+            finally:
+                if scratch_allocation is not None:
+                    assert isinstance(
+                        self._engine_driven_context, EngineDrivenContextShm
+                    )
+                    self._engine_driven_context.free_scratch(scratch_allocation)
         ok = self._engine_driven_context.commit_store(key, instance_id, cpu_chunks)
 
         future = MessagingFuture()

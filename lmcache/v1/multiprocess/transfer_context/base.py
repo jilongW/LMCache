@@ -204,6 +204,8 @@ def create_engine_driven_context(
     pool_size: int,
     *,
     use_pickle: bool = False,
+    scratch_offset: int = 0,
+    scratch_size: int = 0,
 ) -> EngineDrivenContext:
     """Factory that returns the appropriate :class:`EngineDrivenContext` implementation.
 
@@ -239,7 +241,13 @@ def create_engine_driven_context(
                 pool_size,
             )
             return EngineDrivenContextShm(
-                metadata, req_client, mq_timeout, shm_name, pool_size
+                metadata,
+                req_client,
+                mq_timeout,
+                shm_name,
+                pool_size,
+                scratch_offset,
+                scratch_size,
             )
         except Exception:
             logger.warning(
