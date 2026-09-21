@@ -49,6 +49,27 @@ def test_unified_page_view_round_trip_preserves_padding_bytes():
     assert torch.equal(raw.view(torch.uint8), merged.view(torch.uint8))
 
 
+def test_merge_writes_real_mamba_substates_into_caller_buffer():
+    raw = torch.randn(2, 2, 8, 8, dtype=torch.float32)
+    split = _KVWeaveCodec.split_mamba_chunk(raw, _layouts(), block_size=2)
+    destination = torch.empty_like(raw)
+
+    merged = _KVWeaveCodec.merge_mamba_chunk(
+        split,
+        _layouts(),
+        block_size=2,
+        hidden_dim=8,
+        raw_shape=raw.shape,
+        raw_dtype=raw.dtype,
+        out=destination,
+    )
+    restored = _KVWeaveCodec.split_mamba_chunk(merged, _layouts(), block_size=2)
+
+    assert merged.data_ptr() == destination.data_ptr()
+    assert torch.equal(split.conv, restored.conv)
+    assert torch.equal(split.ssm, restored.ssm)
+
+
 def test_qwen35_mamba_page_quant_round_trip_is_deterministic():
     """Exercise the real Qwen3.5 mixed-dtype Mamba page contract.
 

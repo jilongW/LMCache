@@ -27,24 +27,26 @@ an extra copy production never makes:
 Scenario A -- Mamba + attention quantization ENABLED:
     Stage 1  gather (device -> CPU, D2H copy) into a plain CPU buffer.
     Stage 2  Mamba: recover the real ``conv_state``/``ssm_state`` bytes out
-             of the opaque, padding-including synthetic page view
+             of the opaque, padding-including synthetic page view into
+             pool-level split scratch, then release the raw gather scratch;
              (``_KVWeaveCodec.split_mamba_chunk``, see
              ``lmcache/integration/vllm/kv_cache_group_edits.py``'s
              ``_MambaPageViewEdit`` docstring for why the raw gathered chunk
              is not already conv/ssm-shaped); attention: real 4-bit fused
              K/V quantization via ``_KVWeaveCodec.encode_chunk`` directly
              (native ``kvweave_quant`` extension).
-    Stage 3  Mamba: real 4-bit conv/ssm quantization via
-             ``_KVWeaveCodec.encode_chunk`` (native ``kvweave_quant``
-             extension); attention: CPU->CPU ``copy_`` of the encoded byte
-             payload into a genuine ``EngineDrivenContextShm`` slot.
-    Stage 4  Mamba only: CPU->CPU ``copy_`` of the encoded byte payload into
-             a genuine ``EngineDrivenContextShm`` slot.
-    Stage R1 dequantize directly off the SHM slot (``_decode_conv_substate``/
-             ``_decode_mamba_substate`` for Mamba; ``_KVWeaveCodec.decode_chunk``
-             for attention's 4-bit fused K/V).
-    Stage R2 Mamba only: ``merge_mamba_chunk`` -- re-add padding, rebuild
-             the opaque page.
+    Stage 3  Mamba: real 4-bit conv/ssm quantization directly from split
+             scratch into the
+             durable SHM slot; attention: fused K/V quantization directly
+             into its durable SHM slot. The native API still returns an
+             internal Python ``bytes`` payload, but no separate uint8 staging
+             tensor is allocated.
+    Stage 4  folded into Stage 3 for quantized groups.
+    Stage R1 dequantize directly off the SHM slot into a pool-level scratch
+             view (``decode_chunk(..., out=scratch)``). For Mamba this also
+             re-adds padding by writing only real conv/ssm bytes to the
+             scratch-backed opaque page; unused padding is left untouched.
+    Stage R2 Mamba only: folded into Stage R1 by the latest production path.
     Stage R3 scatter (CPU -> device, H2D copy) using the dequantized chunk.
 
 Scenario B -- Mamba + attention quantization DISABLED:
@@ -82,6 +84,7 @@ import torch
 from lmcache import torch_dev, torch_device_type
 from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
     AttentionPlaneLayout,
+    KVWeaveCodecConfig,
     MambaCodecOptions,
 )
 from lmcache.v1.distributed.serde.kvweave.kvweave_serde import (
@@ -592,14 +595,43 @@ def _run_store_stages(
                 "(split_mamba_chunk, CPU):"
             )
             split_result: list[MambaChunkSplit] = []
+            conv_layout, ssm_layout = _MAMBA_REAL_LAYOUT
+            layers = raw_chunk.shape[1] if raw_chunk.dim() == 4 else raw_chunk.shape[0]
+            blocks = raw_chunk.shape[-2] // _BLOCK_SIZE
+            split_scratch = shm_ctx.allocate_scratch_tensor_groups(
+                [
+                    (
+                        torch.Size((layers, blocks, *conv_layout.shape)),
+                        KVWeaveCodecConfig.mamba_dtype(conv_layout.dtype_str),
+                    ),
+                    (
+                        torch.Size((layers, blocks, *ssm_layout.shape)),
+                        KVWeaveCodecConfig.mamba_dtype(ssm_layout.dtype_str),
+                    ),
+                ],
+                1,
+                wait=False,
+            )
+            split_scratch_allocation = None
+            if split_scratch is not None:
+                split_views, split_scratch_allocation = split_scratch
+                split_destination = MambaChunkSplit(*split_views[0])
+                split_description = "pool-level SHM split scratch"
+            else:
+                split_destination = None
+                split_description = "temporary CPU split buffers"
 
             def _split() -> None:
                 split_result[:] = [
                     _KVWeaveCodec.split_mamba_chunk(
-                        raw_chunk, _MAMBA_REAL_LAYOUT, _BLOCK_SIZE
+                        raw_chunk,
+                        _MAMBA_REAL_LAYOUT,
+                        _BLOCK_SIZE,
+                        out=split_destination,
                     )
                 ]
 
+            print(f"  Stage 2 destination: {split_description}")
             samples_ms = _time_calls(_split, _NUM_ITERATIONS, _NUM_WARMUP)
             split_preview = split_result[0]
             split_bytes = (
@@ -611,36 +643,19 @@ def _run_store_stages(
                 samples_ms,
                 split_bytes,
             )
+            if scratch_allocation is not None:
+                shm_ctx.free_scratch(scratch_allocation)
+                result["scratch_allocation"] = None
+                scratch_allocation = None
 
-            print(
-                "\nStage 3 - quantization (4-bit conv+ssm, CPU, "
-                "native kvweave_quant):"
-            )
-            quantized_payload: list[bytes] = []
-
-            def _encode() -> None:
-                quantized_payload[:] = [
-                    codec.encode_chunk(
-                        "mamba",
-                        _MAMBA_REAL_LAYOUT,
-                        _BLOCK_SIZE,
-                        mamba_options,
-                        raw_chunk,
-                    )
-                ]
-
-            samples_ms = _time_calls(_encode, _NUM_ITERATIONS, _NUM_WARMUP)
-            payload = quantized_payload[0]
-            _print_stats(
-                label,
-                samples_ms,
-                len(payload),
+            payload = codec.encode_chunk(
+                "mamba",
+                _MAMBA_REAL_LAYOUT,
+                _BLOCK_SIZE,
+                mamba_options,
+                raw_chunk,
             )
 
-            print(
-                "\nStage 4 - write into SHM (CPU -> SHM, quantized "
-                "payload copy_):"
-            )
             if len(payload) > _SHM_QUANTIZED_REGION_BYTES:
                 raise RuntimeError(
                     f"quantized Mamba payload ({len(payload)} bytes) "
@@ -650,15 +665,23 @@ def _run_store_stages(
             quant_shm_slot = _shm_slot_tensor(
                 shm_ctx, offset=0, num_bytes=len(payload)
             )
-            payload_tensor = torch.frombuffer(
-                bytearray(payload), dtype=torch.uint8
+            print(
+                "\nStage 3 - quantization directly into SHM "
+                "(no uint8 staging tensor):"
             )
             samples_ms = _time_calls(
-                lambda: quant_shm_slot.copy_(payload_tensor),
+                lambda: codec.encode_chunk_into(
+                    "mamba", _MAMBA_REAL_LAYOUT, _BLOCK_SIZE,
+                    mamba_options, raw_chunk, quant_shm_slot,
+                    mamba_split=split_preview,
+                ),
                 _NUM_ITERATIONS,
                 _NUM_WARMUP,
             )
             _print_stats(label, samples_ms, len(payload))
+            print("\nStage 4 - folded into Stage 3 (direct SHM slot write).")
+            if split_scratch_allocation is not None:
+                shm_ctx.free_scratch(split_scratch_allocation)
 
             result["quantized_payload"] = payload
             result["quant_shm_slot"] = quant_shm_slot
@@ -676,36 +699,15 @@ def _run_store_stages(
 
     if is_attention:
         if run_attention_quant:
-            print(
-                "\nStage 2 - quantization (4-bit fused K/V, CPU, "
-                "native kvweave_quant):"
-            )
-            quantized_payload: list[bytes] = []
-
-            def _encode_attention() -> None:
-                quantized_payload[:] = [
-                    attention_codec.encode_chunk(
-                        "attention",
-                        None,
-                        _BLOCK_SIZE,
-                        None,
-                        raw_chunk,
-                        attention_plane_layout=AttentionPlaneLayout.FUSED_KV,
-                    )
-                ]
-
-            samples_ms = _time_calls(_encode_attention, _NUM_ITERATIONS, _NUM_WARMUP)
-            payload = quantized_payload[0]
-            _print_stats(
-                label,
-                samples_ms,
-                len(payload),
+            payload = attention_codec.encode_chunk(
+                "attention",
+                None,
+                _BLOCK_SIZE,
+                None,
+                raw_chunk,
+                attention_plane_layout=AttentionPlaneLayout.FUSED_KV,
             )
 
-            print(
-                "\nStage 3 - write into SHM (CPU -> SHM, quantized "
-                "payload copy_):"
-            )
             if len(payload) > _SHM_QUANTIZED_REGION_BYTES:
                 raise RuntimeError(
                     f"quantized attention payload ({len(payload)} bytes) "
@@ -715,15 +717,24 @@ def _run_store_stages(
             quant_shm_slot = _shm_slot_tensor(
                 shm_ctx, offset=0, num_bytes=len(payload)
             )
-            payload_tensor = torch.frombuffer(
-                bytearray(payload), dtype=torch.uint8
+            print(
+                "\nStage 2 - quantization directly into SHM "
+                "(no uint8 staging tensor):"
             )
             samples_ms = _time_calls(
-                lambda: quant_shm_slot.copy_(payload_tensor),
+                lambda: attention_codec.encode_chunk_into(
+                    "attention", None, _BLOCK_SIZE, None, raw_chunk,
+                    quant_shm_slot,
+                    attention_plane_layout=AttentionPlaneLayout.FUSED_KV,
+                ),
                 _NUM_ITERATIONS,
                 _NUM_WARMUP,
             )
             _print_stats(label, samples_ms, len(payload))
+            print("\nStage 3 - folded into Stage 2 (direct SHM slot write).")
+            if scratch_allocation is not None:
+                shm_ctx.free_scratch(scratch_allocation)
+                result["scratch_allocation"] = None
 
             result["quantized_payload"] = payload
             result["quant_shm_slot"] = quant_shm_slot
@@ -777,6 +788,7 @@ def _run_retrieve_stages(
     group_block_ids: list[int],
     store_result: dict[str, object],
     attention_codec: _KVWeaveCodec,
+    shm_ctx: EngineDrivenContextShm,
     *,
     quantize_mamba: bool,
     quantize_attention: bool,
@@ -791,6 +803,23 @@ def _run_retrieve_stages(
         is_attention and quantize_attention and "quantized_payload" in store_result
     )
     raw_chunk = store_result["gathered_chunk"]
+    decode_scratch_allocation = None
+    decode_target: torch.Tensor | None = None
+    if run_mamba_quant or run_attention_quant:
+        scratch = shm_ctx.allocate_scratch_tensors(
+            _raw_gather_shape(plan), raw_chunk.dtype, 1, wait=False
+        )
+        if scratch is not None:
+            scratch_chunks, decode_scratch_allocation = scratch
+            decode_target = scratch_chunks[0]
+        else:
+            requested_mib = (
+                raw_chunk.numel() * raw_chunk.element_size() / (1024**2)
+            )
+            print(
+                "  retrieve scratch unavailable; falling back to temporary "
+                f"CPU buffer (requested={requested_mib:.3f}MiB)"
+            )
 
     scatter_chunk = raw_chunk
     if run_mamba_quant:
@@ -803,67 +832,33 @@ def _run_retrieve_stages(
         # ``quant_shm_slot`` here too -- an extra ``.clone()`` before this
         # would measure a copy production never makes.
         print(
-            "\nStage R1 - dequantization (4-bit conv+ssm, CPU, "
-            "native kvweave_quant, reads directly off the SHM slot):"
+            "\nStage R1 - dequantization + scratch-backed opaque-page "
+            "rebuild (4-bit conv+ssm, CPU, reads directly off the SHM slot):"
         )
         quant_shm_slot = store_result["quant_shm_slot"]
-        conv_layout, ssm_layout = _MAMBA_REAL_LAYOUT
-        mamba_layers = raw_chunk.shape[1]
-        mamba_blocks = max(raw_chunk.shape[-2] // _BLOCK_SIZE, 1)
-        decoded_split: list[MambaChunkSplit] = []
+        decoded_chunk: list[torch.Tensor] = []
 
         def _dequantize() -> None:
-            conv_payload, ssm_payload = _KVWeaveCodec.unpack_mamba_payloads(
-                _KVWeaveCodec._tensor_bytes(quant_shm_slot)
-            )
-            conv = _KVWeaveCodec._decode_conv_substate(
-                conv_payload, conv_layout, mamba_layers, mamba_blocks
-            )
-            ssm = _KVWeaveCodec._decode_mamba_substate(
-                ssm_payload, ssm_layout, mamba_layers, mamba_blocks
-            )
-            decoded_split[:] = [MambaChunkSplit(conv, ssm)]
+            decoded_chunk[:] = [
+                attention_codec.decode_chunk(
+                    "mamba",
+                    _MAMBA_REAL_LAYOUT,
+                    _BLOCK_SIZE,
+                    raw_chunk.shape,
+                    raw_chunk.dtype,
+                    quant_shm_slot,
+                    out=decode_target,
+                )
+            ]
 
         samples_ms = _time_calls(_dequantize, _NUM_ITERATIONS, _NUM_WARMUP)
-        split = decoded_split[0]
-        decoded_bytes = (
-            split.conv.numel() * split.conv.element_size()
-            + split.ssm.numel() * split.ssm.element_size()
-        )
         _print_stats(
             label,
             samples_ms,
-            decoded_bytes,
+            raw_chunk.numel() * raw_chunk.element_size(),
         )
-
-        print(
-            "\nStage R2 - re-add padding / rebuild the opaque page "
-            "(merge_mamba_chunk, CPU):"
-        )
-        samples_ms = _time_calls(
-            lambda: _KVWeaveCodec.merge_mamba_chunk(
-                split,
-                _MAMBA_REAL_LAYOUT,
-                _BLOCK_SIZE,
-                raw_chunk.shape[-1],
-                raw_shape=raw_chunk.shape,
-                raw_dtype=raw_chunk.dtype,
-            ),
-            _NUM_ITERATIONS,
-            _NUM_WARMUP,
-        )
-        _print_stats(
-            label, samples_ms, raw_chunk.numel() * raw_chunk.element_size()
-        )
-
-        scatter_chunk = _KVWeaveCodec.merge_mamba_chunk(
-            split,
-            _MAMBA_REAL_LAYOUT,
-            _BLOCK_SIZE,
-            raw_chunk.shape[-1],
-            raw_shape=raw_chunk.shape,
-            raw_dtype=raw_chunk.dtype,
-        )
+        print("\nStage R2 - folded into Stage R1 (scratch-backed decode_chunk).")
+        scatter_chunk = decoded_chunk[0]
     elif is_mamba:
         skip_reason = (
             "quantization disabled for this scenario"
@@ -894,6 +889,7 @@ def _run_retrieve_stages(
                     raw_chunk.dtype,
                     quant_shm_slot,
                     attention_plane_layout=AttentionPlaneLayout.FUSED_KV,
+                    out=decode_target,
                 )
             ]
 
@@ -930,6 +926,8 @@ def _run_retrieve_stages(
         samples_ms,
         scatter_chunk.numel() * scatter_chunk.element_size(),
     )
+    if decode_scratch_allocation is not None:
+        shm_ctx.free_scratch(decode_scratch_allocation)
 
 
 def main() -> int:
@@ -996,6 +994,7 @@ def main() -> int:
                     group_block_ids,
                     store_result,
                     attention_codec,
+                    shm_ctx,
                     quantize_mamba=quantize_all,
                     quantize_attention=quantize_all,
                 )

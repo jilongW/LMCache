@@ -7,6 +7,7 @@ import torch
 
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
+    AttentionPlaneLayout,
     ConvQKVSplit,
     KVWeaveCodecConfig,
     KVWeaveRuntimeConfig,
@@ -108,6 +109,61 @@ def test_qwen35_fused_attention_estimate_covers_payload():
     assert codec.estimate_fused_serialized_size(layout) >= len(payload)
 
 
+def test_qwen35_fused_attention_preconditioned_round_trip():
+    codec = _codec(
+        num_kv_heads=4,
+        head_dim=256,
+        block_size=64,
+        rh=True,
+        asym=True,
+        precond=True,
+    )
+    source = torch.randn(8, 64, 2048, dtype=torch.float16)
+
+    payload = codec.encode_chunk(
+        "attention",
+        None,
+        64,
+        None,
+        source,
+        AttentionPlaneLayout.FUSED_KV,
+    )
+    restored = codec.decode_chunk(
+        "attention",
+        None,
+        64,
+        source.shape,
+        source.dtype,
+        torch.frombuffer(bytearray(payload), dtype=torch.uint8),
+        AttentionPlaneLayout.FUSED_KV,
+    )
+
+    assert torch.isfinite(restored).all()
+    assert torch.max(torch.abs(source.float() - restored.float())) < 2.0
+
+
+@pytest.mark.parametrize("scaling_method", ["per_channel", "per_token"])
+def test_qwen35_fused_attention_uses_independent_head_scales(scaling_method):
+    codec = _codec(
+        num_kv_heads=2,
+        head_dim=4,
+        block_size=8,
+        scaling_method=scaling_method,
+        rh=False,
+        asym=True,
+    )
+    source = torch.randn(2, 8, 16, dtype=torch.float16)
+    payload = codec.serialize_fused_tensor(source)
+    parsed = codec._parse_fused(payload)
+    restored = torch.empty_like(source)
+    codec.deserialize_fused_tensor(
+        torch.frombuffer(bytearray(payload), dtype=torch.uint8), restored
+    )
+
+    assert parsed["per_head_scales"]
+    assert torch.max(torch.abs(source.float() - restored.float())) < 0.5
+
+
 def test_rejects_non_kv_shape():
     with pytest.raises(ValueError, match="KVWeave"):
         _codec().serialize_tensor(torch.randn(1, 64, 8))
@@ -146,7 +202,8 @@ def test_runtime_config_resolves_environment(monkeypatch, tmp_path):
     assert config.linear_max_size_ratio == 1.5
     assert config.attention_codec_kwargs["num_kv_heads"] == 8
     assert config.attention_codec_kwargs["head_dim"] == 128
-    assert config.attention_codec_kwargs["qbit"] == 8
+    assert config.attention_codec_kwargs["qbit"] == 4
+    assert config.attention_codec_kwargs["scaling_method"] == "per_token"
     assert config.attention_codec_kwargs["precond"]
     assert config.mamba_options == MambaCodecOptions(
         conv_scaling_method="per_token",
@@ -167,6 +224,7 @@ def test_runtime_config_falls_back_to_qwen35_9b_defaults(monkeypatch):
 
     assert config.attention_codec_kwargs["num_kv_heads"] == 4
     assert config.attention_codec_kwargs["head_dim"] == 256
+    assert config.attention_codec_kwargs["scaling_method"] == "per_token"
     assert config.mamba_options.conv_scaling_method == "per_token"
     assert config.mamba_options.ssm_scaling_method == "per_token"
     assert config.mamba_options.conv_qkv_split == ConvQKVSplit(
@@ -222,6 +280,26 @@ def test_codec_chunk_methods_dispatch_attention():
     )
 
     assert restored.shape == source.shape
+    assert torch.max(torch.abs(source.float() - restored.float())) < 0.5
+
+
+def test_codec_decode_chunk_writes_attention_into_caller_buffer():
+    codec = _codec()
+    source = torch.randn(2, 1, 64, 8, dtype=torch.float16)
+    payload = codec.encode_chunk("attention", None, 64, None, source)
+    destination = torch.empty_like(source)
+
+    restored = codec.decode_chunk(
+        "attention",
+        None,
+        64,
+        source.shape,
+        source.dtype,
+        torch.tensor(list(payload), dtype=torch.uint8),
+        out=destination,
+    )
+
+    assert restored.data_ptr() == destination.data_ptr()
     assert torch.max(torch.abs(source.float() - restored.float())) < 0.5
 
 

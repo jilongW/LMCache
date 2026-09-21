@@ -115,7 +115,7 @@ def _env_scaling_method(name: str, default: str) -> str:
 
 
 def _env_attention_qbit() -> int:
-    qbit = int(os.environ.get("LMCACHE_MP_KVWEAVE_QBIT", "8"))
+    qbit = int(os.environ.get("LMCACHE_MP_KVWEAVE_QBIT", "4"))
     if qbit not in {4, 8}:
         raise ValueError(
             f"LMCACHE_MP_KVWEAVE_QBIT={qbit!r} is not one of [4, 8]"
@@ -265,7 +265,7 @@ class KVWeaveRuntimeConfig:
                 "num_kv_heads": text_config["num_key_value_heads"],
                 "head_dim": text_config["head_dim"],
                 "scaling_method": os.environ.get(
-                    "LMCACHE_MP_KVWEAVE_SCALING_METHOD", "per_channel"
+                    "LMCACHE_MP_KVWEAVE_SCALING_METHOD", "per_token"
                 ),
                 "rh": _env_flag("LMCACHE_MP_KVWEAVE_RH", True),
                 "asym": _env_flag("LMCACHE_MP_KVWEAVE_ASYM", True),

@@ -13,6 +13,7 @@ import torch
 # First Party
 from lmcache import torch_dev
 from lmcache.logging import init_logger
+from lmcache.v1.distributed.serde.kvweave.kvweave_config import AttentionPlaneLayout
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
 from lmcache.v1.multiprocess.scratch_allocator import ScratchAllocation
@@ -294,7 +295,13 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     # not quantized or in pickle mode), so Phase 2.5 can
                     # copy_ the encoded bytes back into them.
                     group_ranges: list[
-                        tuple[Any, int, int, list[torch.Tensor] | None]
+                        tuple[
+                            Any,
+                            int,
+                            int,
+                            list[torch.Tensor] | None,
+                            ScratchAllocation | None,
+                        ]
                     ] = []
                     group_offset = 0
                     with torch.inference_mode(), torch_dev.stream(self._copy_stream):
@@ -335,6 +342,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                             # groups use the SHM slot directly here.
                             if group_slots is not None and not plan.quantized:
                                 group_out = group_slots
+                                raw_scratch_allocation = None
                             elif plan.quantized and isinstance(
                                 engine_driven_context, EngineDrivenContextShm
                             ):
@@ -349,9 +357,10 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                     )
                                 )
                                 if scratch is not None:
-                                    group_out, allocation = scratch
-                                    scratch_allocations.append(allocation)
+                                    group_out, raw_scratch_allocation = scratch
+                                    scratch_allocations.append(raw_scratch_allocation)
                                 else:
+                                    raw_scratch_allocation = None
                                     requested_bytes = (
                                         int(raw_shape.numel())
                                         * torch.empty((), dtype=raw_dtype).element_size()
@@ -377,6 +386,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                     )
                                     staged_chunks.extend(group_out)
                             else:
+                                raw_scratch_allocation = None
                                 group_out = self._alloc_pinned_staging(
                                     _raw_gather_shape(plan),
                                     engine_driven_context.layout_desc.dtypes[0],
@@ -404,6 +414,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                     start_idx,
                                     len(gather_target),
                                     group_slots if plan.quantized else None,
+                                    raw_scratch_allocation,
                                 )
                             )
 
@@ -424,29 +435,124 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     # synchronized above: gather issues async device->CPU
                     # copies, and encoding reads the gathered tensor's bytes.
                     # Built fresh (not a patched copy of gather_target) so
-                    # that SHM-quantized ranges -- already copy_'d into their
-                    # real slots below -- are dropped entirely rather than
-                    # left in with their raw, un-encoded bytes.
+                    # that SHM-quantized ranges -- encoded directly into
+                    # their real slots below -- are dropped entirely rather
+                    # than left in with their raw, un-encoded bytes.
                     commit_target = []
-                    for plan, start_idx, end_idx, quant_slots in group_ranges:
+                    for (
+                        plan,
+                        start_idx,
+                        end_idx,
+                        quant_slots,
+                        raw_scratch_allocation,
+                    ) in group_ranges:
                         if not plan.quantized:
                             commit_target.extend(gather_target[start_idx:end_idx])
                             continue
-                        encoded = self._encode_group_chunks(
-                            plan, gather_target[start_idx:end_idx]
-                        )
                         if quant_slots is not None:
-                            # SHM mode: write the encoded uint8 bytes into
-                            # this group's real slot now, since commit_store
-                            # won't transmit them. The slot is sized to
-                            # ``estimate_serialized_size``'s upper bound;
-                            # ``encoded`` may be shorter -- decode_chunk()
-                            # parses a self-describing payload, so the
-                            # untouched tail is inert.
-                            for slot, chunk in zip(quant_slots, encoded, strict=True):
-                                slot.view(-1)[: chunk.numel()].copy_(chunk)
+                            mamba_splits = None
+                            split_scratch_allocation = None
+                            fused_head_splits = None
+                            head_split_scratch_allocation = None
+                            if (
+                                isinstance(engine_driven_context, EngineDrivenContextShm)
+                                and plan.group_info is not None
+                                and plan.group_info.cache_category == "mamba"
+                            ):
+                                split_scratch = self._allocate_mamba_split_scratch(
+                                    plan,
+                                    end_idx - start_idx,
+                                    engine_driven_context,
+                                    wait=True,
+                                )
+                                if split_scratch is not None:
+                                    mamba_splits, split_scratch_allocation = split_scratch
+                                    for raw_chunk, split in zip(
+                                        gather_target[start_idx:end_idx],
+                                        mamba_splits,
+                                        strict=True,
+                                    ):
+                                        self._kvweave_codec.split_mamba_chunk(  # type: ignore[union-attr]
+                                            raw_chunk,
+                                            plan.group_info.mamba_real_layout,
+                                            plan.group_info.tokens_per_block,
+                                            out=split,
+                                        )
+                                    if raw_scratch_allocation is not None:
+                                        engine_driven_context.free_scratch(
+                                            raw_scratch_allocation
+                                        )
+                                        scratch_allocations.remove(
+                                            raw_scratch_allocation
+                                        )
+                                        raw_scratch_allocation = None
+                            elif (
+                                isinstance(engine_driven_context, EngineDrivenContextShm)
+                                and plan.attention_plane_layout
+                                == AttentionPlaneLayout.FUSED_KV
+                            ):
+                                head_split_scratch = (
+                                    self._allocate_fused_head_split_scratch(
+                                        plan,
+                                        end_idx - start_idx,
+                                        engine_driven_context,
+                                        wait=True,
+                                    )
+                                )
+                                if head_split_scratch is not None:
+                                    (
+                                        fused_head_splits,
+                                        head_split_scratch_allocation,
+                                    ) = head_split_scratch
+                                    for raw_chunk, head_split in zip(
+                                        gather_target[start_idx:end_idx],
+                                        fused_head_splits,
+                                        strict=True,
+                                    ):
+                                        self._kvweave_codec.split_fused_attention_heads(  # type: ignore[union-attr]
+                                            raw_chunk,
+                                            self._kvweave_codec._fused_head_num(  # type: ignore[union-attr]
+                                                raw_chunk.shape[-1]
+                                            ),
+                                            self._kvweave_codec._fused_head_dim(  # type: ignore[union-attr]
+                                                raw_chunk.shape[-1]
+                                            ),
+                                            out=head_split,
+                                        )
+                                    if raw_scratch_allocation is not None:
+                                        engine_driven_context.free_scratch(
+                                            raw_scratch_allocation
+                                        )
+                                        scratch_allocations.remove(
+                                            raw_scratch_allocation
+                                        )
+                                        raw_scratch_allocation = None
+                            self._encode_group_chunks_into_slots(
+                                plan,
+                                gather_target[start_idx:end_idx],
+                                quant_slots,
+                                mamba_splits,
+                                fused_head_splits,
+                            )
+                            if raw_scratch_allocation is not None:
+                                engine_driven_context.free_scratch(
+                                    raw_scratch_allocation
+                                )
+                                scratch_allocations.remove(raw_scratch_allocation)
+                            if split_scratch_allocation is not None:
+                                engine_driven_context.free_scratch(
+                                    split_scratch_allocation
+                                )
+                            if head_split_scratch_allocation is not None:
+                                engine_driven_context.free_scratch(
+                                    head_split_scratch_allocation
+                                )
                         else:
-                            commit_target.extend(encoded)
+                            commit_target.extend(
+                                self._encode_group_chunks(
+                                    plan, gather_target[start_idx:end_idx]
+                                )
+                            )
 
                     # --- Phase 3: commit ---
                     with self._commit_lock:

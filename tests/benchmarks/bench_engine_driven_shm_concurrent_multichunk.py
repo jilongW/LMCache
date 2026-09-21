@@ -49,8 +49,12 @@ need (this script never talks to a real model): the group's cached
 manually built fused-K/V attention codec (mirroring
 ``bench_engine_driven_shm_timing.py``'s ``_attention_codec()``), so the
 *real* ``submit_store``/``submit_retrieve`` quantize/dequantize dispatch
-(``EngineDrivenTransferContext._encode_group_chunks``/``_decode_group_chunks``)
-runs for real under concurrency, not a manually-invoked standalone call.
+(``EngineDrivenTransferContext._encode_group_chunks_into_slots``/
+``_decode_group_chunks``) runs for real under concurrency, not a manually
+invoked standalone call. The quantized store path gathers raw chunks into
+pool scratch, encodes directly into durable SHM slots, then returns raw
+scratch before ``commit_store``; retrieve decodes to raw scratch, releases
+the compact read slots, then scatters to device.
 
 Requires a real XPU device (exits early otherwise). Run with:
 
@@ -211,7 +215,7 @@ def _enable_quantization(
     Patches ``ctx._group_plans[0]`` in place to ``quantized=True`` with a
     real ``cache_category="attention"``/``FUSED_KV`` classification, and
     swaps in a manually built codec (see :func:`_attention_codec`) so the
-    real ``_encode_group_chunks``/``_decode_group_chunks`` dispatch used by
+    real direct-slot encode/decode dispatch used by
     ``submit_store``/``submit_retrieve`` actually quantizes -- rather than
     calling the codec by hand outside the real store/retrieve path.
 
@@ -575,9 +579,10 @@ def _time_stages_concurrent(
     only called for a quantized group; blocks up to its wait/retry budget
     when the scratch region is too small or unconfigured, see
     ``scratch_shm_raw_buffer_plan.md``), ``async_engine_driven.gather_paged_kv_to_cpu``
-    (Stage: gather, GPU->CPU for all 8 chunks in one call), ``ctx._encode_group_chunks``
-    (Stage: quantize -- a no-op passthrough when the group is unquantized,
-    so this stage's timings collapse to ~0 in that scenario), and
+    (Stage: gather, GPU->CPU for all 8 chunks in one call),
+    ``ctx._encode_group_chunks_into_slots`` (Stage: quantize and direct write
+    to the durable SHM slots; raw pool scratch is released immediately after
+    it returns), and
     ``shm_ctx.commit_store`` (Stage: commit, notifies the mocked server the
     SHM slots are ready) -- by temporarily wrapping them with timers, since
     all four run inside ``commit_executor`` worker threads concurrently
@@ -592,7 +597,7 @@ def _time_stages_concurrent(
 
     original_scratch = shm_ctx.allocate_scratch_tensors
     original_gather = async_engine_driven.gather_paged_kv_to_cpu
-    original_encode = ctx._encode_group_chunks  # noqa: SLF001
+    original_encode_into_slots = ctx._encode_group_chunks_into_slots  # noqa: SLF001
     original_commit = shm_ctx.commit_store
 
     def _timed_scratch(*args, **kwargs):
@@ -609,9 +614,9 @@ def _time_stages_concurrent(
             gather_ms.append((time.perf_counter() - start) * 1000.0)
         return result
 
-    def _timed_encode(*args, **kwargs):
+    def _timed_encode_into_slots(*args, **kwargs):
         start = time.perf_counter()
-        result = original_encode(*args, **kwargs)
+        result = original_encode_into_slots(*args, **kwargs)
         with lock:
             quantize_ms.append((time.perf_counter() - start) * 1000.0)
         return result
@@ -625,7 +630,7 @@ def _time_stages_concurrent(
 
     async_engine_driven.gather_paged_kv_to_cpu = _timed_gather
     shm_ctx.allocate_scratch_tensors = _timed_scratch
-    ctx._encode_group_chunks = _timed_encode  # noqa: SLF001
+    ctx._encode_group_chunks_into_slots = _timed_encode_into_slots  # noqa: SLF001
     shm_ctx.commit_store = _timed_commit
     try:
         for _ in range(_NUM_WARMUP + _NUM_ITERATIONS):
@@ -650,7 +655,7 @@ def _time_stages_concurrent(
     finally:
         async_engine_driven.gather_paged_kv_to_cpu = original_gather
         shm_ctx.allocate_scratch_tensors = original_scratch
-        ctx._encode_group_chunks = original_encode  # noqa: SLF001
+        ctx._encode_group_chunks_into_slots = original_encode_into_slots  # noqa: SLF001
         shm_ctx.commit_store = original_commit
 
     # Drop the warmup iteration's samples (first _NUM_REQUESTS of each list).
@@ -752,7 +757,7 @@ def _run_scenario(quantize: bool) -> None:
             )
             _print_stats("scratch alloc (quantized only)", scratch_ms)
             _print_stats("gather (D2H, all chunks)", gather_ms)
-            _print_stats("quantize (encode, all chunks)", quantize_ms)
+            _print_stats("quantize + direct SHM write", quantize_ms)
             _print_stats("commit (SHM notify)", commit_ms)
             _print_stats("end-to-end request latency", request_ms)
         finally:

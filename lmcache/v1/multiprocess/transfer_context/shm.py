@@ -195,6 +195,47 @@ class EngineDrivenContextShm(EngineDrivenContext):
         ]
         return tensors, allocation
 
+    def allocate_scratch_tensor_groups(
+        self,
+        specs: list[tuple[torch.Size, torch.dtype]],
+        count: int,
+        *,
+        wait: bool,
+        max_retries: int = 3,
+        timeout_s: float = 0.5,
+    ) -> tuple[list[tuple[torch.Tensor, ...]], ScratchAllocation] | None:
+        """Allocate heterogeneous contiguous tensor views per scratch item."""
+        if count <= 0 or not specs:
+            raise ValueError("count and specs must be non-empty")
+        offsets: list[int] = []
+        chunk_bytes = 0
+        for shape, dtype in specs:
+            itemsize = torch.empty((), dtype=dtype).element_size()
+            chunk_bytes = (chunk_bytes + itemsize - 1) // itemsize * itemsize
+            offsets.append(chunk_bytes)
+            chunk_bytes += int(shape.numel()) * itemsize
+        allocation = self._scratch_allocator.allocate(
+            chunk_bytes * count,
+            wait=wait,
+            max_retries=max_retries,
+            timeout_s=timeout_s,
+        )
+        if allocation is None:
+            return None
+        groups = [
+            tuple(
+                self._make_tensor_view(
+                    allocation.offset + item_index * chunk_bytes + spec_offset,
+                    int(shape.numel()) * torch.empty((), dtype=dtype).element_size(),
+                    list(shape),
+                    str(dtype).removeprefix("torch."),
+                )
+                for (shape, dtype), spec_offset in zip(specs, offsets, strict=True)
+            )
+            for item_index in range(count)
+        ]
+        return groups, allocation
+
     def free_scratch(self, allocation: ScratchAllocation) -> None:
         """Return a previously allocated scratch range."""
         self._scratch_allocator.free(allocation)

@@ -194,7 +194,10 @@ class _KVWeaveCodec:
         dst.copy_(restored.to(dtype=dst.dtype, device=dst.device))
 
     def serialize_fused_tensor(
-        self, tensor: torch.Tensor, scaling_method: str | None = None
+        self,
+        tensor: torch.Tensor,
+        scaling_method: str | None = None,
+        head_split: torch.Tensor | None = None,
     ) -> bytes:
         """Serialize a fused-K/V attention chunk (no leading K/V axis)."""
         if tensor.dim() != 3:
@@ -206,9 +209,16 @@ class _KVWeaveCodec:
         layers, tokens, hidden = shape
         method = scaling_method or self.scaling_method
         rh, asym = (False, False) if method == "per_tensor" else (self.rh, self.asym)
+        precond = rh and self.precond
         head_num = self._fused_head_num(hidden)
         head_dim = self._fused_head_dim(hidden)
-        flags = (1 if rh else 0) | (2 if asym else 0)
+        per_head_scales = method != "per_tensor" and head_num > 1
+        flags = (
+            (1 if rh else 0)
+            | (2 if asym else 0)
+            | (4 if precond else 0)
+            | (8 if per_head_scales else 0)
+        )
         header = self._config.MAGIC_QUANT_FUSED + struct.pack(
             ">BBBBB" + "i" * len(shape),
             self.qbit,
@@ -218,29 +228,98 @@ class _KVWeaveCodec:
             len(shape),
             *shape,
         )
+        signs = perm = None
+        if precond:
+            transform_size = self._fused_rh_transform_size(
+                tokens, hidden, head_dim, method, per_head_scales
+            )
+            signs, perm = self._config.mamba_precond_tensors(transform_size)
+        native_src = cpu
+        native_layers = layers
+        if per_head_scales:
+            expected_shape = (layers * head_num, tokens, head_dim)
+            if head_split is not None:
+                if (
+                    tuple(head_split.shape) != expected_shape
+                    or head_split.dtype != cpu.dtype
+                    or not head_split.is_contiguous()
+                ):
+                    raise ValueError("head_split does not match fused attention layout")
+                native_src = head_split
+            else:
+                native_src = self.split_fused_attention_heads(cpu, head_num, head_dim)
+            native_layers *= head_num
         return bytes(
             self._native().kvweave_serialize_chunk_state(
-                cpu.view(-1), header, KVWeaveCodecConfig.next_scale_id(),
+                native_src.view(-1), header, KVWeaveCodecConfig.next_scale_id(),
                 qbit=self.qbit, blocks_num=max(1, tokens // self.block_size),
                 block_size=self.block_size, head_num=head_num, head_dim=head_dim,
-                num_layers=layers, rh=rh, asym=asym, scaling_method=method,
+                num_layers=native_layers, rh=rh, asym=asym, scaling_method=method,
+                signs=signs, perm=perm,
                 num_threads=self.num_threads,
             )
         )
+
+    @staticmethod
+    def split_fused_attention_heads(
+        source: torch.Tensor,
+        head_num: int,
+        head_dim: int,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Reorder fused ``[L,T,H*D]`` attention into contiguous head rows."""
+        layers, tokens, hidden = map(int, source.shape)
+        expected_shape = (layers * head_num, tokens, head_dim)
+        if hidden != head_num * head_dim:
+            raise ValueError("fused hidden size does not match head layout")
+        if out is None:
+            out = torch.empty(expected_shape, dtype=source.dtype)
+        if (
+            tuple(out.shape) != expected_shape
+            or out.dtype != source.dtype
+            or not out.is_contiguous()
+        ):
+            raise ValueError("out does not match fused attention head layout")
+        out.copy_(
+            source.reshape(layers, tokens, head_num, head_dim)
+            .permute(0, 2, 1, 3)
+            .reshape(expected_shape)
+        )
+        return out
 
     def deserialize_fused_tensor(self, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Decode a fused-K/V payload and restore it into the destination tensor."""
         parsed = self._parse_fused(self._tensor_bytes(src))
         layers, tokens, hidden = parsed["shape"]
         q = torch.frombuffer(bytearray(parsed["q_data"]), dtype=torch.int8)
+        signs = perm = None
+        if parsed["precond"]:
+            transform_size = self._fused_rh_transform_size(
+                tokens,
+                hidden,
+                parsed["head_dim"],
+                parsed["scaling"],
+                parsed["per_head_scales"],
+            )
+            signs, perm = self._config.mamba_precond_tensors(transform_size)
+        native_layers = layers * parsed["head_num"] if parsed["per_head_scales"] else layers
+        native_hidden = parsed["head_dim"] if parsed["per_head_scales"] else hidden
         restored = self._native().kvweave_dequantize_chunk_state(
-            q, parsed["scales"], layers, tokens, hidden,
+            q, parsed["scales"], native_layers, tokens, native_hidden,
             qbit=parsed["qbit"], blocks_num=max(1, tokens // self.block_size),
             block_size=self.block_size, head_num=parsed["head_num"],
             head_dim=parsed["head_dim"], rh=parsed["rh"], asym=parsed["asym"],
             scaling_method=parsed["scaling"], output_dtype=dst.dtype,
+            signs=signs, perm=perm,
             num_threads=self.num_threads,
         )
+        if parsed["per_head_scales"]:
+            restored = (
+                restored.reshape(layers, parsed["head_num"], tokens, native_hidden)
+                .permute(0, 2, 1, 3)
+                .reshape(layers, tokens, hidden)
+                .contiguous()
+            )
         dst.copy_(restored.reshape(dst.shape).to(dtype=dst.dtype, device=dst.device))
 
     def _parse_fused(self, raw: bytes) -> dict[str, object]:
@@ -266,6 +345,8 @@ class _KVWeaveCodec:
             "qbit": qbit,
             "rh": bool(flags & 1),
             "asym": bool(flags & 2),
+            "precond": bool(flags & 4),
+            "per_head_scales": bool(flags & 8),
             "scaling": method,
             "dtype": self._config.CODE_TO_DTYPE.get(dtype_code, torch.float16),
             "scales": scales,
@@ -273,6 +354,24 @@ class _KVWeaveCodec:
             "head_num": self._fused_head_num(hidden),
             "head_dim": self._fused_head_dim(hidden),
         }
+
+    @staticmethod
+    def _fused_rh_transform_size(
+        tokens: int,
+        hidden: int,
+        head_dim: int,
+        method: str,
+        per_head_scales: bool = False,
+    ) -> int:
+        if per_head_scales:
+            return head_dim if method == "per_token" else tokens
+        if method == "per_token":
+            return hidden
+        if method == "per_channel":
+            if hidden % head_dim:
+                raise ValueError("fused hidden size must divide by head_dim")
+            return tokens * (hidden // head_dim)
+        return tokens * hidden
 
     def _normalize(self, tensor: torch.Tensor) -> _KVShape:
         """Convert supported 3D/4D KV layouts to canonical 4D metadata."""
@@ -349,6 +448,8 @@ class _KVWeaveCodec:
             if method == "per_channel"
             else 1
         )
+        if method != "per_tensor":
+            layers *= self._fused_head_num(hidden)
         return max(1, base * layers if layers > 1 else base)
 
     def _scale_count(self, tokens: int, hidden: int, layers: int, method: str) -> int:
@@ -364,43 +465,106 @@ class _KVWeaveCodec:
         return KVWeaveCodecConfig().mamba_precond_tensors(size)
 
     @staticmethod
-    def split_mamba_chunk(raw: torch.Tensor, layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout], block_size: int) -> MambaChunkSplit:
-        """Recover real conv/ssm bytes from the opaque synthetic page view."""
+    def split_mamba_chunk(
+        raw: torch.Tensor,
+        layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout],
+        block_size: int,
+        out: MambaChunkSplit | None = None,
+    ) -> MambaChunkSplit:
+        """Recover real conv/ssm bytes from the opaque synthetic page view.
+
+        When ``out`` is provided its contiguous sub-state tensors receive the
+        recovered bytes. This lets engine-driven store use pool scratch rather
+        than allocate ordinary CPU tensors for Stage 2.
+        """
         conv_layout, ssm_layout = layout
         if block_size <= 0 or raw.shape[-2] % block_size:
             raise ValueError(
                 f"chunk_tokens ({raw.shape[-2]}) is not a multiple of block_size ({block_size})"
             )
-        if raw.dim() == 4 and int(raw.shape[0]) == 2:
+        is_two_plane = raw.dim() == 4 and int(raw.shape[0]) == 2
+        if is_two_plane:
             _, layers, tokens, hidden = map(int, raw.shape)
             page_bytes = 2 * block_size * hidden * raw.element_size()
-            pages = raw.permute(1, 0, 2, 3).reshape(
-                layers, 2, tokens // block_size, block_size, hidden
-            ).permute(0, 2, 1, 3, 4).reshape(
-                layers, tokens // block_size, page_bytes // raw.element_size()
-            ).contiguous().view(torch.uint8)
         elif raw.dim() == 3:
             layers, tokens, hidden = map(int, raw.shape)
             page_bytes = block_size * hidden * raw.element_size()
-            pages = raw.reshape(
-                layers, tokens // block_size, block_size, hidden
-            ).contiguous().view(torch.uint8).reshape(layers, tokens // block_size, page_bytes)
         else:
             raise ValueError(
                 f"expected Mamba chunk shape [2,L,T,H] or [L,T,H], got {tuple(raw.shape)}"
             )
         blocks = tokens // block_size
-        def read(item):
-            desc, dtype = item
+        blocks = tokens // block_size
+
+        def validate_and_target(
+            desc: MambaSubStateWireLayout,
+            dtype: torch.dtype,
+            target: torch.Tensor | None,
+        ) -> torch.Tensor:
             end = desc.byte_offset + desc.byte_length
             if desc.byte_offset < 0 or end > page_bytes:
                 raise ValueError("Mamba sub-state byte layout exceeds page size")
-            return pages[:, :, desc.byte_offset:end].contiguous().view(dtype).reshape(layers, blocks, *desc.shape)
-        return MambaChunkSplit(read((conv_layout, KVWeaveCodecConfig.mamba_dtype(conv_layout.dtype_str))), read((ssm_layout, KVWeaveCodecConfig.mamba_dtype(ssm_layout.dtype_str))))
+            expected_shape = (layers, blocks, *desc.shape)
+            if target is None:
+                return torch.empty(expected_shape, dtype=dtype)
+            if (
+                target.shape != expected_shape
+                or target.dtype != dtype
+                or not target.is_contiguous()
+            ):
+                raise ValueError("Mamba split out tensor does not match real layout")
+            return target
+
+        def read(desc: MambaSubStateWireLayout, dtype: torch.dtype, target: torch.Tensor | None) -> torch.Tensor:
+            destination = validate_and_target(desc, dtype, target)
+            destination_bytes = destination.view(torch.uint8).reshape(layers, blocks, -1)
+            end = desc.byte_offset + desc.byte_length
+            if not is_two_plane:
+                pages = raw.view(torch.uint8).reshape(layers, blocks, page_bytes)
+                destination_bytes.copy_(pages[:, :, desc.byte_offset:end])
+                return destination
+
+            plane_bytes = block_size * hidden * raw.element_size()
+            source_offset = 0
+            page_offset = desc.byte_offset
+            while source_offset < desc.byte_length:
+                plane_index = page_offset // plane_bytes
+                plane_offset = page_offset % plane_bytes
+                copy_bytes = min(
+                    desc.byte_length - source_offset, plane_bytes - plane_offset
+                )
+                for block_index in range(blocks):
+                    for layer_index in range(layers):
+                        source = raw[
+                            plane_index,
+                            layer_index,
+                            block_index * block_size : (block_index + 1) * block_size,
+                            :,
+                        ].view(torch.uint8).reshape(-1)
+                        destination_bytes[
+                            layer_index,
+                            block_index,
+                            source_offset : source_offset + copy_bytes,
+                        ] = source[plane_offset : plane_offset + copy_bytes]
+                source_offset += copy_bytes
+                page_offset += copy_bytes
+            return destination
+
+        conv = read(
+            conv_layout,
+            KVWeaveCodecConfig.mamba_dtype(conv_layout.dtype_str),
+            out.conv if out is not None else None,
+        )
+        ssm = read(
+            ssm_layout,
+            KVWeaveCodecConfig.mamba_dtype(ssm_layout.dtype_str),
+            out.ssm if out is not None else None,
+        )
+        return MambaChunkSplit(conv, ssm)
 
     @staticmethod
-    def merge_mamba_chunk(split: MambaChunkSplit, layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout], block_size: int, hidden_dim: int, raw_shape: torch.Size | None = None, raw_dtype: torch.dtype | None = None) -> torch.Tensor:
-        """Rebuild the opaque page view, zero-filling unused padding bytes."""
+    def merge_mamba_chunk(split: MambaChunkSplit, layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout], block_size: int, hidden_dim: int, raw_shape: torch.Size | None = None, raw_dtype: torch.dtype | None = None, out: torch.Tensor | None = None) -> torch.Tensor:
+        """Rebuild the opaque page view, optionally in a caller-owned buffer."""
         conv_layout, ssm_layout = layout
         layers, blocks = map(int, split.conv.shape[:2])
         if split.ssm.shape[:2] != (layers, blocks):
@@ -408,6 +572,48 @@ class _KVWeaveCodec:
         output_dtype = raw_dtype or split.conv.dtype
         planes = 1 if raw_shape is not None and len(raw_shape) == 3 else 2
         page_bytes = planes * block_size * hidden_dim * output_dtype.itemsize
+        if out is not None:
+            if raw_shape is None or raw_dtype is None:
+                raise ValueError("raw_shape and raw_dtype are required with out")
+            if out.shape != raw_shape or out.dtype != raw_dtype or not out.is_contiguous():
+                raise ValueError("out must be a contiguous tensor matching raw_shape/raw_dtype")
+
+            def write_to_out(tensor: torch.Tensor, desc: MambaSubStateWireLayout) -> None:
+                raw = tensor.contiguous().view(torch.uint8).reshape(layers, blocks, -1)
+                end = desc.byte_offset + desc.byte_length
+                if raw.shape[-1] != desc.byte_length or end > page_bytes:
+                    raise ValueError("Mamba sub-state tensor does not match byte layout")
+                if planes == 1:
+                    out.view(torch.uint8).reshape(layers, blocks, page_bytes)[
+                        :, :, desc.byte_offset:end
+                    ] = raw
+                    return
+                plane_bytes = block_size * hidden_dim * output_dtype.itemsize
+                source_offset = 0
+                page_offset = desc.byte_offset
+                while source_offset < desc.byte_length:
+                    plane_index = page_offset // plane_bytes
+                    plane_offset = page_offset % plane_bytes
+                    copy_bytes = min(
+                        desc.byte_length - source_offset,
+                        plane_bytes - plane_offset,
+                    )
+                    for block_index in range(blocks):
+                        destination = out[
+                            plane_index,
+                            :,
+                            block_index * block_size : (block_index + 1) * block_size,
+                            :,
+                        ].view(torch.uint8).reshape(layers, plane_bytes)
+                        destination[:, plane_offset : plane_offset + copy_bytes] = raw[
+                            :, block_index, source_offset : source_offset + copy_bytes
+                        ]
+                    source_offset += copy_bytes
+                    page_offset += copy_bytes
+
+            write_to_out(split.conv, conv_layout)
+            write_to_out(split.ssm, ssm_layout)
+            return out
         pages = torch.zeros(layers, blocks, page_bytes, dtype=torch.uint8)
         for tensor, desc in ((split.conv, conv_layout), (split.ssm, ssm_layout)):
             raw = tensor.contiguous().view(torch.uint8).reshape(layers, blocks, -1)
@@ -931,6 +1137,8 @@ class _KVWeaveCodec:
         mamba_options: MambaCodecOptions | None,
         raw_chunk: torch.Tensor,
         attention_plane_layout: AttentionPlaneLayout | None = None,
+        mamba_split: MambaChunkSplit | None = None,
+        fused_head_split: torch.Tensor | None = None,
     ) -> bytes:
         """Encode one gathered raw chunk into its wire-quantized byte payload.
 
@@ -955,7 +1163,9 @@ class _KVWeaveCodec:
         if mamba_layout is not None:
             if mamba_options is None:
                 raise RuntimeError("Mamba codec options are not initialized")
-            split = self.split_mamba_chunk(raw_chunk, mamba_layout, tokens_per_block)
+            split = mamba_split or self.split_mamba_chunk(
+                raw_chunk, mamba_layout, tokens_per_block
+            )
             if getattr(mamba_options, "conv_quant_enabled", True):
                 query, key, value = self._split_conv_qkv(
                     split.conv, mamba_options.conv_qkv_split
@@ -993,8 +1203,50 @@ class _KVWeaveCodec:
                 ssm_payload = b"\x00" + self._tensor_bytes(split.ssm)
             return self.pack_mamba_payloads(conv_payload, ssm_payload)
         if attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
-            return self.serialize_fused_tensor(raw_chunk)
+            return self.serialize_fused_tensor(raw_chunk, head_split=fused_head_split)
         return self.serialize_tensor(raw_chunk)
+
+    def encode_chunk_into(
+        self,
+        cache_category: str,
+        mamba_layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None,
+        tokens_per_block: int,
+        mamba_options: MambaCodecOptions | None,
+        raw_chunk: torch.Tensor,
+        destination: torch.Tensor,
+        attention_plane_layout: AttentionPlaneLayout | None = None,
+        mamba_split: MambaChunkSplit | None = None,
+        fused_head_split: torch.Tensor | None = None,
+    ) -> int:
+        """Encode a chunk and copy its payload directly into ``destination``.
+
+        ``destination`` is normally the durable quantized SHM slot. The
+        native serializer currently returns Python ``bytes``, so this cannot
+        eliminate that native result allocation; it does avoid constructing a
+        second ``bytearray``/``uint8`` staging tensor before the SHM copy.
+        Returns the number of payload bytes written.
+        """
+        if destination.dtype != torch.uint8 or not destination.is_contiguous():
+            raise ValueError("destination must be a contiguous torch.uint8 tensor")
+        payload = self.encode_chunk(
+            cache_category,
+            mamba_layout,
+            tokens_per_block,
+            mamba_options,
+            raw_chunk,
+            attention_plane_layout,
+            mamba_split,
+            fused_head_split,
+        )
+        if len(payload) > destination.numel():
+            raise ValueError(
+                f"encoded payload ({len(payload)} bytes) exceeds destination "
+                f"capacity ({destination.numel()} bytes)"
+            )
+        destination.view(-1)[: len(payload)].copy_(
+            torch.frombuffer(memoryview(payload), dtype=torch.uint8)
+        )
+        return len(payload)
 
     def decode_chunk(
         self,
@@ -1005,14 +1257,13 @@ class _KVWeaveCodec:
         raw_dtype: torch.dtype,
         chunk: torch.Tensor,
         attention_plane_layout: AttentionPlaneLayout | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode one retrieved wire-quantized byte chunk back to its raw shape.
 
-        Mirrors :meth:`encode_chunk`'s dispatch. All branches return a
-        freshly allocated tensor (the attention branches' ``deserialize_*``
-        methods write into a caller-provided destination internally, so
-        callers of this method never need to know which convention the
-        underlying codec uses).
+        Mirrors :meth:`encode_chunk`'s dispatch. When ``out`` is supplied,
+        the decoded raw chunk is written there; otherwise a fresh tensor is
+        allocated.
 
         Raises:
             ValueError: If ``cache_category``/``mamba_layout``/
@@ -1035,14 +1286,16 @@ class _KVWeaveCodec:
             hidden_dim = raw_shape[-1]
             merged = self.merge_mamba_chunk(
                 MambaChunkSplit(conv, ssm), mamba_layout, tokens_per_block,
-                hidden_dim, raw_shape=raw_shape, raw_dtype=raw_dtype,
+                hidden_dim, raw_shape=raw_shape, raw_dtype=raw_dtype, out=out,
             )
             # ``merged`` is an opaque page view. Its bytes already contain
             # each sub-state in its own wire dtype; converting the page tensor
             # numerically would corrupt fp32 SSM bytes when the page dtype is
             # fp16 (the normal Qwen3.5 layout).
             return merged
-        destination = torch.empty(raw_shape, dtype=raw_dtype)
+        destination = out if out is not None else torch.empty(raw_shape, dtype=raw_dtype)
+        if destination.shape != raw_shape or destination.dtype != raw_dtype:
+            raise ValueError("out must match raw_shape and raw_dtype")
         if attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
             self.deserialize_fused_tensor(chunk, destination)
         else:
