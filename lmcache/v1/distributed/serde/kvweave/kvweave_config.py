@@ -123,6 +123,21 @@ def _env_attention_qbit() -> int:
     return qbit
 
 
+def _env_num_threads() -> int:
+    """Read the native KVWeave quant kernel's OpenMP thread count.
+
+    Previously never wired up despite ``LMCACHE_MP_KVWEAVE_NUM_THREADS``
+    being referenced by deployment scripts -- the codec always ran with
+    ``num_threads=1`` regardless of this env var.
+    """
+    num_threads = int(os.environ.get("LMCACHE_MP_KVWEAVE_NUM_THREADS", "8"))
+    if num_threads < 1:
+        raise ValueError(
+            f"LMCACHE_MP_KVWEAVE_NUM_THREADS={num_threads!r} must be >= 1"
+        )
+    return num_threads
+
+
 @dataclass(frozen=True)
 class MambaCodecOptions:
     """Resolved per-substate quantization parameters for Mamba groups.
@@ -270,6 +285,7 @@ class KVWeaveRuntimeConfig:
                 "rh": _env_flag("LMCACHE_MP_KVWEAVE_RH", True),
                 "asym": _env_flag("LMCACHE_MP_KVWEAVE_ASYM", True),
                 "precond": _env_flag("LMCACHE_MP_KVWEAVE_PRECOND", True),
+                "num_threads": _env_num_threads(),
             },
             mamba_options=MambaCodecOptions.from_env(),
         )
@@ -286,7 +302,7 @@ class KVWeaveCodecConfig:
     asym: bool = True
     log: bool = False
     precond: bool = False
-    num_threads: int = 1
+    num_threads: int = 8
     precond_seed: int = 42
     precond_path: Optional[str] = None
     MAGIC_RAW: ClassVar[bytes] = b"KVW0"

@@ -57,7 +57,7 @@ class _KVWeaveCodec:
             asym=bool(kwargs.get("asym", True)),
             log=bool(kwargs.get("log", False)),
             precond=bool(kwargs.get("precond", False)),
-            num_threads=int(kwargs.get("num_threads", 1)),
+            num_threads=int(kwargs.get("num_threads", 8)),
             precond_seed=int(kwargs.get("precond_seed", 42)),
             precond_path=kwargs.get("precond_path") or None,
         )
@@ -266,20 +266,25 @@ class _KVWeaveCodec:
         head_num: int,
         head_dim: int,
         out: torch.Tensor | None = None,
+        num_threads: int = 0,
     ) -> torch.Tensor:
         """Reorder fused ``[L,T,H*D]`` attention into contiguous head rows."""
         layers, tokens, hidden = map(int, source.shape)
         expected_shape = (layers * head_num, tokens, head_dim)
         if hidden != head_num * head_dim:
             raise ValueError("fused hidden size does not match head layout")
-        if out is None:
-            out = torch.empty(expected_shape, dtype=source.dtype)
-        if (
+        if out is not None and (
             tuple(out.shape) != expected_shape
             or out.dtype != source.dtype
             or not out.is_contiguous()
         ):
             raise ValueError("out does not match fused attention head layout")
+        if kvweave_quant is not None and hasattr(kvweave_quant, "kvweave_split_fused_heads"):
+            return kvweave_quant.kvweave_split_fused_heads(
+                source.contiguous(), head_num, head_dim, num_threads, out
+            )
+        if out is None:
+            out = torch.empty(expected_shape, dtype=source.dtype)
         out.copy_(
             source.reshape(layers, tokens, head_num, head_dim)
             .permute(0, 2, 1, 3)
@@ -314,12 +319,17 @@ class _KVWeaveCodec:
             num_threads=self.num_threads,
         )
         if parsed["per_head_scales"]:
-            restored = (
-                restored.reshape(layers, parsed["head_num"], tokens, native_hidden)
-                .permute(0, 2, 1, 3)
-                .reshape(layers, tokens, hidden)
-                .contiguous()
-            )
+            if kvweave_quant is not None and hasattr(kvweave_quant, "kvweave_merge_fused_heads"):
+                restored = kvweave_quant.kvweave_merge_fused_heads(
+                    restored, layers, parsed["head_num"], native_hidden, self.num_threads
+                )
+            else:
+                restored = (
+                    restored.reshape(layers, parsed["head_num"], tokens, native_hidden)
+                    .permute(0, 2, 1, 3)
+                    .reshape(layers, tokens, hidden)
+                    .contiguous()
+                )
         dst.copy_(restored.reshape(dst.shape).to(dtype=dst.dtype, device=dst.device))
 
     def _parse_fused(self, raw: bytes) -> dict[str, object]:
@@ -533,19 +543,15 @@ class _KVWeaveCodec:
                 copy_bytes = min(
                     desc.byte_length - source_offset, plane_bytes - plane_offset
                 )
-                for block_index in range(blocks):
-                    for layer_index in range(layers):
-                        source = raw[
-                            plane_index,
-                            layer_index,
-                            block_index * block_size : (block_index + 1) * block_size,
-                            :,
-                        ].view(torch.uint8).reshape(-1)
-                        destination_bytes[
-                            layer_index,
-                            block_index,
-                            source_offset : source_offset + copy_bytes,
-                        ] = source[plane_offset : plane_offset + copy_bytes]
+                # Vectorized over all (layer, block) pairs at once instead of a
+                # per-(layer, block) Python loop -- raw[plane_index] is already
+                # contiguous (slicing a contiguous tensor's outermost dim).
+                plane_view = raw[plane_index].view(torch.uint8).reshape(
+                    layers, blocks, plane_bytes
+                )
+                destination_bytes[
+                    :, :, source_offset : source_offset + copy_bytes
+                ] = plane_view[:, :, plane_offset : plane_offset + copy_bytes]
                 source_offset += copy_bytes
                 page_offset += copy_bytes
             return destination
@@ -598,16 +604,16 @@ class _KVWeaveCodec:
                         desc.byte_length - source_offset,
                         plane_bytes - plane_offset,
                     )
-                    for block_index in range(blocks):
-                        destination = out[
-                            plane_index,
-                            :,
-                            block_index * block_size : (block_index + 1) * block_size,
-                            :,
-                        ].view(torch.uint8).reshape(layers, plane_bytes)
-                        destination[:, plane_offset : plane_offset + copy_bytes] = raw[
-                            :, block_index, source_offset : source_offset + copy_bytes
-                        ]
+                    # Vectorized over all (layer, block) pairs at once instead
+                    # of a per-block Python loop -- out[plane_index] is
+                    # already contiguous (slicing a contiguous tensor's
+                    # outermost dim).
+                    dest_view = out[plane_index].view(torch.uint8).reshape(
+                        layers, blocks, plane_bytes
+                    )
+                    dest_view[:, :, plane_offset : plane_offset + copy_bytes] = raw[
+                        :, :, source_offset : source_offset + copy_bytes
+                    ]
                     source_offset += copy_bytes
                     page_offset += copy_bytes
 
