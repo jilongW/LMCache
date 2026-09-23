@@ -62,6 +62,15 @@ inline int round_up_to_sg(int n) {
 // ---------------------------------------------------------------------------
 namespace lmc {
 
+template <bool USE_BLOCK_IDS>
+inline int64_t resolve_slot(const int64_t* mapping_ptr, const int token_idx,
+                            const int block_size) {
+  if constexpr (USE_BLOCK_IDS) {
+    return mapping_ptr[token_idx / block_size];
+  }
+  return mapping_ptr[token_idx];
+}
+
 template <EngineKVFormat format>
 inline int64_t page_buffer_offset(const int k_or_v, const int token_idx,
                                   const int scalar_offset,
@@ -118,6 +127,20 @@ inline int64_t page_buffer_base_offset(const int k_or_v, const int token_idx,
                        format == EngineKVFormat::NL_X_NBBS_ONE_HS) {
     return token_idx * scalars_per_token;
   }
+}
+
+template <EngineKVFormat format>
+inline int64_t page_buffer_base_offset_for_slot(
+    const int k_or_v, const int64_t block_id, const int token_offset,
+    const int scalars_per_token, const int page_buffer_size,
+    const int block_size) {
+  if constexpr (format == EngineKVFormat::NL_X_NB_TWO_BS_NH_HS) {
+    return block_id * 2 * block_size * scalars_per_token +
+           k_or_v * block_size * scalars_per_token +
+           token_offset * scalars_per_token;
+  }
+  return page_buffer_base_offset<format>(
+      k_or_v, block_id, scalars_per_token, page_buffer_size, block_size);
 }
 
 inline int64_t page_buffer_offset_unilateral(const int token_idx,
@@ -186,7 +209,8 @@ T* get_kernel_ptr(TENSOR_TYPE& tensor) {
  *   - Work-group size rounded to a sub-group multiple for full SIMD
  *     utilisation
  */
-template <typename scalar_t, bool DIRECTION, EngineKVFormat format>
+template <typename scalar_t, bool DIRECTION, EngineKVFormat format,
+          bool USE_BLOCK_IDS = false>
 void submit_multi_layer_kernel(sycl::queue& queue, scalar_t* key_value_ptr,
                                scalar_t** page_buffer_ptrs,
                                const int64_t* slot_mapping_ptr,
@@ -212,7 +236,8 @@ void submit_multi_layer_kernel(sycl::queue& queue, scalar_t* key_value_ptr,
         const int num_threads = static_cast<int>(item.get_local_range(2));
 
         const int kv_token_id = token_id + skip_prefix_n_tokens;
-        const int64_t slot_idx = slot_mapping_ptr[kv_token_id];
+        const int64_t slot_idx = lmc::resolve_slot<USE_BLOCK_IDS>(
+          slot_mapping_ptr, kv_token_id, block_size);
         scalar_t* paged_buffer_ptr = page_buffer_ptrs[layer_id];
 
         if (slot_idx < 0) return;
@@ -220,10 +245,11 @@ void submit_multi_layer_kernel(sycl::queue& queue, scalar_t* key_value_ptr,
         // Hoist loop-invariant base offsets (flash_infer's integer
         // division happens here, once, not per loop iteration).
         const int64_t lmc_base = lmc::key_value_base_offset(
-            k_or_v, layer_id, kv_token_id, scalars_per_token, num_tokens,
+          k_or_v, layer_id, token_id, scalars_per_token, num_tokens,
             num_layers);
-        const int64_t vllm_base = lmc::page_buffer_base_offset<format>(
-            k_or_v, slot_idx, scalars_per_token, page_buffer_size, block_size);
+        const int64_t vllm_base = lmc::page_buffer_base_offset_for_slot<format>(
+          k_or_v, slot_idx, kv_token_id % block_size, scalars_per_token,
+          page_buffer_size, block_size);
 
         for (int i = tid; i < scalars_per_token; i += num_threads) {
           if constexpr (DIRECTION) {
@@ -243,7 +269,8 @@ void submit_multi_layer_kernel(sycl::queue& queue, scalar_t* key_value_ptr,
  * V separately. Slot mapping, pointer-array lookup, and flash_infer's
  * block-index division are each performed once and reused for both.
  */
-template <typename scalar_t, bool DIRECTION, EngineKVFormat format>
+template <typename scalar_t, bool DIRECTION, EngineKVFormat format,
+          bool USE_BLOCK_IDS = false>
 void submit_multi_layer_kernel_fused_kv(
     sycl::queue& queue, scalar_t* key_value_ptr, scalar_t** page_buffer_ptrs,
     const int64_t* slot_mapping_ptr, int scalars_per_token, int num_tokens,
@@ -268,7 +295,8 @@ void submit_multi_layer_kernel_fused_kv(
         const int num_threads = static_cast<int>(item.get_local_range(2));
 
         const int kv_token_id = token_id + skip_prefix_n_tokens;
-        const int64_t slot_idx = slot_mapping_ptr[kv_token_id];
+        const int64_t slot_idx = lmc::resolve_slot<USE_BLOCK_IDS>(
+          slot_mapping_ptr, kv_token_id, block_size);
         scalar_t* paged_buffer_ptr = page_buffer_ptrs[layer_id];
 
         if (slot_idx < 0) return;
@@ -276,15 +304,19 @@ void submit_multi_layer_kernel_fused_kv(
         // Base offsets for K (k_or_v=0) and V (k_or_v=1); the
         // flash_infer division/modulo runs once per token+layer.
         const int64_t lmc_base_k = lmc::key_value_base_offset(
-            0, layer_id, kv_token_id, scalars_per_token, num_tokens,
+          0, layer_id, token_id, scalars_per_token, num_tokens,
             num_layers);
         const int64_t lmc_base_v = lmc::key_value_base_offset(
-            1, layer_id, kv_token_id, scalars_per_token, num_tokens,
+          1, layer_id, token_id, scalars_per_token, num_tokens,
             num_layers);
-        const int64_t vllm_base_k = lmc::page_buffer_base_offset<format>(
-            0, slot_idx, scalars_per_token, page_buffer_size, block_size);
-        const int64_t vllm_base_v = lmc::page_buffer_base_offset<format>(
-            1, slot_idx, scalars_per_token, page_buffer_size, block_size);
+        const int64_t vllm_base_k =
+          lmc::page_buffer_base_offset_for_slot<format>(
+            0, slot_idx, kv_token_id % block_size, scalars_per_token,
+            page_buffer_size, block_size);
+        const int64_t vllm_base_v =
+          lmc::page_buffer_base_offset_for_slot<format>(
+            1, slot_idx, kv_token_id % block_size, scalars_per_token,
+            page_buffer_size, block_size);
 
         for (int i = tid; i < scalars_per_token; i += num_threads) {
           if constexpr (DIRECTION) {
@@ -295,6 +327,67 @@ void submit_multi_layer_kernel_fused_kv(
             // LMCache → paged buffer
             paged_buffer_ptr[vllm_base_k + i] = key_value_ptr[lmc_base_k + i];
             paged_buffer_ptr[vllm_base_v + i] = key_value_ptr[lmc_base_v + i];
+          }
+        }
+      });
+}
+
+template <typename scalar_t, bool DIRECTION, EngineKVFormat format,
+          bool USE_BLOCK_IDS = false>
+void submit_multi_layer_kernel_fused_packed(
+    sycl::queue& queue, scalar_t* key_value_ptr, scalar_t** page_buffer_ptrs,
+    const int64_t* slot_mapping_ptr, int xwords_per_token, int num_tokens,
+    int num_layers, int page_buffer_size, int block_size, int num_heads,
+    int skip_prefix_n_tokens, int wg_size) {
+  const int num_transfer_tokens = num_tokens - skip_prefix_n_tokens;
+  if (num_transfer_tokens <= 0 || num_layers <= 0) return;
+
+  const int xwords_per_head = xwords_per_token / num_heads;
+  sycl::range<3> global_range(
+      1, static_cast<size_t>(num_layers),
+      static_cast<size_t>(num_transfer_tokens) * wg_size);
+  sycl::range<3> local_range(1, 1, static_cast<size_t>(wg_size));
+
+  queue.parallel_for(
+      sycl::nd_range<3>(global_range, local_range),
+      [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(16)]] {
+        const int token_id = static_cast<int>(item.get_group(2));
+        const int layer_id = static_cast<int>(item.get_group(1));
+        const int tid = static_cast<int>(item.get_local_id(2));
+        const int num_threads = static_cast<int>(item.get_local_range(2));
+        const int kv_token_id = token_id + skip_prefix_n_tokens;
+        const int64_t slot_idx = lmc::resolve_slot<USE_BLOCK_IDS>(
+          slot_mapping_ptr, kv_token_id, block_size);
+        if (slot_idx < 0) return;
+
+        scalar_t* paged_buffer_ptr = page_buffer_ptrs[layer_id];
+        const int block_offset = kv_token_id % block_size;
+        const int64_t lmc_base = lmc::key_value_base_offset(
+          0, layer_id, token_id, xwords_per_token, num_tokens,
+            num_layers);
+
+        for (int i = tid; i < xwords_per_token; i += num_threads) {
+          const int head = i / xwords_per_head;
+          const int head_offset = i % xwords_per_head;
+          int64_t page_offset;
+          if constexpr (format == EngineKVFormat::NL_X_NB_NH_BS_CS ||
+                        format == EngineKVFormat::NL_X_NB_NH_BS_TWO_HS) {
+            page_offset = static_cast<int64_t>(slot_idx) * block_size *
+                              xwords_per_token +
+                          static_cast<int64_t>(block_offset) *
+                              xwords_per_token + i;
+          } else {
+            page_offset = static_cast<int64_t>(slot_idx) * block_size *
+                              xwords_per_token +
+                          static_cast<int64_t>(head) * block_size *
+                              xwords_per_head +
+                          static_cast<int64_t>(block_offset) *
+                              xwords_per_head + head_offset;
+          }
+          if constexpr (DIRECTION) {
+            key_value_ptr[lmc_base + i] = paged_buffer_ptr[page_offset];
+          } else {
+            paged_buffer_ptr[page_offset] = key_value_ptr[lmc_base + i];
           }
         }
       });
@@ -363,14 +456,23 @@ void submit_multi_layer_unilateral_kernel(
 // MLA formats (k_or_v_size==1) use the per-component kernel.
 // Non-MLA formats (k_or_v_size==2) use the fused K+V kernel.
 // ---------------------------------------------------------------------------
-#define LAUNCH_KERNEL_WITH_FORMAT(T, DIRECTION, FORMAT)                     \
-  submit_multi_layer_kernel<T, DIRECTION, FORMAT>(                          \
+#define LAUNCH_KERNEL_WITH_FORMAT(T, DIRECTION, FORMAT, USE_BLOCK_IDS)      \
+  submit_multi_layer_kernel<T, DIRECTION, FORMAT, USE_BLOCK_IDS>(            \
       queue, key_value_ptr, page_buffer_ptrs, slot_mapping_ptr, num_xwords, \
       num_tokens, num_layers, page_buffer_size, block_size,                 \
       skip_prefix_n_tokens, k_or_v_size, wg_size);
 
-#define LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(T, DIRECTION, FORMAT)            \
-  submit_multi_layer_kernel_fused_kv<T, DIRECTION, FORMAT>(                 \
+#define LAUNCH_FUSED_PACKED_KERNEL_WITH_FORMAT(T, DIRECTION, FORMAT,         \
+                                               USE_BLOCK_IDS)                 \
+  submit_multi_layer_kernel_fused_packed<T, DIRECTION, FORMAT,               \
+                                         USE_BLOCK_IDS>(                     \
+      queue, key_value_ptr, page_buffer_ptrs, slot_mapping_ptr, num_xwords,  \
+      num_tokens, num_layers, page_buffer_size, block_size, num_heads,        \
+      skip_prefix_n_tokens, wg_size);
+
+#define LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(T, DIRECTION, FORMAT,             \
+                                           USE_BLOCK_IDS)                    \
+  submit_multi_layer_kernel_fused_kv<T, DIRECTION, FORMAT, USE_BLOCK_IDS>(   \
       queue, key_value_ptr, page_buffer_ptrs, slot_mapping_ptr, num_xwords, \
       num_tokens, num_layers, page_buffer_size, block_size,                 \
       skip_prefix_n_tokens, wg_size);
@@ -378,13 +480,13 @@ void submit_multi_layer_unilateral_kernel(
 // ---------------------------------------------------------------------------
 // multi_layer_kv_transfer -- templated implementation
 // ---------------------------------------------------------------------------
-template <typename T>
+template <typename T, bool USE_BLOCK_IDS = false>
 void multi_layer_kv_transfer_templated(
     torch::Tensor& key_value, const torch::Tensor& key_value_ptrs,
     const torch::Tensor& slot_mapping, const torch::Device& paged_memory_device,
     const int page_buffer_size, const TransferDirection direction,
     const EngineKVFormat engine_kv_format, const int block_size,
-    const int skip_prefix_n_tokens) {
+    const int head_size, const int skip_prefix_n_tokens) {
   T* key_value_ptr = get_kernel_ptr<T, torch::Tensor>(key_value);
   T** page_buffer_ptrs =
       get_kernel_ptr<T*, const torch::Tensor>(key_value_ptrs);
@@ -394,10 +496,14 @@ void multi_layer_kv_transfer_templated(
   int num_layers = key_value.size(1);
   int num_tokens = key_value.size(2);
   int num_origin_elements = key_value.size(3);
+  int num_heads = head_size > 0 ? num_origin_elements / head_size : 1;
   int elements_per_xword = sizeof(T) / key_value.element_size();
   int num_xwords = num_origin_elements / elements_per_xword;
 
-  int k_or_v_size = ::is_mla(engine_kv_format) ? 1 : 2;
+  int k_or_v_size = (::is_mla(engine_kv_format) ||
+                     ::is_fused_packed(engine_kv_format))
+                        ? 1
+                        : 2;
 
   // Round up to a sub-group multiple so every sub-group is full.
   int wg_size = round_up_to_sg(std::min(num_xwords, MAX_WG_SIZE));
@@ -408,20 +514,64 @@ void multi_layer_kv_transfer_templated(
 
   // Non-MLA formats use the fused K+V kernel; MLA formats
   // (k_or_v_size==1) use the per-component kernel.
-  if (k_or_v_size == 2) {
+  if (::is_fused_packed(engine_kv_format)) {
+    if (direction == TransferDirection::H2D) {
+      switch (engine_kv_format) {
+        case EngineKVFormat::NL_X_NB_NH_BS_TWO_HS:
+          LAUNCH_FUSED_PACKED_KERNEL_WITH_FORMAT(
+              T, false, EngineKVFormat::NL_X_NB_NH_BS_TWO_HS, USE_BLOCK_IDS);
+          break;
+        case EngineKVFormat::NL_X_NB_BS_NH_TWO_HS:
+          LAUNCH_FUSED_PACKED_KERNEL_WITH_FORMAT(
+              T, false, EngineKVFormat::NL_X_NB_BS_NH_TWO_HS, USE_BLOCK_IDS);
+          break;
+        case EngineKVFormat::NL_X_NB_NH_BS_CS:
+          LAUNCH_FUSED_PACKED_KERNEL_WITH_FORMAT(
+              T, false, EngineKVFormat::NL_X_NB_NH_BS_CS, USE_BLOCK_IDS);
+          break;
+        case EngineKVFormat::NL_X_NB_BS_NH_CS:
+          LAUNCH_FUSED_PACKED_KERNEL_WITH_FORMAT(
+              T, false, EngineKVFormat::NL_X_NB_BS_NH_CS, USE_BLOCK_IDS);
+          break;
+        default:
+          throw std::runtime_error("Unsupported packed EngineKVFormat");
+      }
+    } else {
+      switch (engine_kv_format) {
+        case EngineKVFormat::NL_X_NB_NH_BS_TWO_HS:
+          LAUNCH_FUSED_PACKED_KERNEL_WITH_FORMAT(
+              T, true, EngineKVFormat::NL_X_NB_NH_BS_TWO_HS, USE_BLOCK_IDS);
+          break;
+        case EngineKVFormat::NL_X_NB_BS_NH_TWO_HS:
+          LAUNCH_FUSED_PACKED_KERNEL_WITH_FORMAT(
+              T, true, EngineKVFormat::NL_X_NB_BS_NH_TWO_HS, USE_BLOCK_IDS);
+          break;
+        case EngineKVFormat::NL_X_NB_NH_BS_CS:
+          LAUNCH_FUSED_PACKED_KERNEL_WITH_FORMAT(
+              T, true, EngineKVFormat::NL_X_NB_NH_BS_CS, USE_BLOCK_IDS);
+          break;
+        case EngineKVFormat::NL_X_NB_BS_NH_CS:
+          LAUNCH_FUSED_PACKED_KERNEL_WITH_FORMAT(
+              T, true, EngineKVFormat::NL_X_NB_BS_NH_CS, USE_BLOCK_IDS);
+          break;
+        default:
+          throw std::runtime_error("Unsupported packed EngineKVFormat");
+      }
+    }
+  } else if (k_or_v_size == 2) {
     if (direction == TransferDirection::H2D) {
       switch (engine_kv_format) {
         case EngineKVFormat::NB_NL_TWO_BS_NH_HS:
           LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(
-              T, false, EngineKVFormat::NB_NL_TWO_BS_NH_HS);
+              T, false, EngineKVFormat::NB_NL_TWO_BS_NH_HS, USE_BLOCK_IDS);
           break;
         case EngineKVFormat::NL_X_TWO_NB_BS_NH_HS:
           LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(
-              T, false, EngineKVFormat::NL_X_TWO_NB_BS_NH_HS);
+              T, false, EngineKVFormat::NL_X_TWO_NB_BS_NH_HS, USE_BLOCK_IDS);
           break;
         case EngineKVFormat::NL_X_NB_TWO_BS_NH_HS:
           LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(
-              T, false, EngineKVFormat::NL_X_NB_TWO_BS_NH_HS);
+              T, false, EngineKVFormat::NL_X_NB_TWO_BS_NH_HS, USE_BLOCK_IDS);
           break;
         default:
           throw std::runtime_error("Unsupported non-MLA EngineKVFormat");
@@ -430,15 +580,15 @@ void multi_layer_kv_transfer_templated(
       switch (engine_kv_format) {
         case EngineKVFormat::NB_NL_TWO_BS_NH_HS:
           LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(
-              T, true, EngineKVFormat::NB_NL_TWO_BS_NH_HS);
+              T, true, EngineKVFormat::NB_NL_TWO_BS_NH_HS, USE_BLOCK_IDS);
           break;
         case EngineKVFormat::NL_X_TWO_NB_BS_NH_HS:
           LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(
-              T, true, EngineKVFormat::NL_X_TWO_NB_BS_NH_HS);
+              T, true, EngineKVFormat::NL_X_TWO_NB_BS_NH_HS, USE_BLOCK_IDS);
           break;
         case EngineKVFormat::NL_X_NB_TWO_BS_NH_HS:
           LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT(
-              T, true, EngineKVFormat::NL_X_NB_TWO_BS_NH_HS);
+              T, true, EngineKVFormat::NL_X_NB_TWO_BS_NH_HS, USE_BLOCK_IDS);
           break;
         default:
           throw std::runtime_error("Unsupported non-MLA EngineKVFormat");
@@ -449,10 +599,12 @@ void multi_layer_kv_transfer_templated(
     if (direction == TransferDirection::H2D) {
       switch (engine_kv_format) {
         case EngineKVFormat::NL_X_NB_BS_HS:
-          LAUNCH_KERNEL_WITH_FORMAT(T, false, EngineKVFormat::NL_X_NB_BS_HS);
+            LAUNCH_KERNEL_WITH_FORMAT(
+              T, false, EngineKVFormat::NL_X_NB_BS_HS, USE_BLOCK_IDS);
           break;
         case EngineKVFormat::NL_X_NBBS_ONE_HS:
-          LAUNCH_KERNEL_WITH_FORMAT(T, false, EngineKVFormat::NL_X_NBBS_ONE_HS);
+            LAUNCH_KERNEL_WITH_FORMAT(
+              T, false, EngineKVFormat::NL_X_NBBS_ONE_HS, USE_BLOCK_IDS);
           break;
         default:
           throw std::runtime_error("Unsupported MLA EngineKVFormat");
@@ -460,10 +612,12 @@ void multi_layer_kv_transfer_templated(
     } else {
       switch (engine_kv_format) {
         case EngineKVFormat::NL_X_NB_BS_HS:
-          LAUNCH_KERNEL_WITH_FORMAT(T, true, EngineKVFormat::NL_X_NB_BS_HS);
+            LAUNCH_KERNEL_WITH_FORMAT(
+              T, true, EngineKVFormat::NL_X_NB_BS_HS, USE_BLOCK_IDS);
           break;
         case EngineKVFormat::NL_X_NBBS_ONE_HS:
-          LAUNCH_KERNEL_WITH_FORMAT(T, true, EngineKVFormat::NL_X_NBBS_ONE_HS);
+            LAUNCH_KERNEL_WITH_FORMAT(
+              T, true, EngineKVFormat::NL_X_NBBS_ONE_HS, USE_BLOCK_IDS);
           break;
         default:
           throw std::runtime_error("Unsupported MLA EngineKVFormat");
@@ -474,6 +628,7 @@ void multi_layer_kv_transfer_templated(
 
 #undef LAUNCH_KERNEL_WITH_FORMAT
 #undef LAUNCH_FUSED_KV_KERNEL_WITH_FORMAT
+#undef LAUNCH_FUSED_PACKED_KERNEL_WITH_FORMAT
 
 // ---------------------------------------------------------------------------
 // Public API: multi_layer_kv_transfer
@@ -484,10 +639,6 @@ void multi_layer_kv_transfer(
     const int page_buffer_size, const TransferDirection direction,
     const EngineKVFormat engine_kv_format, const int block_size,
     const int head_size, const int skip_prefix_n_tokens) {
-  // head_size is currently unused in the SYCL implementation; accepted to
-  // keep ABI parity with the CUDA cuda_ops binding so callers can pass the
-  // same kwargs to either backend.
-  (void)head_size;
   int num_origin_elements = key_value.size(3);
   int copy_size = num_origin_elements * key_value.element_size();
 
@@ -496,7 +647,7 @@ void multi_layer_kv_transfer(
     multi_layer_kv_transfer_templated<type>(                          \
         key_value, key_value_ptrs, slot_mapping, paged_memory_device, \
         page_buffer_size, direction, engine_kv_format, block_size,    \
-        skip_prefix_n_tokens);                                        \
+        head_size, skip_prefix_n_tokens);                              \
   } while (0)
   if (copy_size % 8 == 0) {
     LAUNCH_MULTI_LAYER_KV_TRANSFER(int64_t);
@@ -508,6 +659,40 @@ void multi_layer_kv_transfer(
     LAUNCH_MULTI_LAYER_KV_TRANSFER(int8_t);
   }
 #undef LAUNCH_MULTI_LAYER_KV_TRANSFER
+}
+
+void multi_layer_kv_transfer_block_ids(
+    torch::Tensor& key_value, const torch::Tensor& key_value_ptrs,
+    const torch::Tensor& block_ids, const torch::Device& paged_memory_device,
+    const int page_buffer_size, const TransferDirection direction,
+    const EngineKVFormat engine_kv_format, const int block_size,
+    const int head_size, const int skip_prefix_n_tokens) {
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+  TORCH_CHECK(block_ids.scalar_type() == torch::kInt64,
+              "block_ids must be int64");
+  TORCH_CHECK(block_ids.dim() == 1, "block_ids must be a 1D tensor");
+
+  int num_origin_elements = key_value.size(3);
+  int copy_size = num_origin_elements * key_value.element_size();
+
+#define LAUNCH_MULTI_LAYER_BLOCK_IDS(type)                              \
+  do {                                                                  \
+    multi_layer_kv_transfer_templated<type, true>(                       \
+        key_value, key_value_ptrs, block_ids, paged_memory_device,       \
+        page_buffer_size, direction, engine_kv_format, block_size,        \
+        head_size, skip_prefix_n_tokens);                                 \
+  } while (0)
+  if (copy_size % 8 == 0) {
+    LAUNCH_MULTI_LAYER_BLOCK_IDS(int64_t);
+  } else if (copy_size % 4 == 0) {
+    LAUNCH_MULTI_LAYER_BLOCK_IDS(int32_t);
+  } else if (copy_size % 2 == 0) {
+    LAUNCH_MULTI_LAYER_BLOCK_IDS(int16_t);
+  } else {
+    LAUNCH_MULTI_LAYER_BLOCK_IDS(int8_t);
+  }
+#undef LAUNCH_MULTI_LAYER_BLOCK_IDS
+
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +896,7 @@ void single_layer_kv_transfer(torch::Tensor& lmc_key_value_cache,
       single_layer_kv_transfer_impl<true, false>(
           queue, lmc_ptr, vllm_ptr, slot_ptr, num_tokens, n, lmc_stride,
           lmc_value_offset, block_size, vllm_block_key_stride_in_64bit,
+
           vllm_value_offset, num_heads, head_size_in_64bit, wg_size);
   } else {
     if (direction == TransferDirection::D2H)

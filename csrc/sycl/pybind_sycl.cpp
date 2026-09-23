@@ -5,13 +5,63 @@
 // Exposed as `lmcache.xpu_ops`.
 //
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <torch/torch.h>
+#include <sycl/sycl.hpp>
+#include <c10/xpu/XPUStream.h>
 
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <vector>
+
+#include "../kv_transfer_plan_types.h"
 #include "../kv_transfer_types.h"
 #include "cachegen_kernels_sycl.h"
 #include "mem_kernels_sycl.h"
 
 namespace py = pybind11;
+
+namespace {
+
+struct ThreadLocalBlockIdUsm {
+      int64_t* ptr = nullptr;
+      size_t capacity = 0;
+      sycl::context context;
+      bool has_context = false;
+
+      ~ThreadLocalBlockIdUsm() {
+            if (ptr != nullptr && has_context) {
+                  sycl::free(ptr, context);
+            }
+      }
+
+      torch::Tensor copy_from(const torch::Tensor& source,
+                              const sycl::queue& queue) {
+            const size_t count = static_cast<size_t>(source.numel());
+            const sycl::context& queue_context = queue.get_context();
+            if (ptr == nullptr || capacity < count ||
+                (has_context && context != queue_context)) {
+                  if (ptr != nullptr && has_context) {
+                        sycl::free(ptr, context);
+                  }
+                  ptr = sycl::malloc_host<int64_t>(count, queue_context);
+                  TORCH_CHECK(ptr != nullptr, "failed to allocate USM host block-ID buffer");
+                  capacity = count;
+                  context = queue_context;
+                  has_context = true;
+            }
+            std::memcpy(ptr, source.data_ptr<int64_t>(),
+                        count * sizeof(int64_t));
+            return torch::from_blob(
+                ptr, {static_cast<int64_t>(count)},
+                torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+      }
+};
+
+thread_local ThreadLocalBlockIdUsm g_block_id_usm;
+
+}  // namespace
 
 // TransferDirection / EngineKVFormat enums are owned and registered exclusively
 // by the `lmcache_native` module (csrc/lmcache_native/pybind.cpp).
@@ -19,6 +69,71 @@ namespace py = pybind11;
 // already registered" error, so xpu_ops accepts them as plain ints and casts.
 // Same convention as csrc/cuda/pybind.cpp (cuda_ops).
 PYBIND11_MODULE(xpu_ops, m) {
+      m.def(
+                  "multi_layer_block_kv_transfer",
+                  [](const torch::Tensor& paged_buffer_ptrs,
+                         const py::list& lmcache_objects_obj, const torch::Tensor& block_ids,
+                         const torch::Device& device, const int direction,
+                         const py::object& shape_desc_obj, const int lmcache_chunk_size,
+                         const int engine_kv_format, const int skip_prefix_n_blocks) {
+                        auto get_int = [&](const char* name) {
+                              return shape_desc_obj.attr(name).cast<int>();
+                        };
+                        PageBufferShapeDesc shape_desc{
+                                    get_int("kv_size"), get_int("nl"), get_int("nb"),
+                                    get_int("bs"), get_int("nh"), get_int("hs"),
+                                    get_int("element_size"), get_int("block_stride_elems")};
+                        TORCH_CHECK(lmcache_chunk_size > 0 && shape_desc.bs > 0 &&
+                                                                        lmcache_chunk_size % shape_desc.bs == 0,
+                                                            "invalid LMCache chunk/block size");
+                        const int blocks_per_object = lmcache_chunk_size / shape_desc.bs;
+
+                        auto block_ids_cpu = block_ids.to(torch::kCPU)
+                                                                                                 .to(torch::kInt64)
+                                                                                                 .contiguous();
+                        const int64_t total_blocks = block_ids_cpu.numel();
+
+                        std::vector<torch::Tensor> object_tensors;
+                        object_tensors.reserve(lmcache_objects_obj.size());
+                        for (const auto& item : lmcache_objects_obj) {
+                              const auto ptr = item.cast<uintptr_t>();
+                              auto options = torch::TensorOptions().dtype(
+                                          shape_desc.element_size == 4 ? torch::kFloat32
+                                                                                                                               : torch::kFloat16);
+                              object_tensors.push_back(torch::from_blob(
+                                          reinterpret_cast<void*>(ptr),
+                                          {shape_desc.kv_size, shape_desc.nl, lmcache_chunk_size,
+                                           shape_desc.nh * shape_desc.hs},
+                                          options));
+                        }
+                        TORCH_CHECK(!object_tensors.empty(),
+                                                            "lmcache_objects_ptrs must contain objects");
+                        TORCH_CHECK(total_blocks ==
+                                                                        static_cast<int64_t>(object_tensors.size()) *
+                                                                                    blocks_per_object,
+                                                            "block_ids length must equal objects * blocks_per_object");
+
+                        auto queue = c10::xpu::getCurrentXPUStream(device.index()).queue();
+                        auto block_ids_usm = g_block_id_usm.copy_from(block_ids_cpu, queue);
+                        for (size_t object_idx = 0; object_idx < object_tensors.size();
+                                     ++object_idx) {
+                              const int64_t block_base =
+                                          static_cast<int64_t>(object_idx) * blocks_per_object;
+                              auto object_block_ids = block_ids_usm.narrow(
+                                          0, block_base, blocks_per_object);
+                              auto& object = object_tensors[object_idx];
+                              multi_layer_kv_transfer_block_ids(
+                                          object, paged_buffer_ptrs, object_block_ids, device,
+                                          shape_desc.nb, static_cast<TransferDirection>(direction),
+                                          static_cast<EngineKVFormat>(engine_kv_format),
+                                          shape_desc.bs, shape_desc.hs,
+                                                              skip_prefix_n_blocks * shape_desc.bs);
+                        }
+                  },
+                  py::arg("paged_buffer_ptrs_tensor"), py::arg("lmcache_objects_ptrs"),
+                  py::arg("block_ids"), py::arg("device"), py::arg("direction"),
+                  py::arg("shape_desc"), py::arg("lmcache_chunk_size"),
+                  py::arg("engine_kv_format"), py::arg("skip_prefix_n_blocks"));
   m.def(
       "multi_layer_kv_transfer",
       [](torch::Tensor& key_value, const torch::Tensor& key_value_ptrs,

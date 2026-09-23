@@ -14,7 +14,7 @@ import msgspec
 import torch
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
@@ -65,19 +65,18 @@ logger = init_logger(__name__)
 # ``lmcache_driven``); ``auto`` reproduces the historical device-type-based
 # dispatch.
 ENV_MP_TRANSFER_MODE = "LMCACHE_MP_TRANSFER_MODE"
-
-
 # Helper functions
 def _supports_async_primitives() -> bool:
     """Probe whether the worker device supports the async store primitives.
 
-    The async engine-driven store path needs a stream, an event exposing
-    ``record``/``synchronize``/``wait``, and pinned (page-locked) host memory.
-    When any of these is unavailable, the factory falls back to the
+    The async engine-driven store path needs a stream and an event exposing
+    ``record``/``synchronize``/``wait``. It does not require pinned host
+    memory; the device runtime decides whether pageable transfers overlap.
+    When the stream/event primitives are unavailable, the factory falls back to
     synchronous :class:`EngineDrivenTransferContext`.
 
     Returns:
-        True if all required async primitives are available, else False.
+        True if the async stream/event primitives are available, else False.
     """
     if not hasattr(torch_dev, "Stream") or not hasattr(torch_dev, "Event"):
         return False
@@ -94,11 +93,6 @@ def _supports_async_primitives() -> bool:
             del stream, event
             return False
     del stream, event
-    try:
-        probe = torch.empty(1, dtype=torch.uint8, device="cpu", pin_memory=True)
-        del probe
-    except (RuntimeError, TypeError):
-        return False
     return True
 
 
@@ -1168,7 +1162,97 @@ class TransferContext(ABC):
             "Q ring store is not supported by this transfer context"
         )
 
-    @abstractmethod
+    def _store_shm_quantized_group_bounded(
+        self,
+        request_id: str,
+        plan: GroupTransferPlan,
+        group_kv_caches: dict[str, torch.Tensor],
+        group_block_ids: list[int],
+        selection: Any,
+        group_slots: list[torch.Tensor],
+    ) -> None:
+        """Process a quantized SHM group in bounded gather/encode batches."""
+        context = self._engine_driven_context
+        assert isinstance(context, EngineDrivenContextShm)
+        raw_shape = _raw_gather_shape(plan)
+        raw_dtype = plan.raw_layout_desc.dtypes[0]
+        for start, batch_index in enumerate(selection.chunk_indices):
+            batch_indices = [batch_index]
+            scratch = context.allocate_scratch_tensors(
+                raw_shape, raw_dtype, len(batch_indices), wait=False
+            )
+            raw_allocation = None
+            if scratch is not None:
+                raw_chunks, raw_allocation = scratch
+            else:
+                logger.debug(
+                    "SHM scratch unavailable for request_id=%s group=%s; "
+                    "using synchronous CPU fallback for %d chunks",
+                    request_id,
+                    plan.group_info.engine_group_id
+                    if plan.group_info is not None
+                    else -1,
+                    len(batch_indices),
+                )
+                raw_chunks = [torch.empty(raw_shape, dtype=raw_dtype) for _ in batch_indices]
+            split_allocation = None
+            try:
+                gathered = gather_paged_kv_to_cpu(
+                    group_kv_caches,
+                    group_block_ids,
+                    plan.blocks_per_chunk,
+                    layout_hints=self._layout_hints,
+                    engine_kv_format=plan.engine_kv_format,
+                    out=raw_chunks,
+                    chunk_indices=batch_indices,
+                )
+                torch_dev.synchronize()
+                mamba_splits = None
+                fused_head_splits = None
+                if (
+                    plan.group_info is not None
+                    and plan.group_info.cache_category == "mamba"
+                ):
+                    split = self._allocate_mamba_split_scratch(
+                        plan, len(gathered), context, wait=False
+                    )
+                    if split is not None:
+                        mamba_splits, split_allocation = split
+                elif plan.attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
+                    split = self._allocate_fused_head_split_scratch(
+                        plan, len(gathered), context, wait=False
+                    )
+                    if split is not None:
+                        fused_head_splits, split_allocation = split
+                if mamba_splits is not None:
+                    for raw_chunk, split in zip(gathered, mamba_splits, strict=True):
+                        self._kvweave_codec.split_mamba_chunk(  # type: ignore[union-attr]
+                            raw_chunk,
+                            plan.group_info.mamba_real_layout,
+                            plan.group_info.tokens_per_block,
+                            out=split,
+                        )
+                elif fused_head_splits is not None:
+                    for raw_chunk, head_split in zip(gathered, fused_head_splits, strict=True):
+                        self._kvweave_codec.split_fused_attention_heads(  # type: ignore[union-attr]
+                            raw_chunk,
+                            self._kvweave_codec._fused_head_num(raw_chunk.shape[-1]),  # type: ignore[union-attr]
+                            self._kvweave_codec._fused_head_dim(raw_chunk.shape[-1]),  # type: ignore[union-attr]
+                            out=head_split,
+                        )
+                self._encode_group_chunks_into_slots(
+                    plan,
+                    gathered,
+                            group_slots[start : start + len(gathered)],
+                    mamba_splits,
+                    fused_head_splits,
+                )
+            finally:
+                if split_allocation is not None:
+                    context.free_scratch(split_allocation)
+                if raw_allocation is not None:
+                    context.free_scratch(raw_allocation)
+
     def submit_store(
         self,
         request_id: str,
@@ -1590,6 +1674,50 @@ class EngineDrivenTransferContext(TransferContext):
         plan = self._group_plans[0]
         yield plan, plan.select_kv_caches(kv_caches), _single_group_block_ids(block_ids)
 
+    def _warmup_quantized_engine_transfer(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> None:
+        """Warm transfer kernels only for groups enabled for quantization."""
+        if not isinstance(self._engine_driven_context, EngineDrivenContextShm):
+            return
+        if torch_device_type != "xpu":
+            return
+        for plan in self._group_plans:
+            if not plan.quantized:
+                continue
+            allocation = None
+            try:
+                scratch = self._engine_driven_context.allocate_scratch_tensors(
+                    _raw_gather_shape(plan),
+                    plan.raw_layout_desc.dtypes[0],  # type: ignore[union-attr]
+                    1,
+                    wait=True,
+                )
+                if scratch is None:
+                    raise RuntimeError("scratch allocation unavailable")
+                scratch_chunks, allocation = scratch
+                gather_paged_kv_to_cpu(
+                    plan.select_kv_caches(kv_caches),
+                    [0] * plan.blocks_per_chunk,
+                    plan.blocks_per_chunk,
+                    layout_hints=self._layout_hints,
+                    engine_kv_format=plan.engine_kv_format,
+                    out=scratch_chunks,
+                )
+                torch_dev.synchronize()
+            except Exception:
+                logger.warning(
+                    "Quantized transfer warmup failed for engine_group_id=%s; "
+                    "the first request may pay kernel startup cost",
+                    plan.group_info.engine_group_id
+                    if plan.group_info is not None
+                    else -1,
+                    exc_info=True,
+                )
+            finally:
+                if allocation is not None:
+                    self._engine_driven_context.free_scratch(allocation)
+
     def register(
         self,
         instance_id: int,
@@ -1661,6 +1789,7 @@ class EngineDrivenTransferContext(TransferContext):
             kvweave_config,
             self._kvweave_codec,
         )
+        self._warmup_kvweave_quant()
         # chunk_shape already carries this group's own hidden_dim_size, so
         # the server can size each group's SHM buffer instead of reusing
         # the shared one.
@@ -1730,6 +1859,7 @@ class EngineDrivenTransferContext(TransferContext):
             scratch_offset=scratch_offset,
             scratch_size=scratch_size,
         )
+        self._warmup_quantized_engine_transfer(kv_caches)
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
         logger.info(
             "Worker non-GPU transfer context registered (instance_id=%d, mode=%s, "
@@ -1752,6 +1882,39 @@ class EngineDrivenTransferContext(TransferContext):
                 tuple(plan.chunk_shape),
                 plan.quantized,
             )
+
+    def _warmup_kvweave_quant(self) -> None:
+        """Force the native kvweave_quant OpenMP thread pool to spin up now.
+
+        Without this, the first real ``encode_chunk`` call after
+        registration pays the OpenMP thread-team creation/wake cost on the
+        request's own critical path (observed as an outlier ``encode``
+            stage, tens of ms slower than steady-state, in per-group processing
+        timing logs). One dummy encode per quantized group's raw shape/
+        dtype absorbs that cost here instead, using zero-filled CPU tensors
+        that are discarded immediately.
+        """
+        for plan in self._group_plans:
+            if not plan.quantized:
+                continue
+            assert self._kvweave_codec is not None
+            try:
+                dummy = torch.zeros(
+                    plan.chunk_shape,
+                    dtype=plan.raw_layout_desc.dtypes[0]
+                    if plan.raw_layout_desc is not None
+                    else torch.float16,
+                )
+                self._encode_group_chunks(plan, [dummy])
+            except Exception:
+                logger.warning(
+                    "KVWeave quant warmup failed for engine_group_id=%s; "
+                    "the first real store may pay OpenMP startup cost",
+                    plan.group_info.engine_group_id
+                    if plan.group_info is not None
+                    else None,
+                    exc_info=True,
+                )
 
     def create_recorded_event(self) -> IPCEvent | None:
         """Return no event for the synchronous engine-driven transfer path.
@@ -1917,7 +2080,7 @@ class EngineDrivenTransferContext(TransferContext):
             or plan.raw_layout_desc is None
         ):
             return None
-        raw_shape = plan.raw_layout_desc.shapes[0]
+        raw_shape = _raw_gather_shape(plan)
         layers = int(raw_shape[1] if len(raw_shape) == 4 else raw_shape[0])
         blocks = max(int(raw_shape[-2]) // group_info.tokens_per_block, 1)
         specs = [
@@ -2011,7 +2174,7 @@ class EngineDrivenTransferContext(TransferContext):
             if plan.group_info is not None
             else self._block_size
         )
-        raw_shape = plan.raw_layout_desc.shapes[0]
+        raw_shape = _raw_gather_shape(plan)
         raw_dtype = plan.raw_layout_desc.dtypes[0]
         if out is not None and len(out) != len(group_chunks):
             raise ValueError("out must contain one tensor per retrieved chunk")
@@ -2122,6 +2285,20 @@ class EngineDrivenTransferContext(TransferContext):
             # below, since ``EngineDrivenContextShm.commit_store`` never
             # transmits ``chunks`` -- SHM mode only releases the write lock,
             # so data must already be in the slot by the time it's called.
+            if (
+                group_slots is not None
+                and plan.quantized
+                and isinstance(self._engine_driven_context, EngineDrivenContextShm)
+            ):
+                self._store_shm_quantized_group_bounded(
+                    _request_id,
+                    plan,
+                    group_kv_caches,
+                    group_block_ids,
+                    selection,
+                    group_slots,
+                )
+                continue
             scratch_allocation: ScratchAllocation | None = None
             group_out_buffers = group_slots
             if plan.quantized and isinstance(
@@ -2273,6 +2450,59 @@ class EngineDrivenTransferContext(TransferContext):
         future = MessagingFuture()
         future.set_result(ok)
         return future
+
+    def _decode_and_scatter_group(
+        self,
+        request_id: str,
+        plan: GroupTransferPlan,
+        group_kv_caches: dict[str, torch.Tensor],
+        scatter_block_ids: list[int],
+        group_chunks: list[torch.Tensor],
+        skip_first_n_tokens: int,
+        decode_scratch_allocations: list[ScratchAllocation],
+    ) -> list[torch.Tensor]:
+        """Decode and scatter quantized chunks serially."""
+        if not isinstance(self._engine_driven_context, EngineDrivenContextShm):
+            raise RuntimeError("Quantized retrieve requires SHM context")
+        raw_shape = _raw_gather_shape(plan)
+        raw_dtype = plan.raw_layout_desc.dtypes[0]  # type: ignore[union-attr]
+        for start, chunk in enumerate(group_chunks):
+            batch = [chunk]
+            scratch = self._engine_driven_context.allocate_scratch_tensors(
+                raw_shape, raw_dtype, len(batch), wait=False
+            )
+            decode_targets: list[torch.Tensor] | None = None
+            allocation: ScratchAllocation | None = None
+            if scratch is not None:
+                decode_targets, allocation = scratch
+            else:
+                logger.info(
+                    "Engine-driven retrieve scratch unavailable for request_id=%s "
+                    "group=%s chunks=%d; falling back to CPU decode buffers",
+                    request_id,
+                    plan.group_info.engine_group_id
+                    if plan.group_info is not None
+                    else -1,
+                    len(batch),
+                )
+
+            decoded = self._decode_group_chunks(plan, batch, out=decode_targets)
+            batch_block_start = start * plan.blocks_per_chunk
+            batch_block_end = batch_block_start + len(decoded) * plan.blocks_per_chunk
+            batch_block_ids = scatter_block_ids[batch_block_start:batch_block_end]
+            scatter_cpu_to_paged_kv(
+                group_kv_caches,
+                batch_block_ids,
+                decoded,
+                plan.blocks_per_chunk,
+                skip_first_n_tokens=skip_first_n_tokens,
+                layout_hints=self._layout_hints,
+                engine_kv_format=plan.engine_kv_format,
+            )
+            torch_dev.synchronize()
+            if allocation is not None:
+                self._engine_driven_context.free_scratch(allocation)
+        return []
 
     def submit_retrieve(
         self,

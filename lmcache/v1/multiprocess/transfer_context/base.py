@@ -20,13 +20,15 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 import inspect
+import ctypes
+import threading
 
 # Third Party
 import numpy as np
 import torch
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
@@ -40,6 +42,56 @@ if TYPE_CHECKING:
     pass
 
 logger = init_logger(__name__)
+
+_XPU_H2D_USM_POOL_LOCK = threading.Lock()
+_XPU_H2D_USM_POOL: dict[int, list[tuple[int, object]]] = {}
+_XPU_USM_POOL_MAX_PER_SIZE = 1
+_XPU_TRANSFER_TENSOR_CACHE_LOCK = threading.Lock()
+_XPU_TRANSFER_TENSOR_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
+_XPU_TRANSFER_TENSOR_CACHE_LIMIT = 256
+def _cached_xpu_long_tensor(
+    values: list[int], device: torch.device, kind: str
+) -> torch.Tensor:
+    """Reuse XPU transfer tensors across requests.
+
+    Layer pointers are immutable for a KV group and are cached by value.
+    Block IDs change on every request, so their tensor is pooled by length and
+    updated in place instead of allocating a new XPU tensor for each request.
+    """
+    key = (kind, device.type, device.index, *values)
+    with _XPU_TRANSFER_TENSOR_CACHE_LOCK:
+        cached = _XPU_TRANSFER_TENSOR_CACHE.get(key)
+        if cached is not None:
+            return cached
+    if kind == "layer_ptrs":
+        raw = np.asarray(values, dtype=np.uint64).view(np.int64)
+        tensor = torch.from_numpy(raw).to(device=device)
+    else:
+        tensor = torch.tensor(values, dtype=torch.int64, device=device)
+    with _XPU_TRANSFER_TENSOR_CACHE_LOCK:
+        if len(_XPU_TRANSFER_TENSOR_CACHE) >= _XPU_TRANSFER_TENSOR_CACHE_LIMIT:
+            _XPU_TRANSFER_TENSOR_CACHE.pop(next(iter(_XPU_TRANSFER_TENSOR_CACHE)))
+        _XPU_TRANSFER_TENSOR_CACHE[key] = tensor
+    return tensor
+
+
+def _return_xpu_usm_buffer(nbytes: int, ptr: int, buffer: object) -> None:
+    """Return a USM buffer to its bounded size bucket or release it."""
+    with _XPU_H2D_USM_POOL_LOCK:
+        bucket = _XPU_H2D_USM_POOL.setdefault(nbytes, [])
+        if len(bucket) < _XPU_USM_POOL_MAX_PER_SIZE:
+            bucket.append((ptr, buffer))
+            return
+    from lmcache import device_ops
+
+    device_ops.free_pinned_ptr(ptr)
+
+
+def set_xpu_usm_pool_max_per_size(max_buffers: int) -> None:
+    """Set the per-size USM pool limit from the transfer worker count."""
+    global _XPU_USM_POOL_MAX_PER_SIZE
+    with _XPU_H2D_USM_POOL_LOCK:
+        _XPU_USM_POOL_MAX_PER_SIZE = max(1, int(max_buffers))
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +148,130 @@ logger.info(
     "multi_layer_block_kv_transfer mode: %s",
     "tensor" if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR else "ptr",
 )
+
+
+def _multi_layer_block_kv_transfer(
+    paged_buffer_ptrs: torch.Tensor | list[torch.Tensor],
+    lmcache_objects: list[int] | list[torch.Tensor],
+    block_ids: torch.Tensor | list[int],
+    device: torch.device,
+    direction: lmcache_native.TransferDirection,
+    shape_desc: object,
+    lmcache_chunk_size: int,
+    engine_kv_format: lmcache_native.EngineKVFormat,
+    skip_prefix_n_blocks: int,
+    fallback_paged_buffer: list[torch.Tensor] | None = None,
+    fallback_objects: list[torch.Tensor] | None = None,
+) -> None:
+    """Use the native transfer when its layout coverage is available."""
+    from lmcache import device_ops
+    from lmcache.v1.platform import torch_ops
+
+    native_xpu_format = (
+        lmcache_native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
+    )
+    if (
+        device.type == "xpu"
+        and engine_kv_format != native_xpu_format
+        and fallback_paged_buffer is not None
+        and fallback_objects is not None
+    ):
+        torch_ops.multi_layer_block_kv_transfer(
+            fallback_paged_buffer,
+            fallback_objects,
+            block_ids,
+            device,
+            direction,
+            shape_desc,
+            lmcache_chunk_size,
+            engine_kv_format,
+            skip_prefix_n_blocks,
+        )
+        return
+
+    usm_ptrs: list[int] = []
+    usm_buffers: list[object] = []
+    if (
+        device.type == "xpu"
+        and direction == lmcache_native.TransferDirection.H2D
+        and engine_kv_format == native_xpu_format
+        and fallback_objects is not None
+    ):
+        try:
+            staged_objects: list[int] = []
+            pooled_buffers: list[tuple[int, object]] = []
+            for source in fallback_objects:
+                source_contiguous = source.contiguous()
+                nbytes = int(source_contiguous.numel()) * source_contiguous.element_size()
+                with _XPU_H2D_USM_POOL_LOCK:
+                    bucket = _XPU_H2D_USM_POOL.get(nbytes)
+                    pooled = bucket.pop() if bucket else None
+                if pooled is None:
+                    ptr = device_ops.alloc_pinned_ptr(nbytes)
+                    buffer = (ctypes.c_uint8 * nbytes).from_address(ptr)
+                else:
+                    ptr, buffer = pooled
+                ctypes.memmove(ptr, source_contiguous.data_ptr(), nbytes)
+                usm_ptrs.append(ptr)
+                usm_buffers.append((buffer, source_contiguous))
+                pooled_buffers.append((ptr, buffer))
+                staged_objects.append(ptr)
+            device_ops.multi_layer_block_kv_transfer(
+                paged_buffer_ptrs,
+                staged_objects,
+                block_ids,
+                device,
+                direction,
+                shape_desc,
+                lmcache_chunk_size,
+                engine_kv_format,
+                skip_prefix_n_blocks,
+            )
+            torch_dev.synchronize()
+            return
+        finally:
+            for nbytes, (ptr, buffer) in zip(
+                [int(source.numel()) * source.element_size() for source in fallback_objects],
+                pooled_buffers,
+                strict=True,
+            ):
+                _return_xpu_usm_buffer(nbytes, ptr, buffer)
+            usm_ptrs.clear()
+            usm_buffers.clear()
+
+    try:
+        device_ops.multi_layer_block_kv_transfer(
+            paged_buffer_ptrs,
+            lmcache_objects,
+            block_ids,
+            device,
+            direction,
+            shape_desc,
+            lmcache_chunk_size,
+            engine_kv_format,
+            skip_prefix_n_blocks,
+        )
+    except RuntimeError as exc:
+        if "Unsupported" not in str(exc) or "EngineKVFormat" not in str(exc):
+            raise
+        logger.debug(
+            "Falling back to torch KV transfer for unsupported XPU format=%s",
+            engine_kv_format,
+        )
+        if fallback_paged_buffer is not None and fallback_objects is not None:
+            paged_buffer_ptrs = fallback_paged_buffer
+            lmcache_objects = fallback_objects
+        torch_ops.multi_layer_block_kv_transfer(
+            paged_buffer_ptrs,
+            lmcache_objects,
+            block_ids,
+            device,
+            direction,
+            shape_desc,
+            lmcache_chunk_size,
+            engine_kv_format,
+            skip_prefix_n_blocks,
+        )
 
 
 def _tensors_to_ptrs(tensors: list[torch.Tensor]) -> list[int]:
@@ -421,6 +597,9 @@ def gather_paged_kv_to_cpu(
     requires_pinned = not _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR
     needs_staging = False
     staged_chunks = []
+    staged_pinned_ptrs: list[int] = []
+    staged_pinned_buffers: list[object] = []
+    staged_pinned_sizes: list[int] = []
 
     if out is None:
         # One object plane per K/V entry: MLA and fused-K/V formats
@@ -454,14 +633,36 @@ def gather_paged_kv_to_cpu(
             # would allocate new tensors, breaking the caller's expectation
             # of an in-place update. Instead, we allocate a temporary pinned
             # staging buffer for the C++ kernel to write to safely.
-            logger.warning(
+            logger.debug(
                 "Unpinned memory detected in 'out' during "
                 "gather_paged_kv_to_cpu (likely Shared Memory). "
                 "Using an internal pinned staging buffer, which "
                 "adds a CPU memory copy overhead."
             )
             needs_staging = True
-            staged_chunks = [torch.empty_like(t, pin_memory=True) for t in _target_out]
+            if torch_device_type == "xpu" and not _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
+                staged_chunks = []
+                for target in _target_out:
+                    nbytes = int(target.numel()) * target.element_size()
+                    with _XPU_H2D_USM_POOL_LOCK:
+                        bucket = _XPU_H2D_USM_POOL.get(nbytes)
+                        pooled = bucket.pop() if bucket else None
+                    if pooled is None:
+                        ptr = device_ops.alloc_pinned_ptr(nbytes)
+                        buffer_type = ctypes.c_uint8 * nbytes
+                        buffer = buffer_type.from_address(ptr)
+                    else:
+                        ptr, buffer = pooled
+                    staged_pinned_ptrs.append(ptr)
+                    staged_pinned_buffers.append(buffer)
+                    staged_pinned_sizes.append(nbytes)
+                    staged_chunks.append(
+                        torch.frombuffer(buffer, dtype=target.dtype).view(target.shape)
+                    )
+            else:
+                staged_chunks = [
+                    torch.empty_like(t, pin_memory=True) for t in _target_out
+                ]
             chunks = (
                 staged_chunks  # Point to the safe staging buffer for the H2D transfer
             )
@@ -490,7 +691,7 @@ def gather_paged_kv_to_cpu(
             block_ids_arg = selected_block_ids
 
             # call kernel in one shot
-            device_ops.multi_layer_block_kv_transfer(
+            _multi_layer_block_kv_transfer(
                 paged_arg,
                 objs_arg,
                 block_ids_arg,
@@ -500,25 +701,40 @@ def gather_paged_kv_to_cpu(
                 chunk_tokens,
                 engine_kv_format,
                 0,
+                fallback_paged_buffer=normalized,
+                fallback_objects=chunks,
             )
 
         else:
             # Compiled C++/CUDA/XPU: requires int64 pointer tensor and list[int].
-            _ptrs_np = np.array(
-                get_group_data_ptrs(
-                    normalized, engine_kv_format, list(range(num_layers))
-                ),
-                dtype=np.uint64,
-            ).view(np.int64)
-            paged_arg = torch.from_numpy(_ptrs_np).to(device=get_device(normalized))
+            transfer_device = get_device(normalized)
+            layer_ptrs = get_group_data_ptrs(
+                normalized, engine_kv_format, list(range(num_layers))
+            )
+            if transfer_device.type == "xpu":
+                paged_arg = _cached_xpu_long_tensor(
+                    layer_ptrs, transfer_device, "layer_ptrs"
+                )
+            else:
+                _ptrs_np = np.array(layer_ptrs, dtype=np.uint64).view(np.int64)
+                paged_arg = torch.from_numpy(_ptrs_np).to(device=transfer_device)
 
             # This safely points to either the pre-pinned chunks
             # OR the temporary staged_chunks
             objs_arg = _tensors_to_ptrs(chunks)
 
-            block_ids_arg = torch.tensor(
-                selected_block_ids, dtype=torch.int64, device=get_device(normalized)
-            )
+            if transfer_device.type == "xpu":
+                # The XPU native binding consumes block IDs on the host and
+                # expands them into device slot mappings. Uploading them to
+                # XPU here only creates an unnecessary device-to-host round
+                # trip inside the binding.
+                block_ids_arg = torch.as_tensor(
+                    selected_block_ids, dtype=torch.int64
+                )
+            else:
+                block_ids_arg = torch.tensor(
+                    selected_block_ids, dtype=torch.int64, device=transfer_device
+                )
 
             # Split transfer to respect CUDA kernel's object count limitation
             MAX_OBJECTS = 4
@@ -536,7 +752,7 @@ def gather_paged_kv_to_cpu(
                 batch_blocks = block_ids_arg[start_block:end_block]
 
                 # Execute batched transfer
-                device_ops.multi_layer_block_kv_transfer(
+                _multi_layer_block_kv_transfer(
                     paged_arg,
                     batch_objs_ptrs,
                     batch_blocks,
@@ -546,7 +762,10 @@ def gather_paged_kv_to_cpu(
                     chunk_tokens,
                     engine_kv_format,
                     0,
+                    fallback_paged_buffer=normalized,
+                    fallback_objects=chunks,
                 )
+
 
     # --- Final reconciliation ---
     # If we used a staging buffer to protect unpinned shared memory,
@@ -566,6 +785,16 @@ def gather_paged_kv_to_cpu(
         else:
             chunks = _target_out
 
+        for nbytes, ptr, buffer in zip(
+            staged_pinned_sizes,
+            staged_pinned_ptrs,
+            staged_pinned_buffers,
+            strict=True,
+        ):
+            _return_xpu_usm_buffer(nbytes, ptr, buffer)
+        staged_pinned_ptrs.clear()
+        staged_pinned_buffers.clear()
+        staged_pinned_sizes.clear()
     # Fast path: The async GPU copy might still be in progress.
     # We intentionally omit synchronization here for performance.
     # WARNING: The caller MUST explicitly call `torch_dev.synchronize()`
@@ -681,7 +910,7 @@ def scatter_cpu_to_paged_kv(
         objs_arg = chunks
         block_ids_arg = selected_block_ids
 
-        device_ops.multi_layer_block_kv_transfer(
+        _multi_layer_block_kv_transfer(
             paged_arg,
             objs_arg,
             block_ids_arg,
@@ -691,6 +920,8 @@ def scatter_cpu_to_paged_kv(
             chunk_tokens,
             engine_kv_format,
             skip_prefix_n_blocks,
+            fallback_paged_buffer=normalized,
+            fallback_objects=chunks,
         )
     else:
         # assuming this is c ops path which requires pin memory
@@ -698,9 +929,17 @@ def scatter_cpu_to_paged_kv(
         # Defensive check: Ensure all incoming CPU chunks are pinned memory.
         # Otherwise, the underlying CUDA kernel may throw an Illegal
         # Memory Access error during H2D transfer.
-        dynamically_pinned = not all(chunk.is_pinned() for chunk in chunks)
+        use_xpu_usm_staging = (
+            torch_device_type == "xpu"
+            and engine_kv_format
+            == lmcache_native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
+        )
+        dynamically_pinned = (
+            not use_xpu_usm_staging
+            and not all(chunk.is_pinned() for chunk in chunks)
+        )
         if dynamically_pinned:
-            logger.warning(
+            logger.debug(
                 "Received unpinned CPU tensors in scatter_cpu_to_paged_kv. "
                 "Dynamically pinning memory now, which may incur additional"
                 "synchronization overhead."
@@ -717,9 +956,15 @@ def scatter_cpu_to_paged_kv(
         ).view(np.int64)
         paged_arg = torch.from_numpy(_ptrs_np).to(device=get_device(normalized))
         objs_arg = _tensors_to_ptrs(chunks)
-        block_ids_arg = torch.tensor(
-            selected_block_ids, dtype=torch.int64, device=get_device(normalized)
-        )
+        transfer_device = get_device(normalized)
+        if transfer_device.type == "xpu":
+            # xpu_ops reads block IDs on the host and performs the required
+            # slot-mapping upload itself; keep this tensor on CPU.
+            block_ids_arg = torch.as_tensor(selected_block_ids, dtype=torch.int64)
+        else:
+            block_ids_arg = torch.tensor(
+                selected_block_ids, dtype=torch.int64, device=transfer_device
+            )
 
         # Batched transfer to satisfy cuda's limitation (max 4 objects)
         MAX_OBJECTS = 4
@@ -739,7 +984,7 @@ def scatter_cpu_to_paged_kv(
             batch_blocks = block_ids_arg[start_block:end_block]
 
             # Execute transfer for this batch
-            device_ops.multi_layer_block_kv_transfer(
+            _multi_layer_block_kv_transfer(
                 paged_arg,
                 batch_objs_ptrs,
                 batch_blocks,
@@ -749,7 +994,10 @@ def scatter_cpu_to_paged_kv(
                 chunk_tokens,
                 engine_kv_format,
                 skip_prefix_n_blocks if i == 0 else 0,
+                fallback_paged_buffer=normalized,
+                fallback_objects=chunks[i : i + MAX_OBJECTS],
             )
+
     # Fast path: The async GPU copy might still be in progress.
     # We intentionally omit synchronization here for performance.
     # WARNING: The caller MUST explicitly call `torch_dev.synchronize()`
@@ -765,4 +1013,7 @@ def scatter_cpu_to_paged_kv(
         # cannot cover this: by then the temporaries are already gone.
         # Only the dynamically pinned case pays this; caller-owned pinned
         # chunks keep the fast path.
+        torch_dev.synchronize()
+
+    if torch_device_type == "xpu" and not dynamically_pinned:
         torch_dev.synchronize()

@@ -15,7 +15,10 @@ from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.serde.kvweave.kvweave_config import AttentionPlaneLayout
 from lmcache.v1.multiprocess.futures import MessagingFuture
-from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
+from lmcache.v1.multiprocess.transfer_context.base import (
+    gather_paged_kv_to_cpu,
+    set_xpu_usm_pool_max_per_size,
+)
 from lmcache.v1.multiprocess.scratch_allocator import ScratchAllocation
 from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
@@ -32,8 +35,6 @@ logger = init_logger(__name__)
 # async engine-driven store path. >1 so that a slow gather for one store does
 # not block the commit of another store whose gather already finished.
 DEFAULT_ENGINE_DRIVEN_COMMIT_WORKERS = 4
-
-
 # TODO: async retrieve path TBD, but benefit might be very limited
 class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
     """Fully async engine-driven data transfer context (store-only async).
@@ -86,6 +87,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         """
         super().__init__()
         self._commit_workers = max(1, int(commit_workers))
+        set_xpu_usm_pool_max_per_size(self._commit_workers)
         self._copy_stream: Any = torch_dev.Stream()
         self._commit_executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=self._commit_workers,
@@ -166,6 +168,124 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         with self._inflight_lock:
             for key, bucket in buckets.items():
                 self._staging_pool.setdefault(key, []).extend(bucket)
+
+    def _process_shm_quantized_group(
+        self,
+        request_id: str,
+        plan: Any,
+        group_kv_caches: dict[str, torch.Tensor],
+        group_block_ids: list[int],
+        selection: Any,
+        group_slots: list[torch.Tensor],
+        ordering_event: Any,
+    ) -> None:
+        """Process quantized SHM chunks serially."""
+        context = self._engine_driven_context
+        assert isinstance(context, EngineDrivenContextShm)
+        raw_shape = _raw_gather_shape(plan)
+        raw_dtype = plan.raw_layout_desc.dtypes[0]
+        chunk_indices = selection.chunk_indices
+        def launch_window(
+            start: int,
+        ) -> tuple[list[torch.Tensor], ScratchAllocation | None, bool, Any]:
+            batch_indices = [chunk_indices[start]]
+            raw_scratch = context.allocate_scratch_tensors(
+                raw_shape, raw_dtype, len(batch_indices), wait=False
+            )
+            raw_allocation = None
+            used_fallback = False
+            if raw_scratch is not None:
+                raw_targets, raw_allocation = raw_scratch
+            else:
+                raw_targets = self._alloc_pinned_staging(
+                    raw_shape, raw_dtype, len(batch_indices)
+                )
+                used_fallback = True
+                logger.debug(
+                    "SHM scratch unavailable for request_id=%s group=%s; "
+                    "using CPU fallback for %d chunks",
+                    request_id,
+                    plan.group_info.engine_group_id
+                    if plan.group_info is not None
+                    else -1,
+                    len(batch_indices),
+                )
+            event = torch_dev.Event()
+            with torch.inference_mode(), torch_dev.stream(self._copy_stream):
+                if start == 0:
+                    ordering_event.wait(stream=self._copy_stream)
+                gathered = gather_paged_kv_to_cpu(
+                    group_kv_caches,
+                    group_block_ids,
+                    plan.blocks_per_chunk,
+                    layout_hints=self._layout_hints,
+                    engine_kv_format=plan.engine_kv_format,
+                    out=raw_targets,
+                    chunk_indices=batch_indices,
+                )
+                event.record(self._copy_stream)
+            return gathered, raw_allocation, used_fallback, event
+
+        def process_window(
+            start: int,
+            pending: tuple[list[torch.Tensor], ScratchAllocation | None, bool, Any],
+        ) -> None:
+            gathered, raw_allocation, used_fallback, event = pending
+            event.synchronize()
+            split_allocation = None
+            try:
+                mamba_splits = None
+                fused_head_splits = None
+                if (
+                    plan.group_info is not None
+                    and plan.group_info.cache_category == "mamba"
+                ):
+                    split = self._allocate_mamba_split_scratch(
+                        plan, len(gathered), context, wait=False
+                    )
+                    if split is not None:
+                        mamba_splits, split_allocation = split
+                elif plan.attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
+                    split = self._allocate_fused_head_split_scratch(
+                        plan, len(gathered), context, wait=False
+                    )
+                    if split is not None:
+                        fused_head_splits, split_allocation = split
+                if mamba_splits is not None:
+                    for raw_chunk, split in zip(gathered, mamba_splits, strict=True):
+                        self._kvweave_codec.split_mamba_chunk(  # type: ignore[union-attr]
+                            raw_chunk,
+                            plan.group_info.mamba_real_layout,
+                            plan.group_info.tokens_per_block,
+                            out=split,
+                        )
+                elif fused_head_splits is not None:
+                    for raw_chunk, head_split in zip(
+                        gathered, fused_head_splits, strict=True
+                    ):
+                        self._kvweave_codec.split_fused_attention_heads(  # type: ignore[union-attr]
+                            raw_chunk,
+                            self._kvweave_codec._fused_head_num(raw_chunk.shape[-1]),  # type: ignore[union-attr]
+                            self._kvweave_codec._fused_head_dim(raw_chunk.shape[-1]),  # type: ignore[union-attr]
+                            out=head_split,
+                        )
+                self._encode_group_chunks_into_slots(
+                    plan, gathered, group_slots[start : start + len(gathered)],
+                    mamba_splits,
+                    fused_head_splits,
+                )
+            finally:
+                if split_allocation is not None:
+                    context.free_scratch(split_allocation)
+                if raw_allocation is not None:
+                    context.free_scratch(raw_allocation)
+                if used_fallback:
+                    self._release_staging(gathered)
+
+        if not chunk_indices:
+            return
+        for start in range(len(chunk_indices)):
+            process_window(start, launch_window(start))
 
     def create_recorded_event(self) -> IPCEvent:
         """Create a local event that orders compute before the copy stream.
@@ -329,6 +449,23 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                 if out_buffers is not None
                                 else None
                             )
+                            if (
+                                group_slots is not None
+                                and plan.quantized
+                                and isinstance(
+                                    engine_driven_context, EngineDrivenContextShm
+                                )
+                            ):
+                                self._process_shm_quantized_group(
+                                    _request_id,
+                                    plan,
+                                    group_kv_caches,
+                                    group_block_ids,
+                                    selection,
+                                    group_slots,
+                                    _event,
+                                )
+                                continue
                             # A quantized group's SHM slot is sized for the
                             # *quantized* (uint8) payload, not this group's
                             # raw KV tensor shape/dtype -- gathering the raw
@@ -420,7 +557,6 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
 
                         gather_done = torch_dev.Event()
                         gather_done.record(self._copy_stream)
-
                     with self._inflight_lock:
                         if gather_done is not None:
                             self._inflight_gather_events.add(gather_done)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Concurrent multi-chunk engine-driven SHM store correctness + timing bench.
+"""Single-request multi-chunk engine-driven SHM store/retrieve timing bench.
 
 Manual timing script (run directly with ``python``, not through pytest):
 exercises :class:`AsyncEngineDrivenTransferContext.submit_store` the way real
@@ -34,10 +34,11 @@ gather/commit ever raced and one request's bytes clobbered another's SHM
 region, the corrupted request's retrieved data would no longer match its
 own original input.
 
-Also times ``_NUM_REQUESTS`` concurrent ``submit_store`` calls (fire all,
-then wait for all futures) against the same ``_NUM_REQUESTS`` stores run
-strictly one-at-a-time (submit, wait, submit next), to quantify the overlap
-the ``commit_executor`` thread pool provides for multi-chunk stores.
+The performance run uses one request and varies the bounded pipeline buffer
+pool depth. Each pipeline window contains one chunk; depth controls how many
+raw/decode buffer slots may be in flight, not the number of chunks in a
+window. This isolates chunk-level pipeline behavior from request-level
+executor concurrency.
 
 Like ``bench_engine_driven_shm_timing.py``, the whole run above is executed
 twice: once with the group unquantized (registration's real, automatic
@@ -74,11 +75,17 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
-from lmcache.v1.distributed.serde.kvweave.kvweave_config import AttentionPlaneLayout
+from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
+    AttentionPlaneLayout,
+    MambaCodecOptions,
+)
 from lmcache.v1.distributed.serde.kvweave.kvweave_serde import _KVWeaveCodec
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.futures import MessagingFuture
-from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.group_view import (
+    EngineGroupInfo,
+    MambaSubStateWireLayout,
+)
 from lmcache.v1.multiprocess.posix_shm import (
     shm_create_readwrite,
     shm_munmap,
@@ -97,6 +104,7 @@ from lmcache.v1.multiprocess.transfer_context.async_engine_driven import (
 from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
+    _raw_gather_shape,
 )
 
 try:
@@ -120,31 +128,45 @@ class _CompletedFuture:
         return self._value
 
 
-# Small, deliberately non-quantized single-group attention geometry: one
-# real vLLM non-MLA fused-K/V layout ([NB, BS, NH, CS]), same shape family as
-# bench_engine_driven_shm_timing.py's ``_attention_kv_caches`` but scaled to
-# hold many requests' disjoint block ranges instead of just one chunk.
-_NUM_LAYERS = 8
+# Qwen3.5-style single-group attention geometry: one real vLLM non-MLA
+# fused-K/V layout ([NB, BS, NH, CS]), matching the 32 MiB raw chunk used by
+# bench_engine_driven_shm_timing.py. This benchmark intentionally uses one
+# request, so the chunk size reflects the real workload.
+_NUM_ATTENTION_LAYERS = 8
+_NUM_MAMBA_GROUPS = 3
+_MAMBA_LAYERS_PER_GROUP = 8
+_NUM_MAMBA_LAYERS = _NUM_MAMBA_GROUPS * _MAMBA_LAYERS_PER_GROUP
+_NUM_LAYERS = _NUM_ATTENTION_LAYERS + _NUM_MAMBA_LAYERS
 _NUM_KV_HEADS = 4
-_HEAD_DIM = 64
-_BLOCK_SIZE = 16
+_HEAD_DIM = 256
+_BLOCK_SIZE = 1024
 _BLOCKS_IN_CHUNK = 1
 _CHUNK_SIZE_TOKENS = _BLOCKS_IN_CHUNK * _BLOCK_SIZE
+_MAMBA_SYNTHETIC_HEAD_SIZE = 1024
+_MAMBA_CONV_BYTES = 3 * 8192 * 2
+_MAMBA_SSM_BYTES = 32 * 128 * 128 * 4
+_MAMBA_REAL_LAYOUT = (
+    MambaSubStateWireLayout(0, _MAMBA_CONV_BYTES, "torch.float16", (3, 8192)),
+    MambaSubStateWireLayout(
+        _MAMBA_CONV_BYTES, _MAMBA_SSM_BYTES, "torch.float32", (32, 128, 128)
+    ),
+)
 
-# Concurrency knobs. ``_NUM_REQUESTS`` is deliberately larger than
-# ``DEFAULT_ENGINE_DRIVEN_COMMIT_WORKERS`` so some requests must queue behind
-# the commit_executor's worker threads, matching a bursty real workload.
-_NUM_REQUESTS = 2 * DEFAULT_ENGINE_DRIVEN_COMMIT_WORKERS
+# This benchmark intentionally measures one request only. Request-level
+# executor concurrency would hide the chunk-level store/retrieve behavior.
+_NUM_REQUESTS = 1
 # Chunks in a single submit_store call -- simulates one long-prefill store
 # rather than one chunk at a time (see scratch_shm_raw_buffer_plan.md's
 # ``chunks_per_call`` discussion).
 _CHUNKS_PER_REQUEST = 8
 _BLOCKS_PER_REQUEST = _CHUNKS_PER_REQUEST * _BLOCKS_IN_CHUNK
-_TOTAL_BLOCKS = _NUM_REQUESTS * _BLOCKS_PER_REQUEST
+# Physical block 0 is reserved by vLLM as the null recurrent-state block.
+_TOTAL_BLOCKS = 1 + _NUM_REQUESTS * _BLOCKS_PER_REQUEST
 
 _NUM_ITERATIONS = 5
 _NUM_WARMUP = 1
 _MQ_TIMEOUT_S = 5.0
+_SKIP_CORRECTNESS = True
 # Real scratch region size for the quantized scenario's Stage 1 gather
 # target, per scratch_shm_raw_buffer_plan.md's proposed default budget.
 _SCRATCH_SIZE_BYTES = 5 * 1024 * 1024 * 1024
@@ -171,25 +193,70 @@ def _attention_codec() -> _KVWeaveCodec:
     )
 
 
-def _attention_kv_caches() -> dict[str, torch.Tensor]:
-    """Real per-layer fused-K/V paged tensors, ``_TOTAL_BLOCKS`` blocks each.
-
-    Big enough to give every simulated request its own disjoint block range
-    (see :func:`_request_block_ids`).
-    """
-    shape = (_TOTAL_BLOCKS, _BLOCK_SIZE, _NUM_KV_HEADS, 2 * _HEAD_DIM)
-    return {
+def _qwen35_kv_caches() -> dict[str, torch.Tensor]:
+    """Qwen3.5-style attention plus three recurrent-state groups."""
+    attention_shape = (
+        _TOTAL_BLOCKS,
+        _BLOCK_SIZE,
+        _NUM_KV_HEADS,
+        2 * _HEAD_DIM,
+    )
+    mamba_shape = (
+        _TOTAL_BLOCKS,
+        2,
+        _BLOCK_SIZE,
+        1,
+        _MAMBA_SYNTHETIC_HEAD_SIZE,
+    )
+    caches = {
         f"attn_layer_{i}": torch.randn(
-            shape, dtype=torch.float16, device=torch_device_type
+            attention_shape, dtype=torch.float16, device=torch_device_type
         )
-        for i in range(_NUM_LAYERS)
+        for i in range(_NUM_ATTENTION_LAYERS)
     }
+    caches.update(
+        {
+            f"mamba_layer_{i}": torch.randn(
+                mamba_shape, dtype=torch.float16, device=torch_device_type
+            )
+            for i in range(_NUM_MAMBA_LAYERS)
+        }
+    )
+    return caches
 
 
-def _request_block_ids(request_idx: int) -> list[int]:
-    """This request's disjoint slice of physical blocks."""
-    start = request_idx * _BLOCKS_PER_REQUEST
-    return list(range(start, start + _BLOCKS_PER_REQUEST))
+def _request_block_ids(request_idx: int) -> list[list[int]]:
+    """This request's group-major physical block ids."""
+    # Block id 0 is vLLM's null recurrent-state block.
+    start = 1 + request_idx * _BLOCKS_PER_REQUEST
+    blocks = list(range(start, start + _BLOCKS_PER_REQUEST))
+    return [blocks] * (_NUM_MAMBA_GROUPS + 1)
+
+
+def _qwen35_engine_groups() -> list[EngineGroupInfo]:
+    groups = [
+        EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=tuple(range(_NUM_ATTENTION_LAYERS)),
+            tokens_per_block=_BLOCK_SIZE,
+            cache_category="attention",
+        )
+    ]
+    for group_idx in range(_NUM_MAMBA_GROUPS):
+        start = _NUM_ATTENTION_LAYERS + group_idx * _MAMBA_LAYERS_PER_GROUP
+        groups.append(
+            EngineGroupInfo(
+                engine_group_id=group_idx + 1,
+                layer_indices=tuple(
+                    range(start, start + _MAMBA_LAYERS_PER_GROUP)
+                ),
+                tokens_per_block=_CHUNK_SIZE_TOKENS,
+                recurrent_state=True,
+                cache_category="mamba",
+                mamba_real_layout=_MAMBA_REAL_LAYOUT,
+            )
+        )
+    return groups
 
 
 def _request_key(request_idx: int) -> IPCCacheServerKey:
@@ -207,57 +274,73 @@ def _request_key(request_idx: int) -> IPCCacheServerKey:
     )
 
 
+def _mamba_codec_options() -> MambaCodecOptions:
+    return MambaCodecOptions(
+        conv_scaling_method="per_channel",
+        conv_rh=False,
+        ssm_scaling_method="per_channel",
+        ssm_rh=False,
+        asym=True,
+    )
+
+
 def _enable_quantization(
-    ctx: AsyncEngineDrivenTransferContext, attention_codec: _KVWeaveCodec
-) -> int:
-    """Force the registered (single, non-hybrid) group to be quantized.
-
-    Patches ``ctx._group_plans[0]`` in place to ``quantized=True`` with a
-    real ``cache_category="attention"``/``FUSED_KV`` classification, and
-    swaps in a manually built codec (see :func:`_attention_codec`) so the
-    real direct-slot encode/decode dispatch used by
-    ``submit_store``/``submit_retrieve`` actually quantizes -- rather than
-    calling the codec by hand outside the real store/retrieve path.
-
-    Returns the quantized wire payload's byte length (from a one-off encode
-    of a dummy chunk; deterministic for fixed shape/qbit), used to size the
-    mocked SHM slots.
-    """
-    plan = ctx._group_plans[0]  # noqa: SLF001 -- internal, mirrors other tests
-    quantized_group_info = EngineGroupInfo(
-        engine_group_id=0,
-        layer_indices=tuple(range(_NUM_LAYERS)),
-        tokens_per_block=_BLOCK_SIZE,
-        cache_category="attention",
-    )
-    ctx._group_plans[0] = replace(  # noqa: SLF001
-        plan,
-        group_info=quantized_group_info,
-        quantized=True,
-        attention_plane_layout=AttentionPlaneLayout.FUSED_KV,
-    )
-    ctx._kvweave_codec = attention_codec  # noqa: SLF001
-
-    dummy_chunk = torch.zeros(plan.chunk_shape, dtype=plan.raw_layout_desc.dtypes[0])
-    payload = attention_codec.encode_chunk(
-        "attention", None, _BLOCK_SIZE, None, dummy_chunk, AttentionPlaneLayout.FUSED_KV
-    )
-    return len(payload)
+    ctx: EngineDrivenTransferContext, codec: _KVWeaveCodec
+) -> list[int]:
+    """Force quantization for the attention and all three Mamba groups."""
+    payload_sizes: list[int] = []
+    mamba_options = _mamba_codec_options()
+    for group_idx, plan in enumerate(ctx._group_plans):  # noqa: SLF001
+        if group_idx == 0:
+            ctx._group_plans[group_idx] = replace(  # noqa: SLF001
+                plan,
+                quantized=True,
+                attention_plane_layout=AttentionPlaneLayout.FUSED_KV,
+            )
+            dummy = torch.zeros(
+                plan.chunk_shape, dtype=plan.raw_layout_desc.dtypes[0]
+            )
+            payload = codec.encode_chunk(
+                "attention", None, _BLOCK_SIZE, None, dummy,
+                AttentionPlaneLayout.FUSED_KV,
+            )
+        else:
+            ctx._group_plans[group_idx] = replace(  # noqa: SLF001
+                plan, quantized=True, mamba_options=mamba_options
+            )
+            dummy = torch.zeros(
+                plan.chunk_shape, dtype=plan.raw_layout_desc.dtypes[0]
+            )
+            payload = codec.encode_chunk(
+                "mamba",
+                _MAMBA_REAL_LAYOUT,
+                _CHUNK_SIZE_TOKENS,
+                mamba_options,
+                dummy,
+            )
+        payload_sizes.append(len(payload))
+    ctx._kvweave_codec = codec  # noqa: SLF001
+    return payload_sizes
 
 
 class _RequestSlots:
     """One request's disjoint SHM byte region, sliced into per-chunk slots."""
 
-    def __init__(self, offset: int, chunk_shape: list[int], dtype_str: str, chunk_bytes: int):
-        self.slots = [
-            {
-                "offset": offset + chunk_idx * chunk_bytes,
-                "length": chunk_bytes,
-                "shape": chunk_shape,
-                "dtype": dtype_str,
-            }
-            for chunk_idx in range(_CHUNKS_PER_REQUEST)
-        ]
+    def __init__(
+        self, offset: int, group_specs: list[tuple[list[int], str, int]]
+    ):
+        self.slots: list[dict[str, object]] = []
+        for chunk_shape, dtype_str, chunk_bytes in group_specs:
+            self.slots.extend(
+                {
+                    "offset": offset + chunk_idx * chunk_bytes,
+                    "length": chunk_bytes,
+                    "shape": chunk_shape,
+                    "dtype": dtype_str,
+                }
+                for chunk_idx in range(_CHUNKS_PER_REQUEST)
+            )
+            offset += _CHUNKS_PER_REQUEST * chunk_bytes
 
 
 def _register_shm_context(
@@ -266,6 +349,7 @@ def _register_shm_context(
     pool_size: int,
     commit_workers: int,
     *,
+    async_mode: bool,
     scratch_offset: int = 0,
     scratch_size: int = 0,
 ) -> tuple[AsyncEngineDrivenTransferContext, EngineDrivenContextShm, MagicMock]:
@@ -317,7 +401,10 @@ def _register_shm_context(
         )
         req_client.register_kv_cache_engine_driven_context.return_value = future
 
-        ctx = AsyncEngineDrivenTransferContext(commit_workers=commit_workers)
+        if async_mode:
+            ctx = AsyncEngineDrivenTransferContext(commit_workers=commit_workers)
+        else:
+            ctx = EngineDrivenTransferContext()
         ctx.register(
             instance_id=1,
             kv_caches=kv_caches,
@@ -326,6 +413,7 @@ def _register_shm_context(
             blocks_in_chunk=_BLOCKS_IN_CHUNK,
             req_client=req_client,
             mq_timeout=_MQ_TIMEOUT_S,
+            engine_group_infos=_qwen35_engine_groups(),
         )
         return ctx, created_shm_contexts[0], req_client
     finally:
@@ -336,9 +424,7 @@ def _wire_request_slots(
     ctx: EngineDrivenTransferContext,
     req_client: MagicMock,
     *,
-    chunk_shape: list[int],
-    dtype_str: str,
-    chunk_bytes: int,
+    group_specs: list[tuple[list[int], str, int]],
 ) -> dict[str, _RequestSlots]:
     """Build each request's disjoint SHM region and wire the mock RPC calls.
 
@@ -352,11 +438,15 @@ def _wire_request_slots(
     quantized one (see :func:`_enable_quantization`).
     """
     request_slots: dict[str, _RequestSlots] = {}
+    request_bytes = sum(
+        _CHUNKS_PER_REQUEST * chunk_bytes
+        for _, _, chunk_bytes in group_specs
+    )
     for request_idx in range(_NUM_REQUESTS):
         request_id = f"req-{request_idx}"
-        offset = request_idx * _CHUNKS_PER_REQUEST * chunk_bytes
+        offset = request_idx * request_bytes
         request_slots[request_id] = _RequestSlots(
-            offset, chunk_shape, dtype_str, chunk_bytes
+            offset, group_specs
         )
 
     def _prepare_store(key, _instance_id):
@@ -365,7 +455,9 @@ def _wire_request_slots(
             PrepareStoreResponse(
                 context={
                     "slots": rs.slots,
-                    "chunk_indices": list(range(_CHUNKS_PER_REQUEST)),
+                    "chunk_indices": list(
+                        range((_NUM_MAMBA_GROUPS + 1) * _CHUNKS_PER_REQUEST)
+                    ),
                 }
             )
         )
@@ -386,7 +478,7 @@ def _wire_request_slots(
 
 
 def _required_shm_pool_bytes(chunk_bytes: int) -> int:
-    return _NUM_REQUESTS * _CHUNKS_PER_REQUEST * chunk_bytes
+    return _NUM_REQUESTS * chunk_bytes
 
 
 def _fill_request_source_data(
@@ -399,10 +491,13 @@ def _fill_request_source_data(
     """
     snapshots: dict[int, dict[str, torch.Tensor]] = {}
     for request_idx in range(_NUM_REQUESTS):
-        block_ids = _request_block_ids(request_idx)
+        group_block_ids = _request_block_ids(request_idx)
         generator = torch.Generator(device="cpu").manual_seed(request_idx)
         snapshot: dict[str, torch.Tensor] = {}
-        for layer_name, tensor in kv_caches.items():
+        for layer_idx, (layer_name, tensor) in enumerate(kv_caches.items()):
+            block_ids = group_block_ids[
+                0 if layer_idx < _NUM_ATTENTION_LAYERS else 1
+            ]
             data = torch.randn(
                 (len(block_ids), *tensor.shape[1:]),
                 dtype=tensor.dtype,
@@ -436,14 +531,14 @@ def _verify_round_trip(
     }
     mismatches: list[int] = []
     for request_idx in range(_NUM_REQUESTS):
-        block_ids = _request_block_ids(request_idx)
+        group_block_ids = _request_block_ids(request_idx)
         event = ctx.create_recorded_event()
         future = ctx.submit_retrieve(
             f"req-{request_idx}",
             _request_key(request_idx),
             1,
             dest_kv_caches,
-            [block_ids],
+            group_block_ids,
             event,
             _BLOCKS_IN_CHUNK,
         )
@@ -453,7 +548,8 @@ def _verify_round_trip(
             continue
         snapshot = snapshots[request_idx]
         for layer_name, expected in snapshot.items():
-            actual = dest_kv_caches[layer_name][block_ids]
+            group_idx = 0 if layer_name.startswith("attn_") else 1
+            actual = dest_kv_caches[layer_name][group_block_ids[group_idx]]
             matches = (
                 torch.allclose(
                     actual.float().cpu(), expected.float().cpu(), atol=0.5, rtol=0.1
@@ -462,6 +558,12 @@ def _verify_round_trip(
                 else torch.equal(actual.cpu(), expected.cpu())
             )
             if not matches:
+                error = (actual.float().cpu() - expected.float().cpu()).abs()
+                print(
+                    f"Round-trip mismatch layer={layer_name} "
+                    f"max_abs={error.max().item():.6f} "
+                    f"mean_abs={error.mean().item():.6f}"
+                )
                 mismatches.append(request_idx)
                 break
 
@@ -489,14 +591,14 @@ def _submit_all_stores(
     """
     futures: list[MessagingFuture] = []
     for request_idx in range(_NUM_REQUESTS):
-        block_ids = _request_block_ids(request_idx)
+        group_block_ids = _request_block_ids(request_idx)
         event = ctx.create_recorded_event()
         future = ctx.submit_store(
             f"req-{request_idx}",
             _request_key(request_idx),
             1,
             kv_caches,
-            [block_ids],
+            group_block_ids,
             event,
             _BLOCKS_IN_CHUNK,
         )
@@ -527,18 +629,51 @@ def _time_sequential_stores(
 ) -> list[float]:
     def _run() -> None:
         for request_idx in range(_NUM_REQUESTS):
-            block_ids = _request_block_ids(request_idx)
+            group_block_ids = _request_block_ids(request_idx)
             event = ctx.create_recorded_event()
             future = ctx.submit_store(
                 f"req-{request_idx}",
                 _request_key(request_idx),
                 1,
                 kv_caches,
-                [block_ids],
+                group_block_ids,
                 event,
                 _BLOCKS_IN_CHUNK,
             )
             assert future.result(timeout=_MQ_TIMEOUT_S)
+
+    for _ in range(_NUM_WARMUP):
+        _run()
+    samples_ms: list[float] = []
+    for _ in range(_NUM_ITERATIONS):
+        start = time.perf_counter()
+        _run()
+        samples_ms.append((time.perf_counter() - start) * 1000.0)
+    return samples_ms
+
+
+def _time_sequential_retrieves(
+    ctx: AsyncEngineDrivenTransferContext,
+    kv_caches: dict[str, torch.Tensor],
+) -> list[float]:
+    """Time complete retrieve rounds, including decode and H2D scatter."""
+    destination = {name: torch.zeros_like(tensor) for name, tensor in kv_caches.items()}
+
+    def _run() -> None:
+        for request_idx in range(_NUM_REQUESTS):
+            group_block_ids = _request_block_ids(request_idx)
+            event = ctx.create_recorded_event()
+            future = ctx.submit_retrieve(
+                f"req-{request_idx}",
+                _request_key(request_idx),
+                1,
+                destination,
+                group_block_ids,
+                event,
+                _BLOCKS_IN_CHUNK,
+            )
+            assert future.result(timeout=_MQ_TIMEOUT_S)
+        torch_dev.synchronize()
 
     for _ in range(_NUM_WARMUP):
         _run()
@@ -636,7 +771,7 @@ def _time_stages_concurrent(
         for _ in range(_NUM_WARMUP + _NUM_ITERATIONS):
             pending: list[tuple[float, MessagingFuture]] = []
             for request_idx in range(_NUM_REQUESTS):
-                block_ids = _request_block_ids(request_idx)
+                group_block_ids = _request_block_ids(request_idx)
                 event = ctx.create_recorded_event()
                 start = time.perf_counter()
                 future = ctx.submit_store(
@@ -644,7 +779,7 @@ def _time_stages_concurrent(
                     _request_key(request_idx),
                     1,
                     kv_caches,
-                    [block_ids],
+                    group_block_ids,
                     event,
                     _BLOCKS_IN_CHUNK,
                 )
@@ -669,8 +804,8 @@ def _time_stages_concurrent(
     )
 
 
-def _run_scenario(quantize: bool) -> None:
-    kv_caches = _attention_kv_caches()
+def _run_scenario(quantize: bool, async_mode: bool) -> None:
+    kv_caches = _qwen35_kv_caches()
     shm_name = f"lmcache_bench_concurrent_{os.getpid()}"
     # The SHM segment must already exist (sized big enough) before register()
     # can attach to it, so the per-chunk byte size is derived analytically
@@ -681,13 +816,18 @@ def _run_scenario(quantize: bool) -> None:
     # -- the quantized wire payload is always smaller.
     itemsize = 2  # fp16
     raw_chunk_bytes = _NUM_LAYERS * _BLOCK_SIZE * _NUM_KV_HEADS * 2 * _HEAD_DIM * itemsize
-    slots_region_bytes = _required_shm_pool_bytes(raw_chunk_bytes) + (16 * 1024 * 1024)
-    # Only the quantized scenario ever calls allocate_scratch_tensors(), but
-    # reserving the region unconditionally keeps both scenarios' pool layout
-    # identical for easier comparison.
+    slots_region_bytes = (
+        _required_shm_pool_bytes(_CHUNKS_PER_REQUEST * raw_chunk_bytes)
+        + (16 * 1024 * 1024)
+    )
+    # Reserve the raw upper bound before registration; quantized payloads use
+    # less space and are wired into this same reserved slot region below.
     scratch_offset = slots_region_bytes
     scratch_size = _SCRATCH_SIZE_BYTES
     pool_size = slots_region_bytes + scratch_size
+    # Only the quantized scenario ever calls allocate_scratch_tensors(), but
+    # reserving the region unconditionally keeps both scenarios' pool layout
+    # identical for easier comparison.
     addr = shm_create_readwrite(shm_name, pool_size)
     try:
         ctx, shm_ctx, req_client = _register_shm_context(
@@ -695,58 +835,76 @@ def _run_scenario(quantize: bool) -> None:
             shm_name,
             pool_size,
             DEFAULT_ENGINE_DRIVEN_COMMIT_WORKERS,
+            async_mode=async_mode,
             scratch_offset=scratch_offset,
             scratch_size=scratch_size,
         )
         try:
-            plan = ctx._group_plans[0]  # noqa: SLF001 -- internal, mirrors other tests
+            plans = ctx._group_plans  # noqa: SLF001 -- benchmark introspection
             if quantize:
-                attention_codec = _attention_codec()
-                quant_bytes = _enable_quantization(ctx, attention_codec)
-                _wire_request_slots(
-                    ctx,
-                    req_client,
-                    chunk_shape=[quant_bytes],
-                    dtype_str="uint8",
-                    chunk_bytes=quant_bytes,
-                )
+                codec = _attention_codec()
+                quant_bytes = _enable_quantization(ctx, codec)
+                group_specs = [
+                    ([payload_size], "uint8", payload_size)
+                    for payload_size in quant_bytes
+                ]
             else:
-                dtype_str = str(plan.raw_layout_desc.dtypes[0]).removeprefix("torch.")
-                _wire_request_slots(
-                    ctx,
-                    req_client,
-                    chunk_shape=list(plan.chunk_shape),
-                    dtype_str=dtype_str,
-                    chunk_bytes=raw_chunk_bytes,
-                )
+                group_specs = []
+                for group_idx, plan in enumerate(plans):
+                    shape = (
+                        torch.Size(plan.chunk_shape)
+                        if group_idx == 0
+                        else torch.Size(
+                            [2, *plan.chunk_shape[:-1], plan.chunk_shape[-1] // 2]
+                        )
+                    )
+                    group_specs.append(
+                        (
+                            list(shape),
+                            str(plan.raw_layout_desc.dtypes[0]).removeprefix("torch."),
+                            int(shape.numel())
+                            * torch.empty(
+                                (), dtype=plan.raw_layout_desc.dtypes[0]
+                            ).element_size(),
+                        )
+                    )
+            _wire_request_slots(ctx, req_client, group_specs=group_specs)
 
             print(
-                f"Concurrent multi-chunk engine-driven SHM store bench "
-                f"({_NUM_LAYERS} attention layers, {_NUM_REQUESTS} concurrent "
-                f"requests x {_CHUNKS_PER_REQUEST} chunks/request "
+                f"Single-request multi-chunk engine-driven SHM store bench "
+                f"({_NUM_ATTENTION_LAYERS} attention + "
+                f"{_NUM_MAMBA_GROUPS}x{_MAMBA_LAYERS_PER_GROUP} Mamba layers, "
+                f"{_NUM_REQUESTS} request x "
+                f"{_CHUNKS_PER_REQUEST} chunks/request "
                 f"({_CHUNK_SIZE_TOKENS} tokens/chunk), "
-                f"commit_workers={DEFAULT_ENGINE_DRIVEN_COMMIT_WORKERS}, "
+                f"mode={'async' if async_mode else 'sync'}, "
                 f"quantized={quantize}, "
                 f"{_NUM_ITERATIONS} iterations after {_NUM_WARMUP} warmup)"
             )
 
-            print("\n--- correctness: one round of concurrent multi-chunk store + retrieve ---")
-            snapshots = _fill_request_source_data(kv_caches)
-            futures = _submit_all_stores(ctx, kv_caches)
-            for request_idx, future in enumerate(futures):
-                if not future.result(timeout=_MQ_TIMEOUT_S):
-                    raise AssertionError(
-                        f"submit_store failed for request {request_idx}"
-                    )
-            _verify_round_trip(ctx, kv_caches, snapshots, quantized=quantize)
+            if _SKIP_CORRECTNESS:
+                print("\n--- correctness: skipped for performance run ---")
+            else:
+                print(
+                    "\n--- correctness: one round of concurrent multi-chunk "
+                    "store + retrieve ---"
+                )
+                snapshots = _fill_request_source_data(kv_caches)
+                futures = _submit_all_stores(ctx, kv_caches)
+                for request_idx, future in enumerate(futures):
+                    if not future.result(timeout=_MQ_TIMEOUT_S):
+                        raise AssertionError(
+                            f"submit_store failed for request {request_idx}"
+                        )
+                _verify_round_trip(ctx, kv_caches, snapshots, quantized=quantize)
 
-            print("\n--- timing: concurrent (fire-all, wait-all) submit_store ---")
+            print("\n--- timing: complete submit_store ---")
             samples_ms = _time_concurrent_stores(ctx, kv_caches)
-            _print_stats("concurrent", samples_ms)
+            _print_stats("store request", samples_ms)
 
-            print("\n--- timing: sequential (submit, wait, next) submit_store ---")
-            samples_ms = _time_sequential_stores(ctx, kv_caches)
-            _print_stats("sequential", samples_ms)
+            print("\n--- timing: sequential retrieve (decode + H2D scatter) ---")
+            samples_ms = _time_sequential_retrieves(ctx, kv_caches)
+            _print_stats("retrieve all requests", samples_ms)
 
             print(
                 "\n--- timing: per-stage breakdown under concurrency "
@@ -786,8 +944,10 @@ def main() -> int:
         )
 
     for quantize, label in scenarios:
-        print(f"\n{'=' * 70}\n{label}\n{'=' * 70}")
-        _run_scenario(quantize)
+        for async_mode in (False, True):
+            mode_label = "async" if async_mode else "sync"
+            print(f"\n{'=' * 70}\n{label}, mode={mode_label}\n{'=' * 70}")
+            _run_scenario(quantize, async_mode)
     return 0
 
 

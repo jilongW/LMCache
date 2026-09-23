@@ -130,7 +130,7 @@ def _env_num_threads() -> int:
     being referenced by deployment scripts -- the codec always ran with
     ``num_threads=1`` regardless of this env var.
     """
-    num_threads = int(os.environ.get("LMCACHE_MP_KVWEAVE_NUM_THREADS", "8"))
+    num_threads = int(os.environ.get("LMCACHE_MP_KVWEAVE_NUM_THREADS", "4"))
     if num_threads < 1:
         raise ValueError(
             f"LMCACHE_MP_KVWEAVE_NUM_THREADS={num_threads!r} must be >= 1"
