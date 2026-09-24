@@ -13,6 +13,16 @@ from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
     MambaCodecOptions,
 )
 
+try:
+    from kvweave import kvweave_quant_xpu
+except ImportError:  # pragma: no cover
+    kvweave_quant_xpu = None
+
+requires_xpu = pytest.mark.skipif(
+    not (kvweave_quant_xpu is not None and torch.xpu.is_available()),
+    reason="kvweave_quant_xpu extension or an XPU device is not available",
+)
+
 
 def _layouts() -> tuple[MambaSubStateWireLayout, MambaSubStateWireLayout]:
     return (
@@ -341,6 +351,56 @@ def test_asymmetric_quantization_preserves_requested_scaling_method(
     assert torch.isfinite(restored).all()
 
 
+@requires_xpu
+@pytest.mark.parametrize("substate", ["conv", "ssm"])
+def test_xpu_native_substate_quant_round_trip(substate: str):
+    """device='xpu' mirror of test_native_substate_quant_round_trip.
+
+    Uses layers=3 (not 1) specifically to catch the class of bug where the
+    XPU path's per-layer native calls (kvweave_quant_xpu has no num_layers
+    concept, unlike the CPU wrapper's fused entry points) produce a payload
+    whose size depends on how many layers are packed -- a single-layer shape
+    can't distinguish a broken per-layer framing scheme from a correct one.
+    """
+    tensor = torch.randn(3, 4, 8, dtype=torch.float32)
+    cpu_payload = _KVWeaveCodec.quantize_mamba_substate_4bit(
+        tensor, substate=substate, scaling_method="per_tensor", device="cpu"
+    )
+    xpu_payload = _KVWeaveCodec.quantize_mamba_substate_4bit(
+        tensor, substate=substate, scaling_method="per_tensor", device="xpu"
+    )
+    restored = _KVWeaveCodec.dequantize_mamba_substate_4bit(xpu_payload, device="xpu")
+
+    assert len(xpu_payload) == len(cpu_payload)
+    assert restored.shape == tensor.shape
+    assert restored.dtype == tensor.dtype
+    assert torch.max(torch.abs(restored - tensor)) < 1.0
+
+
+@requires_xpu
+@pytest.mark.parametrize("substate", ["conv", "ssm"])
+@pytest.mark.parametrize("asym,rh", [(True, False), (False, True), (True, True)])
+def test_xpu_sensitive_quantization_round_trip(substate: str, asym: bool, rh: bool):
+    """device='xpu' mirror of test_sensitive_quantization_round_trip."""
+    tensor = torch.randn(2, 4, 4, 8, 16, dtype=torch.float32)
+    scaling_method = "per_token" if substate == "conv" and rh else "per_channel"
+    payload = _KVWeaveCodec.quantize_mamba_substate_4bit(
+        tensor,
+        substate=substate,
+        scaling_method=scaling_method,
+        rh=rh,
+        asym=asym,
+        device="xpu",
+    )
+
+    assert payload[:4] == b"MQ01"
+    assert payload[7] == (1 if scaling_method == "per_token" else 2)
+    restored = _KVWeaveCodec.dequantize_mamba_substate_4bit(payload, device="xpu")
+    assert restored.shape == tensor.shape
+    assert restored.dtype == tensor.dtype
+    assert torch.isfinite(restored).all()
+
+
 def test_native_substate_quant_rejects_invalid_substate():
     with pytest.raises(ValueError, match="substate"):
         _KVWeaveCodec.quantize_mamba_substate_4bit(
@@ -475,3 +535,179 @@ def test_resolve_mamba_options_keeps_rh_for_power_of_two_shapes():
     assert resolved.ssm_rh is True
 
 
+@requires_xpu
+def test_xpu_quantize_mamba_jobs_matches_per_item_for_homogeneous_dtype():
+    """``_quantize_mamba_jobs``'s XPU batched path (>=2 same-dtype jobs)
+    must produce byte-identical payloads to calling
+    ``quantize_mamba_substate_4bit`` once per job -- batching only removes
+    the redundant per-job host<->XPU round trip, never changes the wire
+    format."""
+    torch.manual_seed(21)
+    jobs = [
+        dict(tensor=torch.randn(2, 4, 8, 16).to(torch.float16),
+             substate="conv", scaling_method="per_channel", rh=True, asym=True, qbit=4),
+        dict(tensor=torch.randn(2, 4, 8, 16).to(torch.float16),
+             substate="conv", scaling_method="per_channel", rh=True, asym=True, qbit=4),
+        dict(tensor=torch.randn(2, 4, 8, 24).to(torch.float16),
+             substate="conv", scaling_method="per_channel", rh=False, asym=True, qbit=4),
+        dict(tensor=torch.randn(2, 4, 4, 32).to(torch.float16),
+             substate="ssm", scaling_method="per_token", rh=True, asym=False, qbit=8),
+    ]
+    batched = _KVWeaveCodec._quantize_mamba_jobs(jobs, "xpu")
+    per_item = [
+        _KVWeaveCodec.quantize_mamba_substate_4bit(
+            job["tensor"], substate=job["substate"], scaling_method=job["scaling_method"],
+            rh=job["rh"], asym=job["asym"], qbit=job["qbit"], device="xpu",
+        )
+        for job in jobs
+    ]
+    assert batched == per_item
+
+
+@requires_xpu
+def test_xpu_quantize_mamba_jobs_handles_mixed_dtype_groups():
+    """A dtype-heterogeneous job list (e.g. Qwen3.5's fp16 conv + fp32 ssm)
+    must still round-trip correctly: the fp16 jobs batch together, the fp32
+    job falls back to its own single-item call (see ``_quantize_mamba_jobs``'s
+    per-dtype grouping)."""
+    torch.manual_seed(22)
+    jobs = [
+        dict(tensor=torch.randn(2, 4, 8, 16).to(torch.float16),
+             substate="conv", scaling_method="per_channel", rh=True, asym=True, qbit=4),
+        dict(tensor=torch.randn(2, 4, 8, 16).to(torch.float16),
+             substate="conv", scaling_method="per_channel", rh=True, asym=True, qbit=4),
+        dict(tensor=torch.randn(2, 4, 8, 24).to(torch.float16),
+             substate="conv", scaling_method="per_channel", rh=False, asym=True, qbit=4),
+        dict(tensor=torch.randn(2, 4, 4, 32, dtype=torch.float32),
+             substate="ssm", scaling_method="per_token", rh=True, asym=False, qbit=8),
+    ]
+    payloads = _KVWeaveCodec._quantize_mamba_jobs(jobs, "xpu")
+    for job, payload in zip(jobs, payloads):
+        restored = _KVWeaveCodec.dequantize_mamba_substate_4bit(payload, device="xpu")
+        assert restored.shape == job["tensor"].shape
+        assert restored.dtype == job["tensor"].dtype
+        assert torch.isfinite(restored).all()
+
+
+@requires_xpu
+def test_xpu_dequantize_mamba_payloads_matches_per_item_dispatch():
+    """``_dequantize_mamba_payloads``'s XPU batched path (>=2 same-output-
+    dtype payloads) must produce the exact same tensors as dequantizing
+    each payload individually."""
+    torch.manual_seed(23)
+    jobs = [
+        dict(tensor=torch.randn(2, 4, 8, 16).to(torch.float16),
+             substate="conv", scaling_method="per_channel", rh=True, asym=True, qbit=4),
+        dict(tensor=torch.randn(2, 4, 8, 16).to(torch.float16),
+             substate="conv", scaling_method="per_channel", rh=True, asym=True, qbit=4),
+        dict(tensor=torch.randn(2, 4, 4, 32).to(torch.float16),
+             substate="ssm", scaling_method="per_token", rh=True, asym=False, qbit=8),
+    ]
+    payloads = [
+        _KVWeaveCodec.quantize_mamba_substate_4bit(
+            job["tensor"], substate=job["substate"], scaling_method=job["scaling_method"],
+            rh=job["rh"], asym=job["asym"], qbit=job["qbit"], device="xpu",
+        )
+        for job in jobs
+    ]
+    batched = _KVWeaveCodec._dequantize_mamba_payloads(payloads, "xpu")
+    per_item = [
+        _KVWeaveCodec.dequantize_mamba_substate_4bit(p, device="xpu") for p in payloads
+    ]
+    for b, p in zip(batched, per_item):
+        assert torch.equal(b, p)
+
+
+@requires_xpu
+def test_xpu_encode_decode_chunk_mamba_batches_homogeneous_dtype_round_trip():
+    """End-to-end ``encode_chunk``/``decode_chunk`` on ``device="xpu"`` with
+    conv and ssm sharing one dtype (the common case): all 4 substates
+    (conv query/key/value + ssm) batch into a single native round trip on
+    both encode and decode -- see ``_quantize_mamba_jobs``/
+    ``_decode_mamba_substates_xpu_batched``.
+    """
+    torch.manual_seed(24)
+    block_size = 4
+    conv_shape = (4, 96)  # key_dim=32, value_dim=32 -> conv_dim=96
+    ssm_shape = (8, 64)
+    conv_dtype = torch.float16
+    conv_bytes = torch.Size(conv_shape).numel() * conv_dtype.itemsize
+    ssm_bytes = torch.Size(ssm_shape).numel() * conv_dtype.itemsize
+    hidden_dim = (conv_bytes + ssm_bytes) // (block_size * conv_dtype.itemsize)
+    layouts = (
+        MambaSubStateWireLayout(0, conv_bytes, str(conv_dtype), conv_shape),
+        MambaSubStateWireLayout(conv_bytes, ssm_bytes, str(conv_dtype), ssm_shape),
+    )
+    conv = torch.randn(2, 2, *conv_shape, dtype=conv_dtype)
+    ssm = torch.randn(2, 2, *ssm_shape, dtype=conv_dtype)
+    raw = _KVWeaveCodec.merge_mamba_chunk(
+        MambaChunkSplit(conv, ssm), layouts, block_size, hidden_dim,
+        raw_shape=torch.Size([2, block_size * 2, hidden_dim]), raw_dtype=conv_dtype,
+    )
+    codec = _KVWeaveCodec({"device": "xpu"})
+    options = MambaCodecOptions(
+        conv_scaling_method="per_channel", conv_rh=True,
+        ssm_scaling_method="per_channel", ssm_rh=True,
+        asym=True, conv_qkv_split=ConvQKVSplit(key_dim=32, value_dim=32),
+    )
+
+    payload = codec.encode_chunk("mamba", layouts, block_size, options, raw)
+    restored = codec.decode_chunk(
+        "mamba", layouts, block_size, raw.shape, raw.dtype,
+        torch.frombuffer(bytearray(payload), dtype=torch.uint8),
+    )
+    original = _KVWeaveCodec.split_mamba_chunk(raw, layouts, block_size)
+    decoded = _KVWeaveCodec.split_mamba_chunk(restored, layouts, block_size)
+
+    assert torch.isfinite(decoded.conv).all()
+    assert torch.isfinite(decoded.ssm).all()
+    assert torch.max(torch.abs(decoded.conv - original.conv)) < 2.0
+    assert torch.max(torch.abs(decoded.ssm - original.ssm)) < 2.0
+
+
+@requires_xpu
+def test_xpu_encode_decode_chunk_mamba_mixed_dtype_round_trip():
+    """End-to-end ``encode_chunk``/``decode_chunk`` on ``device="xpu"`` with
+    conv fp16 + ssm fp32 (Qwen3.5's real mixed-dtype contract): conv's
+    query/key/value batch together, ssm falls back to its own single-item
+    native call (see ``_quantize_mamba_jobs``/``_dequantize_mamba_payloads``'s
+    per-dtype grouping).
+    """
+    torch.manual_seed(25)
+    block_size = 4
+    conv_shape = (4, 96)  # key_dim=32, value_dim=32 -> conv_dim=96
+    ssm_shape = (8, 64)
+    conv_dtype = torch.float16
+    ssm_dtype = torch.float32
+    conv_bytes = torch.Size(conv_shape).numel() * conv_dtype.itemsize
+    ssm_bytes = torch.Size(ssm_shape).numel() * ssm_dtype.itemsize
+    hidden_dim = (conv_bytes + ssm_bytes) // (block_size * conv_dtype.itemsize)
+    layouts = (
+        MambaSubStateWireLayout(0, conv_bytes, str(conv_dtype), conv_shape),
+        MambaSubStateWireLayout(conv_bytes, ssm_bytes, str(ssm_dtype), ssm_shape),
+    )
+    conv = torch.randn(2, 2, *conv_shape, dtype=conv_dtype)
+    ssm = torch.randn(2, 2, *ssm_shape, dtype=ssm_dtype)
+    raw = _KVWeaveCodec.merge_mamba_chunk(
+        MambaChunkSplit(conv, ssm), layouts, block_size, hidden_dim,
+        raw_shape=torch.Size([2, block_size * 2, hidden_dim]), raw_dtype=conv_dtype,
+    )
+    codec = _KVWeaveCodec({"device": "xpu"})
+    options = MambaCodecOptions(
+        conv_scaling_method="per_channel", conv_rh=True,
+        ssm_scaling_method="per_channel", ssm_rh=True,
+        asym=True, conv_qkv_split=ConvQKVSplit(key_dim=32, value_dim=32),
+    )
+
+    payload = codec.encode_chunk("mamba", layouts, block_size, options, raw)
+    restored = codec.decode_chunk(
+        "mamba", layouts, block_size, raw.shape, raw.dtype,
+        torch.frombuffer(bytearray(payload), dtype=torch.uint8),
+    )
+    original = _KVWeaveCodec.split_mamba_chunk(raw, layouts, block_size)
+    decoded = _KVWeaveCodec.split_mamba_chunk(restored, layouts, block_size)
+
+    assert torch.isfinite(decoded.conv).all()
+    assert torch.isfinite(decoded.ssm).all()
+    assert torch.max(torch.abs(decoded.conv - original.conv)) < 2.0
+    assert torch.max(torch.abs(decoded.ssm - original.ssm)) < 2.0

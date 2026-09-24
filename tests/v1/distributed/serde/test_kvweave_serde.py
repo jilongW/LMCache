@@ -19,6 +19,16 @@ from lmcache.v1.distributed.serde.kvweave.kvweave_serde import (
 )
 from lmcache.v1.multiprocess.group_view import MambaSubStateWireLayout
 
+try:
+    from kvweave import kvweave_quant_xpu
+except ImportError:  # pragma: no cover
+    kvweave_quant_xpu = None
+
+requires_xpu = pytest.mark.skipif(
+    not (kvweave_quant_xpu is not None and torch.xpu.is_available()),
+    reason="kvweave_quant_xpu extension or an XPU device is not available",
+)
+
 
 def _codec(**kwargs: object) -> _KVWeaveCodec:
     settings = {
@@ -154,7 +164,7 @@ def test_qwen35_fused_attention_uses_independent_head_scales(scaling_method):
     )
     source = torch.randn(2, 8, 16, dtype=torch.float16)
     payload = codec.serialize_fused_tensor(source)
-    parsed = codec._parse_fused(payload)
+    parsed = codec._read_fused_header(torch.frombuffer(bytearray(payload), dtype=torch.uint8))
     restored = torch.empty_like(source)
     codec.deserialize_fused_tensor(
         torch.frombuffer(bytearray(payload), dtype=torch.uint8), restored
@@ -167,6 +177,76 @@ def test_qwen35_fused_attention_uses_independent_head_scales(scaling_method):
 def test_rejects_non_kv_shape():
     with pytest.raises(ValueError, match="KVWeave"):
         _codec().serialize_tensor(torch.randn(1, 64, 8))
+
+
+@requires_xpu
+def test_xpu_quantized_four_dimensional_round_trip():
+    """device='xpu' mirror of test_quantized_four_dimensional_round_trip.
+
+    Also checks the payload against estimate_serialized_size: the XPU path
+    quantizes K/V planes independently (no fused native entry point), and an
+    earlier version of this wiring added a per-layer length prefix that
+    inflated the payload past what this size estimate (derived from the CPU
+    wire format) assumes, overflowing the caller's pre-allocated SHM slot.
+    A multi-layer shape (layers=3) is required to catch that regression --
+    a single-layer shape can't distinguish "no per-layer overhead" from
+    "one prefix that happens to fit".
+    """
+    codec = _codec(device="xpu")
+    source = torch.randn(2, 3, 64, 8, dtype=torch.float16)
+    layout = MemoryLayoutDesc([source.shape], [source.dtype])
+    payload = codec.serialize_tensor(source)
+    restored = torch.empty_like(source)
+
+    codec.deserialize_tensor(torch.tensor(list(payload), dtype=torch.uint8), restored)
+
+    assert payload[:4] == b"KVW3"
+    assert restored.shape == source.shape
+    assert torch.max(torch.abs(source.float() - restored.float())) < 0.5
+    assert codec.estimate_serialized_size(layout) >= len(payload)
+
+
+@requires_xpu
+def test_xpu_quantized_three_dimensional_round_trip():
+    codec = _codec(device="xpu")
+    source = torch.randn(64, 2, 8, dtype=torch.float16)
+    payload = codec.serialize_tensor(source)
+    restored = torch.empty_like(source)
+
+    codec.deserialize_tensor(torch.tensor(list(payload), dtype=torch.uint8), restored)
+
+    assert restored.shape == source.shape
+    assert torch.max(torch.abs(source.float() - restored.float())) < 0.5
+
+
+@requires_xpu
+def test_xpu_qwen35_fused_attention_estimate_covers_payload():
+    codec = _codec(num_kv_heads=4, head_dim=256, device="xpu")
+    source = torch.randn(8, 64, 2048, dtype=torch.float16)
+    layout = MemoryLayoutDesc([source.shape], [source.dtype])
+
+    payload = codec.serialize_fused_tensor(source)
+    restored = torch.empty_like(source)
+    codec.deserialize_fused_tensor(torch.tensor(list(payload), dtype=torch.uint8), restored)
+
+    assert payload[:4] == b"KVW4"
+    assert codec.estimate_fused_serialized_size(layout) >= len(payload)
+    assert torch.max(torch.abs(source.float() - restored.float())) < 0.5
+
+
+def test_xpu_device_requires_native_extension_or_raises(monkeypatch):
+    """device='xpu' without the native extension fails loudly at construction,
+    not silently falling back to CPU."""
+    import lmcache.v1.distributed.serde.kvweave.kvweave_serde as kvweave_serde_mod
+
+    monkeypatch.setattr(kvweave_serde_mod, "kvweave_quant_xpu", None)
+    with pytest.raises(RuntimeError, match="xpu"):
+        _codec(device="xpu")
+
+
+def test_invalid_device_raises():
+    with pytest.raises(ValueError, match="device"):
+        _codec(device="tpu")
 
 
 def test_runtime_config_resolves_environment(monkeypatch, tmp_path):

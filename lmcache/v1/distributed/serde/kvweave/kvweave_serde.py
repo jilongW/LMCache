@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import io
 import struct
 from typing import Optional
 
@@ -25,7 +24,33 @@ try:
 except ImportError:  # pragma: no cover
     kvweave_quant = None
 
+try:
+    from kvweave import kvweave_quant_xpu
+except ImportError:  # pragma: no cover
+    kvweave_quant_xpu = None
+
 logger = init_logger(__name__)
+
+
+def _resolve_native(device: str):
+    """Return the native quantization module for ``device`` ('cpu' or 'xpu').
+
+    Single canonical native-module resolver used everywhere in this file --
+    both modules expose identical kvweave_serialize_chunk*/
+    kvweave_dequantize_chunk* signatures (the XPU ones added a native
+    ``num_layers`` axis and fused K/V entry points in the SYCL kernels,
+    mirroring the CPU wrapper's fused chunk entry points -- see
+    quant_sycl.cpp / kvweave_quant_xpu_wrapper.cpp), so every call site here
+    just picks a module and calls the same function name/arguments
+    regardless of device.
+    """
+    if device == "xpu":
+        if kvweave_quant_xpu is None:
+            raise RuntimeError("KVWeave native XPU quantization extension is unavailable")
+        return kvweave_quant_xpu
+    if kvweave_quant is None:
+        raise RuntimeError("KVWeave native quantization extension is unavailable")
+    return kvweave_quant
 
 
 @dataclass
@@ -72,18 +97,43 @@ class _KVWeaveCodec:
         self.block_size = int(kwargs.get("block_size", config.DEFAULT_BLOCK_SIZE))
         self.num_kv_heads = int(kwargs.get("num_kv_heads", kwargs.get("head_num", 1)))
         self.head_dim = int(kwargs.get("head_dim", 0))
-        self._quant_mod = None
-
-    def _native(self):
-        if self._quant_mod is None:
-            if kvweave_quant is None:
-                raise RuntimeError("KVWeave native quantization extension is unavailable")
-            self._quant_mod = kvweave_quant
-        return self._quant_mod
+        self.device = str(kwargs.get("device", "cpu")).strip().lower()
+        if self.device not in {"cpu", "xpu"}:
+            raise ValueError(f"device={self.device!r} is not one of ['cpu', 'xpu']")
+        if self.device == "xpu" and not torch.xpu.is_available():
+            raise RuntimeError("device='xpu' but torch.xpu.is_available() is False")
+        self.native = _resolve_native(self.device)
 
     @staticmethod
     def _tensor_bytes(tensor: torch.Tensor) -> bytes:
         return bytes(tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+
+    @staticmethod
+    def _payload_u8(tensor: torch.Tensor) -> torch.Tensor:
+        payload = tensor.detach()
+        if payload.dtype != torch.uint8:
+            raise ValueError("KVWeave payload tensor must have dtype torch.uint8")
+        if payload.device.type != "cpu":
+            payload = payload.cpu()
+        if not payload.is_contiguous():
+            payload = payload.contiguous()
+        return payload.view(torch.uint8)
+
+    @staticmethod
+    def _payload_buffer(payload: torch.Tensor) -> memoryview:
+        return memoryview(payload.numpy())
+
+    @staticmethod
+    def _payload_tail(payload: torch.Tensor, offset: int, dtype: torch.dtype) -> torch.Tensor:
+        if dtype == torch.int8:
+            return payload[offset:].view(torch.int8)
+        if dtype == torch.uint8:
+            return payload[offset:]
+        if dtype == torch.int16:
+            if offset % 2:
+                raise ValueError("KVWeave int16 q_data is not 2-byte aligned")
+            return payload[offset:].view(torch.int16)
+        raise ValueError(f"unsupported KVWeave payload view dtype: {dtype}")
 
     def estimate_serialized_size(
         self, layout_desc: MemoryLayoutDesc, scaling_method: Optional[str] = None
@@ -144,51 +194,59 @@ class _KVWeaveCodec:
 
     def serialize_tensor(self, tensor: torch.Tensor, scaling_method: str | None = None) -> bytes:
         """Normalize a KV tensor and serialize it as raw or 4-bit data."""
-        cpu = tensor.detach().to("cpu").contiguous()
-        shape = self._normalize(cpu)
+        work = tensor.detach().to("cpu").contiguous()
+        shape = self._normalize(work)
         method = scaling_method or self.scaling_method
         if not self.quantize:
-            return self._raw_payload(cpu, shape)
+            return self._raw_payload(work, shape)
         rh, asym, precond = (False, False, False) if method == "per_tensor" else (self.rh, self.asym, self.precond)
-        header = self._quant_header(shape, cpu.dtype, method, rh, asym, precond)
+        header = self._quant_header(shape, work.dtype, method, rh, asym, precond)
         ids = KVWeaveCodecConfig.next_scale_ids(2)
-        payload = self._native().kvweave_serialize_chunk(
+        payload = bytes(self.native.kvweave_serialize_chunk(
             shape.tensor4d, header, ids[0], ids[1], qbit=self.qbit,
             blocks_num=max(1, shape.chunk_tokens // self.block_size),
             block_size=self.block_size, head_num=self._head_num(shape.hidden_dim),
             head_dim=self._head_dim(shape.hidden_dim), num_layers=shape.num_layers,
             rh=rh, asym=asym, scaling_method=method, num_threads=self.num_threads,
-        )
-        payload = bytes(payload)
-        raw_bytes = cpu.numel() * cpu.element_size()
+        ))
+        raw_bytes = work.numel() * work.element_size()
         logger.debug(
             "KVWeave quantize store shape=%s dtype=%s qbit=%d scaling=%s "
             "raw_bytes=%d payload_bytes=%d ratio=%.4f",
-            tuple(cpu.shape), cpu.dtype, self.qbit, method, raw_bytes,
+            tuple(work.shape), work.dtype, self.qbit, method, raw_bytes,
             len(payload), len(payload) / raw_bytes if raw_bytes else 0.0,
         )
         return payload
 
     def deserialize_tensor(self, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Decode a payload and restore it into the destination KV tensor."""
-        parsed = self._parse(self._tensor_bytes(src))
+        payload = self._payload_u8(src)
+        parsed = self._read_header(payload)
         if parsed["raw"]:
-            data = torch.frombuffer(bytearray(parsed["data"]), dtype=parsed["dtype"])
+            data = self._payload_tail(payload, parsed["data_offset"], parsed["dtype"])
             dst.copy_(data.reshape(dst.shape).to(dtype=dst.dtype, device=dst.device))
             return
         shape = parsed["shape4d"]
-        q = torch.frombuffer(bytearray(parsed["q_data"]), dtype=torch.int8)
-        native = self._native()
+        q_dtype = torch.int8 if parsed["qbit"] <= 8 else torch.int16
+        q = self._payload_tail(payload, parsed["q_offset"], q_dtype)
         kwargs = dict(
             qbit=parsed["qbit"], blocks_num=parsed["blocks_num"], block_size=self.block_size,
             head_num=parsed["head_num"], head_dim=parsed["head_dim"], rh=parsed["rh"],
             asym=parsed["asym"], scaling_method=parsed["scaling"], output_dtype=dst.dtype,
             num_threads=self.num_threads,
         )
-        if hasattr(native, "kvweave_dequantize_chunk_into_4d") and dst.dim() == 4:
-            native.kvweave_dequantize_chunk_into_4d(q, parsed["k_scales"], parsed["v_scales"], dst, shape[1], shape[2], shape[3], **kwargs)
+        if (
+            hasattr(self.native, "kvweave_dequantize_chunk_into_4d")
+            and dst.dim() == 4
+            and dst.device.type == "cpu"
+        ):
+            self.native.kvweave_dequantize_chunk_into_4d(
+                q, parsed["k_scales"], parsed["v_scales"], dst, shape[1], shape[2], shape[3], **kwargs
+            )
             return
-        restored = native.kvweave_dequantize_chunk(q, parsed["k_scales"], parsed["v_scales"], shape[1], shape[2], shape[3], **kwargs)
+        restored = self.native.kvweave_dequantize_chunk(
+            q, parsed["k_scales"], parsed["v_scales"], shape[1], shape[2], shape[3], **kwargs
+        )
         if dst.dim() == 3:
             restored = restored.squeeze(1).permute(1, 0, 2)
         dst.copy_(restored.to(dtype=dst.dtype, device=dst.device))
@@ -204,8 +262,8 @@ class _KVWeaveCodec:
             raise ValueError(
                 f"KVWeave fused-K/V tensor expects [L, T, H], got {tuple(tensor.shape)}"
             )
-        cpu = tensor.detach().to("cpu").contiguous()
-        shape = tuple(int(dim) for dim in cpu.shape)
+        work = tensor.detach().to("cpu").contiguous()
+        shape = tuple(int(dim) for dim in work.shape)
         layers, tokens, hidden = shape
         method = scaling_method or self.scaling_method
         rh, asym = (False, False) if method == "per_tensor" else (self.rh, self.asym)
@@ -222,37 +280,38 @@ class _KVWeaveCodec:
         header = self._config.MAGIC_QUANT_FUSED + struct.pack(
             ">BBBBB" + "i" * len(shape),
             self.qbit,
-            self._config.DTYPE_TO_CODE.get(cpu.dtype, 0),
+            self._config.DTYPE_TO_CODE.get(work.dtype, 0),
             flags,
             self._config.SCALING_TO_CODE.get(method, 1),
             len(shape),
             *shape,
         )
+        blocks_num = max(1, tokens // self.block_size)
         signs = perm = None
         if precond:
             transform_size = self._fused_rh_transform_size(
                 tokens, hidden, head_dim, method, per_head_scales
             )
             signs, perm = self._config.mamba_precond_tensors(transform_size)
-        native_src = cpu
+        native_src = work
         native_layers = layers
         if per_head_scales:
             expected_shape = (layers * head_num, tokens, head_dim)
             if head_split is not None:
                 if (
                     tuple(head_split.shape) != expected_shape
-                    or head_split.dtype != cpu.dtype
+                    or head_split.dtype != work.dtype
                     or not head_split.is_contiguous()
                 ):
                     raise ValueError("head_split does not match fused attention layout")
                 native_src = head_split
             else:
-                native_src = self.split_fused_attention_heads(cpu, head_num, head_dim)
+                native_src = self.split_fused_attention_heads(work, head_num, head_dim)
             native_layers *= head_num
         return bytes(
-            self._native().kvweave_serialize_chunk_state(
+            self.native.kvweave_serialize_chunk_state(
                 native_src.view(-1), header, KVWeaveCodecConfig.next_scale_id(),
-                qbit=self.qbit, blocks_num=max(1, tokens // self.block_size),
+                qbit=self.qbit, blocks_num=blocks_num,
                 block_size=self.block_size, head_num=head_num, head_dim=head_dim,
                 num_layers=native_layers, rh=rh, asym=asym, scaling_method=method,
                 signs=signs, perm=perm,
@@ -294,9 +353,12 @@ class _KVWeaveCodec:
 
     def deserialize_fused_tensor(self, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Decode a fused-K/V payload and restore it into the destination tensor."""
-        parsed = self._parse_fused(self._tensor_bytes(src))
+        payload = self._payload_u8(src)
+        parsed = self._read_fused_header(payload)
         layers, tokens, hidden = parsed["shape"]
-        q = torch.frombuffer(bytearray(parsed["q_data"]), dtype=torch.int8)
+        blocks_num = max(1, tokens // self.block_size)
+        q_dtype = torch.int8 if parsed["qbit"] <= 8 else torch.int16
+        q = self._payload_tail(payload, parsed["q_offset"], q_dtype)
         signs = perm = None
         if parsed["precond"]:
             transform_size = self._fused_rh_transform_size(
@@ -309,9 +371,9 @@ class _KVWeaveCodec:
             signs, perm = self._config.mamba_precond_tensors(transform_size)
         native_layers = layers * parsed["head_num"] if parsed["per_head_scales"] else layers
         native_hidden = parsed["head_dim"] if parsed["per_head_scales"] else hidden
-        restored = self._native().kvweave_dequantize_chunk_state(
+        restored = self.native.kvweave_dequantize_chunk_state(
             q, parsed["scales"], native_layers, tokens, native_hidden,
-            qbit=parsed["qbit"], blocks_num=max(1, tokens // self.block_size),
+            qbit=parsed["qbit"], blocks_num=blocks_num,
             block_size=self.block_size, head_num=parsed["head_num"],
             head_dim=parsed["head_dim"], rh=parsed["rh"], asym=parsed["asym"],
             scaling_method=parsed["scaling"], output_dtype=dst.dtype,
@@ -332,20 +394,25 @@ class _KVWeaveCodec:
                 )
         dst.copy_(restored.reshape(dst.shape).to(dtype=dst.dtype, device=dst.device))
 
-    def _parse_fused(self, raw: bytes) -> dict[str, object]:
-        """Parse a fused-K/V self-describing header for decode."""
-        stream = io.BytesIO(raw)
-        magic = stream.read(4)
+    def _read_fused_header(self, payload: torch.Tensor) -> dict[str, object]:
+        """Read a fused-K/V header without copying the quantized payload."""
+        raw = self._payload_buffer(payload)
+        magic = bytes(raw[:4])
         if magic != self._config.MAGIC_QUANT_FUSED:
             raise ValueError(f"invalid KVWeave fused payload magic: {magic!r}")
-        qbit, dtype_code, flags, scaling_code, ndim = struct.unpack(
-            ">BBBBB", stream.read(5)
+        offset = 4
+        qbit, dtype_code, flags, scaling_code, ndim = struct.unpack_from(
+            ">BBBBB", raw, offset
         )
-        shape = tuple(struct.unpack(">" + "i" * ndim, stream.read(4 * ndim)))
+        offset += 5
+        shape = tuple(struct.unpack_from(">" + "i" * ndim, raw, offset))
+        offset += 4 * ndim
         if len(shape) != 3:
             raise ValueError(f"KVWeave fused payload expects 3-D shape, got {shape}")
-        (scale_len,) = struct.unpack(">I", stream.read(4))
-        scales = stream.read(scale_len)
+        (scale_len,) = struct.unpack_from(">I", raw, offset)
+        offset += 4
+        scales = bytes(raw[offset : offset + scale_len])
+        offset += scale_len
         method = {
             value: key for key, value in self._config.SCALING_TO_CODE.items()
         }.get(scaling_code, self.scaling_method)
@@ -360,7 +427,7 @@ class _KVWeaveCodec:
             "scaling": method,
             "dtype": self._config.CODE_TO_DTYPE.get(dtype_code, torch.float16),
             "scales": scales,
-            "q_data": stream.read(),
+            "q_offset": offset,
             "head_num": self._fused_head_num(hidden),
             "head_dim": self._fused_head_dim(hidden),
         }
@@ -404,25 +471,32 @@ class _KVWeaveCodec:
     def _quant_header(self, shape: _KVShape, dtype: torch.dtype, method: str, rh: bool, asym: bool, precond: bool) -> bytes:
         return struct.pack(">4sBBBBBBBB" + "i" * shape.original_ndim, self._config.MAGIC_QUANT, self.qbit, int(rh), int(asym), int(precond), shape.original_ndim, 1, self._config.SCALING_TO_CODE.get(method, 1), self._config.DTYPE_TO_CODE.get(dtype, 0), *shape.header_shape)
 
-    def _parse(self, raw: bytes) -> dict[str, object]:
-        """Parse the self-describing header and expose native decode fields."""
-        stream = io.BytesIO(raw)
-        magic = stream.read(4)
+    def _read_header(self, payload: torch.Tensor) -> dict[str, object]:
+        """Read the attention payload header without copying q_data."""
+        raw = self._payload_buffer(payload)
+        magic = bytes(raw[:4])
+        offset = 4
         if magic == self._config.MAGIC_RAW:
-            ndim, _, dtype_code = struct.unpack(">BBB", stream.read(3))
-            shape = tuple(struct.unpack(">" + "i" * ndim, stream.read(4 * ndim)))
-            return {"raw": True, "shape": shape, "dtype": self._config.CODE_TO_DTYPE.get(dtype_code, torch.float16), "data": stream.read()}
+            ndim, _, dtype_code = struct.unpack_from(">BBB", raw, offset)
+            offset += 3
+            shape = tuple(struct.unpack_from(">" + "i" * ndim, raw, offset))
+            offset += 4 * ndim
+            return {"raw": True, "shape": shape, "dtype": self._config.CODE_TO_DTYPE.get(dtype_code, torch.float16), "data_offset": offset}
         if magic != self._config.MAGIC_QUANT:
             raise ValueError(f"invalid KVWeave payload magic: {magic!r}")
-        qbit, rh, asym, _, ndim, _, scaling_code, dtype_code = struct.unpack(">BBBBBBBB", stream.read(8))
-        shape = tuple(struct.unpack(">" + "i" * ndim, stream.read(4 * ndim)))
+        qbit, rh, asym, _, ndim, _, scaling_code, dtype_code = struct.unpack_from(">BBBBBBBB", raw, offset)
+        offset += 8
+        shape = tuple(struct.unpack_from(">" + "i" * ndim, raw, offset))
+        offset += 4 * ndim
         shape4d = (shape[1], 1, shape[0], shape[2]) if ndim == 3 else shape
         scales = []
         for _ in range(2):
-            size = struct.unpack(">I", stream.read(4))[0]
-            scales.append(stream.read(size))
+            size = struct.unpack_from(">I", raw, offset)[0]
+            offset += 4
+            scales.append(bytes(raw[offset:offset + size]))
+            offset += size
         method = {value: key for key, value in self._config.SCALING_TO_CODE.items()}.get(scaling_code, self.scaling_method)
-        return {"raw": False, "shape4d": shape4d, "qbit": qbit, "rh": bool(rh), "asym": bool(asym), "scaling": method, "dtype": self._config.CODE_TO_DTYPE.get(dtype_code, torch.float16), "k_scales": scales[0], "v_scales": scales[1], "q_data": stream.read(), "blocks_num": max(1, shape4d[2] // self.block_size), "head_num": self._head_num(shape4d[3]), "head_dim": self._head_dim(shape4d[3])}
+        return {"raw": False, "shape4d": shape4d, "qbit": qbit, "rh": bool(rh), "asym": bool(asym), "scaling": method, "dtype": self._config.CODE_TO_DTYPE.get(dtype_code, torch.float16), "k_scales": scales[0], "v_scales": scales[1], "q_offset": offset, "blocks_num": max(1, shape4d[2] // self.block_size), "head_num": self._head_num(shape4d[3]), "head_dim": self._head_dim(shape4d[3])}
 
     def _head_num(self, hidden: int) -> int:
         return self.num_kv_heads if self.num_kv_heads > 1 and hidden % self.num_kv_heads == 0 else 1
@@ -640,10 +714,9 @@ class _KVWeaveCodec:
         rh: bool,
         asym: bool,
         qbit: int = KVWeaveCodecConfig.MAMBA_QBIT,
+        device: str = "cpu",
     ) -> bytes:
         """Quantize one real Mamba sub-state with native state kernels."""
-        if kvweave_quant is None:
-            raise RuntimeError("KVWeave native quantization extension is unavailable")
         if tensor.dtype not in KVWeaveCodecConfig.DTYPE_TO_CODE:
             raise ValueError(f"unsupported dtype for 4-bit quantization: {tensor.dtype}")
         if substate not in KVWeaveCodecConfig.SUBSTATE_TO_CODE:
@@ -652,31 +725,129 @@ class _KVWeaveCodec:
             raise ValueError(f"unsupported scaling_method: {scaling_method!r}")
         if tensor.dim() < 2 :
             raise ValueError("invalid Mamba tensor or RH configuration")
-        cpu = tensor.detach().to("cpu").contiguous()
-        shape = tuple(int(dim) for dim in cpu.shape)
+        work = tensor.detach().to("cpu").contiguous()
+        shape = tuple(int(dim) for dim in work.shape)
         blocks, heads, head_dim, chunks = _KVWeaveCodec._mamba_layout(substate, shape, scaling_method)
         signs = perm = None
         if rh:
             signs, perm = _KVWeaveCodec._mamba_precond_pair(
-                max(cpu.numel() // shape[0] // chunks, 1)
+                max(work.numel() // shape[0] // chunks, 1)
             )
         flags = (KVWeaveCodecConfig.MAMBA_FLAG_RH if rh else 0) | (KVWeaveCodecConfig.MAMBA_FLAG_ASYM if asym else 0)
-        header = KVWeaveCodecConfig.MAMBA_MAGIC + struct.pack(">BBBBBB" + "i" * len(shape), qbit, KVWeaveCodecConfig.DTYPE_TO_CODE[cpu.dtype], flags, KVWeaveCodecConfig.SCALING_TO_CODE[scaling_method], KVWeaveCodecConfig.SUBSTATE_TO_CODE[substate], len(shape), *shape)
-        payload = bytes(kvweave_quant.kvweave_serialize_chunk_state(
-            cpu.view(-1), header, KVWeaveCodecConfig.next_scale_id(),
+        header = KVWeaveCodecConfig.MAMBA_MAGIC + struct.pack(">BBBBBB" + "i" * len(shape), qbit, KVWeaveCodecConfig.DTYPE_TO_CODE[work.dtype], flags, KVWeaveCodecConfig.SCALING_TO_CODE[scaling_method], KVWeaveCodecConfig.SUBSTATE_TO_CODE[substate], len(shape), *shape)
+        native = _resolve_native(device)
+        payload = bytes(native.kvweave_serialize_chunk_state(
+            work.view(-1), header, KVWeaveCodecConfig.next_scale_id(),
             qbit=qbit, blocks_num=blocks,
             block_size=1, head_num=heads, head_dim=head_dim,
             num_layers=shape[0], rh=rh, asym=asym,
             scaling_method=scaling_method, signs=signs, perm=perm,
         ))
-        raw_bytes = cpu.numel() * cpu.element_size()
+        raw_bytes = work.numel() * work.element_size()
         logger.debug(
             "Mamba quantize %s shape=%s dtype=%s qbit=%d raw_bytes=%d "
             "payload_bytes=%d ratio=%.4f",
-            substate, shape, cpu.dtype, qbit, raw_bytes, len(payload),
+            substate, shape, work.dtype, qbit, raw_bytes, len(payload),
             len(payload) / raw_bytes if raw_bytes else 0.0,
         )
         return payload
+
+    @staticmethod
+    def _quantize_mamba_substates_batch_xpu(jobs: list[dict]) -> list[bytes]:
+        """Batch >=2 independent Mamba substate quantize jobs into one XPU
+        round trip via ``kvweave_quant_xpu.kvweave_serialize_chunk_state_multi``.
+
+        Each ``job`` dict carries the same per-item inputs
+        :meth:`_quantize_mamba_substate_payload` takes (``tensor``,
+        ``substate``, ``scaling_method``, ``rh``, ``asym``, ``qbit``).
+        Produces byte-identical payloads to calling
+        ``quantize_mamba_substate_4bit(..., device="xpu")`` once per job --
+        this only collapses the redundant per-job H2D upload/D2H download
+        into one combined transfer, never changes the wire format. All jobs
+        must share one tensor dtype (enforced by the native entry point);
+        callers group jobs by dtype first (see :meth:`_quantize_mamba_jobs`).
+        """
+        native = _resolve_native("xpu")
+        works, headers = [], []
+        blocks_list, block_sizes, head_nums, head_dims = [], [], [], []
+        num_layers_list, rh_list, asym_list, scaling_list = [], [], [], []
+        signs_list, perm_list = [], []
+        for job in jobs:
+            tensor = job["tensor"]
+            work = tensor.detach().to("cpu").contiguous()
+            shape = tuple(int(dim) for dim in work.shape)
+            blocks, heads, head_dim, chunks = _KVWeaveCodec._mamba_layout(
+                job["substate"], shape, job["scaling_method"]
+            )
+            signs = perm = None
+            if job["rh"]:
+                signs, perm = _KVWeaveCodec._mamba_precond_pair(
+                    max(work.numel() // shape[0] // chunks, 1)
+                )
+            flags = (
+                (KVWeaveCodecConfig.MAMBA_FLAG_RH if job["rh"] else 0)
+                | (KVWeaveCodecConfig.MAMBA_FLAG_ASYM if job["asym"] else 0)
+            )
+            header = KVWeaveCodecConfig.MAMBA_MAGIC + struct.pack(
+                ">BBBBBB" + "i" * len(shape),
+                job["qbit"], KVWeaveCodecConfig.DTYPE_TO_CODE[work.dtype], flags,
+                KVWeaveCodecConfig.SCALING_TO_CODE[job["scaling_method"]],
+                KVWeaveCodecConfig.SUBSTATE_TO_CODE[job["substate"]], len(shape), *shape,
+            )
+            works.append(work.view(-1))
+            headers.append(header)
+            blocks_list.append(blocks)
+            block_sizes.append(1)
+            head_nums.append(heads)
+            head_dims.append(head_dim)
+            num_layers_list.append(shape[0])
+            rh_list.append(job["rh"])
+            asym_list.append(job["asym"])
+            scaling_list.append(job["scaling_method"])
+            signs_list.append(signs)
+            perm_list.append(perm)
+        return list(native.kvweave_serialize_chunk_state_multi(
+            works, headers, [0] * len(jobs), [job["qbit"] for job in jobs],
+            blocks_list, block_sizes, head_nums, head_dims, num_layers_list,
+            rh_list, asym_list, scaling_list, signs_list, perm_list,
+        ))
+
+    @staticmethod
+    def _quantize_mamba_jobs(jobs: list[dict], device: str) -> list[bytes]:
+        """Quantize N independent Mamba substate jobs (e.g. conv-query/
+        conv-key/conv-value/ssm), batching same-dtype groups into a single
+        XPU round trip when ``device == "xpu"``. CPU device, a single job,
+        or a dtype-singleton group all fall back to one native call per job
+        -- unchanged from the pre-batching behavior, since there is no
+        transfer to save in those cases.
+        """
+        if device != "xpu" or len(jobs) <= 1:
+            return [
+                _KVWeaveCodec.quantize_mamba_substate_4bit(
+                    job["tensor"], substate=job["substate"], scaling_method=job["scaling_method"],
+                    rh=job["rh"], asym=job["asym"], qbit=job["qbit"], device=device,
+                )
+                for job in jobs
+            ]
+        results: list[bytes] = [b""] * len(jobs)
+        groups: dict[torch.dtype, list[int]] = {}
+        for idx, job in enumerate(jobs):
+            groups.setdefault(job["tensor"].dtype, []).append(idx)
+        for indices in groups.values():
+            if len(indices) == 1:
+                idx = indices[0]
+                job = jobs[idx]
+                results[idx] = _KVWeaveCodec.quantize_mamba_substate_4bit(
+                    job["tensor"], substate=job["substate"], scaling_method=job["scaling_method"],
+                    rh=job["rh"], asym=job["asym"], qbit=job["qbit"], device=device,
+                )
+                continue
+            batch_payloads = _KVWeaveCodec._quantize_mamba_substates_batch_xpu(
+                [jobs[i] for i in indices]
+            )
+            for idx, payload in zip(indices, batch_payloads):
+                results[idx] = payload
+        return results
 
     @staticmethod
     def _decode_mamba_substate(
@@ -684,6 +855,7 @@ class _KVWeaveCodec:
         layout: MambaSubStateWireLayout,
         layers: int,
         blocks: int,
+        device: str = "cpu",
     ) -> torch.Tensor:
         """Decode one sub-state payload, honoring its leading quant-enabled flag.
 
@@ -692,17 +864,18 @@ class _KVWeaveCodec:
         skipped 4-bit quantization for this sub-state and wrote its real
         bytes verbatim; ``\\x01`` means the rest is a normal MQ01 payload.
         """
-        flag, payload = flagged_payload[0], flagged_payload[1:]
+        view = memoryview(flagged_payload)
+        flag, payload = view[0], view[1:]
         if flag == 0:
             dtype = KVWeaveCodecConfig.mamba_dtype(layout.dtype_str)
-            return torch.frombuffer(bytearray(payload), dtype=dtype).reshape(
+            return torch.frombuffer(payload, dtype=dtype).reshape(
                 layers, blocks, *layout.shape
             )
         if flag == 2:
-            return torch.frombuffer(bytearray(payload), dtype=torch.float16).reshape(
+            return torch.frombuffer(payload, dtype=torch.float16).reshape(
                 layers, blocks, *layout.shape
             ).to(dtype=KVWeaveCodecConfig.mamba_dtype(layout.dtype_str))
-        return _KVWeaveCodec.dequantize_mamba_substate_4bit(payload)
+        return _KVWeaveCodec.dequantize_mamba_substate_4bit(payload, device=device)
 
     @staticmethod
     def _decode_conv_substate(
@@ -710,6 +883,7 @@ class _KVWeaveCodec:
         layout: MambaSubStateWireLayout,
         layers: int,
         blocks: int,
+        device: str = "cpu",
     ) -> torch.Tensor:
         """Decode conv_state's payload, honoring its leading quant-enabled flag.
 
@@ -722,34 +896,41 @@ class _KVWeaveCodec:
         ssm-only, see ``encode_chunk``), but it's handled the same way as
         ``_decode_mamba_substate`` for symmetry.
         """
-        flag, payload = flagged_payload[0], flagged_payload[1:]
+        view = memoryview(flagged_payload)
+        flag, payload = view[0], view[1:]
         if flag == 0:
             dtype = KVWeaveCodecConfig.mamba_dtype(layout.dtype_str)
-            return torch.frombuffer(bytearray(payload), dtype=dtype).reshape(
+            return torch.frombuffer(payload, dtype=dtype).reshape(
                 layers, blocks, *layout.shape
             )
         if flag == 2:
-            return torch.frombuffer(bytearray(payload), dtype=torch.float16).reshape(
+            return torch.frombuffer(payload, dtype=torch.float16).reshape(
                 layers, blocks, *layout.shape
             ).to(dtype=KVWeaveCodecConfig.mamba_dtype(layout.dtype_str))
         query, key, value = _KVWeaveCodec.unpack_conv_qkv_payloads(payload)
         return torch.cat(
             [
-                _KVWeaveCodec.dequantize_mamba_substate_4bit(sub)
+                _KVWeaveCodec.dequantize_mamba_substate_4bit(sub, device=device)
                 for sub in (query, key, value)
             ],
             dim=-1,
         )
 
     @staticmethod
-    def dequantize_mamba_substate_4bit(payload: bytes) -> torch.Tensor:
-        """Decode a self-describing native Mamba sub-state payload."""
-        if kvweave_quant is None:
-            raise RuntimeError("KVWeave native quantization extension is unavailable")
-        if payload[:4] != KVWeaveCodecConfig.MAMBA_MAGIC:
-            raise ValueError(f"unrecognized payload magic: {payload[:4]!r}")
-        qbit, dtype_code, flags, scaling_code, substate_code, ndim = struct.unpack(
-            ">BBBBBB", payload[4:10]
+    def _read_mamba_substate_payload(payload) -> dict[str, object]:
+        """Read a native Mamba sub-state payload header without copying q_data.
+
+        Split out of :meth:`dequantize_mamba_substate_4bit` so several
+        payloads' native calls can be batched into one XPU round trip while
+        the metadata decode stays single-sourced between the batched and
+        single-item paths.
+        """
+        view = memoryview(payload)
+        magic = bytes(view[:4])
+        if magic != KVWeaveCodecConfig.MAMBA_MAGIC:
+            raise ValueError(f"unrecognized payload magic: {magic!r}")
+        qbit, dtype_code, flags, scaling_code, substate_code, ndim = struct.unpack_from(
+            ">BBBBBB", view, 4
         )
         scaling_map = {v: k for k, v in KVWeaveCodecConfig.SCALING_TO_CODE.items()}
         substate_map = {v: k for k, v in KVWeaveCodecConfig.SUBSTATE_TO_CODE.items()}
@@ -758,7 +939,7 @@ class _KVWeaveCodec:
         if scaling_code not in scaling_map or substate_code not in substate_map:
             raise ValueError("unsupported scaling method or substate in Mamba payload")
         offset = 10
-        shape = tuple(struct.unpack(">" + "i" * ndim, payload[offset:offset + 4 * ndim]))
+        shape = tuple(struct.unpack_from(">" + "i" * ndim, view, offset))
         offset += 4 * ndim
         scaling = scaling_map[scaling_code]
         substate = substate_map[substate_code]
@@ -768,27 +949,173 @@ class _KVWeaveCodec:
         num_layers = shape[0]
         num_blocks = shape[1]
         blocks, heads, head_dim, chunks = _KVWeaveCodec._mamba_layout(substate, shape, scaling)
-        (scale_size,) = struct.unpack(">I", payload[offset:offset + 4])
+        (scale_size,) = struct.unpack_from(">I", view, offset)
         offset += 4
-        scales = payload[offset:offset + scale_size]
+        scales = bytes(view[offset:offset + scale_size])
         offset += scale_size
-        q_data = torch.frombuffer(bytearray(payload[offset:]), dtype=torch.int8)
         signs = perm = None
         if flags & KVWeaveCodecConfig.MAMBA_FLAG_RH:
             transform = max(torch.tensor(shape).prod().item() // shape[0] // chunks, 1)
             signs, perm = _KVWeaveCodec._mamba_precond_pair(int(transform))
-        restored = kvweave_quant.kvweave_dequantize_chunk_state(
-            q_data, scales, shape[0], num_blocks,
-            numel // (num_layers * num_blocks),
-            qbit=qbit, blocks_num=blocks,
-            block_size=1, head_num=heads, head_dim=head_dim,
-            rh=bool(flags & KVWeaveCodecConfig.MAMBA_FLAG_RH),
-            asym=bool(flags & KVWeaveCodecConfig.MAMBA_FLAG_ASYM),
-            scaling_method=scaling,
-            output_dtype=KVWeaveCodecConfig.CODE_TO_DTYPE[dtype_code],
-            signs=signs, perm=perm,
+        output_dtype = KVWeaveCodecConfig.CODE_TO_DTYPE[dtype_code]
+        q_data = torch.frombuffer(view[offset:], dtype=torch.int8)
+        return {
+            "qbit": qbit,
+            "blocks_num": blocks,
+            "head_num": heads,
+            "head_dim": head_dim,
+            "num_layers": num_layers,
+            "num_blocks": num_blocks,
+            "h_merged": numel // (num_layers * num_blocks),
+            "rh": bool(flags & KVWeaveCodecConfig.MAMBA_FLAG_RH),
+            "asym": bool(flags & KVWeaveCodecConfig.MAMBA_FLAG_ASYM),
+            "scaling_method": scaling,
+            "output_dtype": output_dtype,
+            "signs": signs,
+            "perm": perm,
+            "q_data": q_data,
+            "scales": scales,
+            "shape": shape,
+        }
+
+    @staticmethod
+    def dequantize_mamba_substate_4bit(payload: bytes, device: str = "cpu") -> torch.Tensor:
+        """Decode a self-describing native Mamba sub-state payload."""
+        p = _KVWeaveCodec._read_mamba_substate_payload(payload)
+        native = _resolve_native(device)
+        restored = native.kvweave_dequantize_chunk_state(
+            p["q_data"], p["scales"], p["num_layers"], p["num_blocks"], p["h_merged"],
+            qbit=p["qbit"], blocks_num=p["blocks_num"],
+            block_size=1, head_num=p["head_num"], head_dim=p["head_dim"],
+            rh=p["rh"], asym=p["asym"],
+            scaling_method=p["scaling_method"],
+            output_dtype=p["output_dtype"],
+            signs=p["signs"], perm=p["perm"],
         )
-        return restored.reshape(shape)
+        return restored.reshape(p["shape"])
+
+    @staticmethod
+    def _dequantize_mamba_substates_batch_xpu(parsed_list: list[dict]) -> list[torch.Tensor]:
+        """Batch >=2 already-parsed Mamba substate specs into one XPU
+        dequantize round trip via
+        ``kvweave_quant_xpu.kvweave_dequantize_chunk_state_multi``. Requires
+        all items share one output dtype (enforced by the native entry
+        point); callers group parsed specs by output dtype first (see
+        :meth:`_dequantize_mamba_payloads`).
+        """
+        native = _resolve_native("xpu")
+        results = native.kvweave_dequantize_chunk_state_multi(
+            [p["q_data"] for p in parsed_list],
+            [p["scales"] for p in parsed_list],
+            [p["num_layers"] for p in parsed_list],
+            [p["num_blocks"] for p in parsed_list],
+            [p["h_merged"] for p in parsed_list],
+            [p["qbit"] for p in parsed_list],
+            [p["blocks_num"] for p in parsed_list],
+            [1] * len(parsed_list),
+            [p["head_num"] for p in parsed_list],
+            [p["head_dim"] for p in parsed_list],
+            [p["rh"] for p in parsed_list],
+            [p["asym"] for p in parsed_list],
+            [p["scaling_method"] for p in parsed_list],
+            [p["output_dtype"] for p in parsed_list],
+            [p["signs"] for p in parsed_list],
+            [p["perm"] for p in parsed_list],
+        )
+        return [r.reshape(p["shape"]) for r, p in zip(results, parsed_list)]
+
+    @staticmethod
+    def _dequantize_mamba_payloads(payloads: list[bytes], device: str) -> list[torch.Tensor]:
+        """Dequantize N independent Mamba substate payloads, batching
+        same-output-dtype groups into a single XPU round trip when
+        ``device == "xpu"`` (mirrors :meth:`_quantize_mamba_jobs`). CPU
+        device, a single payload, or a dtype-singleton group all fall back
+        to one native call per payload -- unchanged behavior, since there
+        is no transfer to save in those cases.
+        """
+        if device != "xpu" or len(payloads) <= 1:
+            return [
+                _KVWeaveCodec.dequantize_mamba_substate_4bit(p, device=device) for p in payloads
+            ]
+        parsed_list = [_KVWeaveCodec._read_mamba_substate_payload(p) for p in payloads]
+        results: list[torch.Tensor] = [None] * len(payloads)  # type: ignore[list-item]
+        groups: dict[torch.dtype, list[int]] = {}
+        for idx, parsed in enumerate(parsed_list):
+            groups.setdefault(parsed["output_dtype"], []).append(idx)
+        native = _resolve_native("xpu")
+        for indices in groups.values():
+            if len(indices) == 1:
+                idx = indices[0]
+                p = parsed_list[idx]
+                restored = native.kvweave_dequantize_chunk_state(
+                    p["q_data"], p["scales"], p["num_layers"], p["num_blocks"], p["h_merged"],
+                    qbit=p["qbit"], blocks_num=p["blocks_num"],
+                    block_size=1, head_num=p["head_num"], head_dim=p["head_dim"],
+                    rh=p["rh"], asym=p["asym"], scaling_method=p["scaling_method"],
+                    output_dtype=p["output_dtype"], signs=p["signs"], perm=p["perm"],
+                )
+                results[idx] = restored.reshape(p["shape"])
+                continue
+            batch_results = _KVWeaveCodec._dequantize_mamba_substates_batch_xpu(
+                [parsed_list[i] for i in indices]
+            )
+            for idx, r in zip(indices, batch_results):
+                results[idx] = r
+        return results
+
+    @staticmethod
+    def _decode_mamba_substates_xpu_batched(
+        conv_payload: bytes,
+        ssm_payload: bytes,
+        conv_layout: MambaSubStateWireLayout,
+        ssm_layout: MambaSubStateWireLayout,
+        layers: int,
+        blocks: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """XPU fast path for :meth:`decode_chunk`'s Mamba branch: collects
+        every substate payload that needs a native dequantize call (conv's
+        query/key/value when quantized, ssm when quantized) and dequantizes
+        them together via :meth:`_dequantize_mamba_payloads`'s batching,
+        instead of each substate independently round-tripping to the
+        device. Falls back to :meth:`_decode_conv_substate`/
+        :meth:`_decode_mamba_substate` for a substate whose flag byte says
+        it was never natively quantized (flag 0/2) -- those never touch the
+        device either way, so there is nothing to batch there.
+        """
+        conv_flag = conv_payload[0]
+        ssm_flag = ssm_payload[0]
+
+        native_payloads: list[bytes] = []
+        conv_indices: tuple[int, int, int] | None = None
+        ssm_index: int | None = None
+        if conv_flag == 1:
+            qkv = _KVWeaveCodec.unpack_conv_qkv_payloads(conv_payload[1:])
+            conv_indices = (0, 1, 2)
+            native_payloads.extend(qkv)
+        if ssm_flag == 1:
+            ssm_index = len(native_payloads)
+            native_payloads.append(ssm_payload[1:])
+
+        dequantized = (
+            _KVWeaveCodec._dequantize_mamba_payloads(native_payloads, device="xpu")
+            if native_payloads else []
+        )
+
+        if conv_indices is not None:
+            conv = torch.cat([dequantized[i] for i in conv_indices], dim=-1)
+        else:
+            conv = _KVWeaveCodec._decode_conv_substate(
+                conv_payload, conv_layout, layers, blocks, device="xpu"
+            )
+
+        if ssm_index is not None:
+            ssm = dequantized[ssm_index]
+        else:
+            ssm = _KVWeaveCodec._decode_mamba_substate(
+                ssm_payload, ssm_layout, layers, blocks, device="xpu"
+            )
+
+        return conv, ssm
 
     @staticmethod
     def quantize_mamba_substate_4bit(
@@ -799,11 +1126,12 @@ class _KVWeaveCodec:
         rh: bool = False,
         asym: bool = False,
         qbit: int = KVWeaveCodecConfig.MAMBA_QBIT,
+        device: str = "cpu",
     ) -> bytes:
         """Quantize a Mamba sub-state using the verified state layout contract."""
         return _KVWeaveCodec._quantize_mamba_substate_payload(
             tensor, substate=substate, scaling_method=scaling_method,
-            rh=rh, asym=asym, qbit=qbit,
+            rh=rh, asym=asym, qbit=qbit, device=device,
         )
 
     @staticmethod
@@ -1172,39 +1500,53 @@ class _KVWeaveCodec:
             split = mamba_split or self.split_mamba_chunk(
                 raw_chunk, mamba_layout, tokens_per_block
             )
-            if getattr(mamba_options, "conv_quant_enabled", True):
+            conv_enabled = getattr(mamba_options, "conv_quant_enabled", True)
+            ssm_enabled = getattr(mamba_options, "ssm_quant_enabled", True)
+            ssm_raw_fallback = ssm_enabled and mamba_options.ssm_qbit == 16
+
+            # Collect every substate that needs a native quantize call
+            # (conv's query/key/value when enabled, ssm when enabled and not
+            # the raw-fp16 fallback) and quantize them together: on
+            # device="xpu" this collapses what would otherwise be up to 4
+            # independent host<->XPU round trips (one per substate) into as
+            # few as 1, since they usually share the KV cache's tensor
+            # dtype. See _quantize_mamba_jobs.
+            jobs = []
+            if conv_enabled:
                 query, key, value = self._split_conv_qkv(
                     split.conv, mamba_options.conv_qkv_split
                 )
+                for sub in (query, key, value):
+                    jobs.append(dict(
+                        tensor=sub, substate="conv",
+                        scaling_method=mamba_options.conv_scaling_method,
+                        rh=mamba_options.conv_rh, asym=mamba_options.asym,
+                        qbit=mamba_options.conv_qbit,
+                    ))
+            if ssm_enabled and not ssm_raw_fallback:
+                jobs.append(dict(
+                    tensor=split.ssm, substate="ssm",
+                    scaling_method=mamba_options.ssm_scaling_method,
+                    rh=mamba_options.ssm_rh, asym=mamba_options.asym,
+                    qbit=mamba_options.ssm_qbit,
+                ))
+
+            payloads = iter(self._quantize_mamba_jobs(jobs, self.device))
+
+            if conv_enabled:
                 conv_payload = b"\x01" + self.pack_conv_qkv_payloads(
-                    *(
-                        self.quantize_mamba_substate_4bit(
-                            sub,
-                            substate="conv",
-                            scaling_method=mamba_options.conv_scaling_method,
-                            rh=mamba_options.conv_rh,
-                            asym=mamba_options.asym,
-                            qbit=mamba_options.conv_qbit,
-                        )
-                        for sub in (query, key, value)
-                    )
+                    *(next(payloads) for _ in range(3))
                 )
             else:
                 conv_payload = b"\x00" + self._tensor_bytes(split.conv)
-            if getattr(mamba_options, "ssm_quant_enabled", True):
-                if mamba_options.ssm_qbit == 16:
+
+            if ssm_enabled:
+                if ssm_raw_fallback:
                     ssm_payload = b"\x02" + self._tensor_bytes(
                         split.ssm.to(dtype=torch.float16)
                     )
                 else:
-                    ssm_payload = b"\x01" + self.quantize_mamba_substate_4bit(
-                        split.ssm,
-                        substate="ssm",
-                        scaling_method=mamba_options.ssm_scaling_method,
-                        rh=mamba_options.ssm_rh,
-                        asym=mamba_options.asym,
-                        qbit=mamba_options.ssm_qbit,
-                    )
+                    ssm_payload = b"\x01" + next(payloads)
             else:
                 ssm_payload = b"\x00" + self._tensor_bytes(split.ssm)
             return self.pack_mamba_payloads(conv_payload, ssm_payload)
@@ -1287,8 +1629,13 @@ class _KVWeaveCodec:
             layers = raw_shape[1] if len(raw_shape) == 4 else raw_shape[0]
             tokens = raw_shape[-2]
             blocks = max(tokens // tokens_per_block, 1)
-            conv = self._decode_conv_substate(conv_payload, conv_layout, layers, blocks)
-            ssm = self._decode_mamba_substate(ssm_payload, ssm_layout, layers, blocks)
+            if self.device == "xpu":
+                conv, ssm = self._decode_mamba_substates_xpu_batched(
+                    conv_payload, ssm_payload, conv_layout, ssm_layout, layers, blocks
+                )
+            else:
+                conv = self._decode_conv_substate(conv_payload, conv_layout, layers, blocks, device=self.device)
+                ssm = self._decode_mamba_substate(ssm_payload, ssm_layout, layers, blocks, device=self.device)
             hidden_dim = raw_shape[-1]
             merged = self.merge_mamba_chunk(
                 MambaChunkSplit(conv, ssm), mamba_layout, tokens_per_block,

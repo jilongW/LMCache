@@ -123,6 +123,15 @@ def _env_attention_qbit() -> int:
     return qbit
 
 
+def _env_device(name: str = "LMCACHE_MP_KVWEAVE_QUANT_DEVICE") -> str:
+    """Read and validate the KVWeave quant/dequant compute device."""
+    value = os.environ.get(name, "cpu").strip().lower()
+    valid = {"cpu", "xpu"}
+    if value not in valid:
+        raise ValueError(f"{name}={value!r} is not one of {sorted(valid)}")
+    return value
+
+
 def _env_num_threads() -> int:
     """Read the native KVWeave quant kernel's OpenMP thread count.
 
@@ -285,6 +294,7 @@ class KVWeaveRuntimeConfig:
                 "rh": _env_flag("LMCACHE_MP_KVWEAVE_RH", True),
                 "asym": _env_flag("LMCACHE_MP_KVWEAVE_ASYM", True),
                 "precond": _env_flag("LMCACHE_MP_KVWEAVE_PRECOND", True),
+                "device": _env_device(),
                 "num_threads": _env_num_threads(),
             },
             mamba_options=MambaCodecOptions.from_env(),
