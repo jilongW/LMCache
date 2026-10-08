@@ -446,8 +446,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 self._scratch_slots[instance_id] = slot
                 return slot
         logger.warning(
-            "No engine-driven scratch partition available for instance %d; "
-            "falling back to temporary CPU buffers",
+            "No engine-driven pinned scratch partition available for instance %d",
             instance_id,
         )
         return 0, 0

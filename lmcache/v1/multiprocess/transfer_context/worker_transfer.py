@@ -2312,26 +2312,7 @@ class EngineDrivenTransferContext(TransferContext):
                     len(selection.chunk_indices),
                     wait=False,
                 )
-                if scratch is not None:
-                    group_out_buffers, scratch_allocation = scratch
-                else:
-                    requested_bytes = (
-                        int(raw_shape.numel())
-                        * torch.empty((), dtype=raw_dtype).element_size()
-                        * len(selection.chunk_indices)
-                    )
-                    logger.info(
-                        "Engine-driven scratch allocation unavailable for "
-                        "request_id=%s group=%s chunks=%d requested=%.3f MiB; "
-                        "falling back to temporary CPU buffers",
-                        _request_id,
-                        plan.group_info.engine_group_id
-                        if plan.group_info is not None
-                        else -1,
-                        len(selection.chunk_indices),
-                        requested_bytes / (1 << 20),
-                    )
-                    group_out_buffers = None
+                group_out_buffers, scratch_allocation = scratch
             elif plan.quantized:
                 group_out_buffers = None
             gathered = gather_paged_kv_to_cpu(
@@ -2582,26 +2563,8 @@ class EngineDrivenTransferContext(TransferContext):
                             num_live_chunks,
                             wait=False,
                         )
-                        if scratch is not None:
-                            decoded_out_buffers, allocation = scratch
-                            decode_scratch_allocations.append(allocation)
-                        else:
-                            requested_bytes = (
-                                int(raw_shape.numel())
-                                * torch.empty((), dtype=raw_dtype).element_size()
-                                * num_live_chunks
-                            )
-                            logger.info(
-                                "Engine-driven retrieve scratch allocation unavailable for "
-                                "request_id=%s group=%s chunks=%d requested=%.3f MiB; "
-                                "falling back to temporary CPU buffers",
-                                _request_id,
-                                plan.group_info.engine_group_id
-                                if plan.group_info is not None
-                                else -1,
-                                num_live_chunks,
-                                requested_bytes / (1 << 20),
-                            )
+                        decoded_out_buffers, allocation = scratch
+                        decode_scratch_allocations.append(allocation)
                     group_chunks = self._decode_group_chunks(
                         plan, group_chunks, out=decoded_out_buffers
                     )

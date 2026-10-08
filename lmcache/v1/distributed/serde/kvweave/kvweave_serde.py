@@ -133,6 +133,12 @@ class _KVWeaveCodec:
             if offset % 2:
                 raise ValueError("KVWeave int16 q_data is not 2-byte aligned")
             return payload[offset:].view(torch.int16)
+        if dtype in {torch.float16, torch.bfloat16, torch.float32, torch.float64}:
+            itemsize = torch.empty((), dtype=dtype).element_size()
+            tail = payload[offset:]
+            if offset % itemsize:
+                return torch.frombuffer(bytearray(tail.contiguous().numpy().tobytes()), dtype=dtype)
+            return tail.view(dtype)
         raise ValueError(f"unsupported KVWeave payload view dtype: {dtype}")
 
     def estimate_serialized_size(
@@ -199,6 +205,11 @@ class _KVWeaveCodec:
         method = scaling_method or self.scaling_method
         if not self.quantize:
             return self._raw_payload(work, shape)
+        if not self._is_attention_shape(shape.hidden_dim):
+            raise ValueError(
+                f"KVWeave attention quantization expects hidden size "
+                f"{self.num_kv_heads * self.head_dim}, got {shape.hidden_dim}"
+            )
         rh, asym, precond = (False, False, False) if method == "per_tensor" else (self.rh, self.asym, self.precond)
         header = self._quant_header(shape, work.dtype, method, rh, asym, precond)
         ids = KVWeaveCodecConfig.next_scale_ids(2)
@@ -382,9 +393,15 @@ class _KVWeaveCodec:
         )
         if parsed["per_head_scales"]:
             if kvweave_quant is not None and hasattr(kvweave_quant, "kvweave_merge_fused_heads"):
-                restored = kvweave_quant.kvweave_merge_fused_heads(
-                    restored, layers, parsed["head_num"], native_hidden, self.num_threads
+                kvweave_quant.kvweave_merge_fused_heads(
+                    restored,
+                    layers,
+                    parsed["head_num"],
+                    native_hidden,
+                    self.num_threads,
+                    dst.reshape(layers, tokens, hidden),
                 )
+                return
             else:
                 restored = (
                     restored.reshape(layers, parsed["head_num"], tokens, native_hidden)
@@ -503,6 +520,10 @@ class _KVWeaveCodec:
 
     def _head_dim(self, hidden: int) -> int:
         return self.head_dim or hidden // self._head_num(hidden)
+
+    def _is_attention_shape(self, h_merged: int) -> bool:
+        expected_hidden = self.num_kv_heads * self.head_dim if self.head_dim > 0 else h_merged
+        return h_merged > 0 and h_merged == expected_hidden
 
     def _fused_head_dim(self, hidden: int) -> int:
         """Width of one K or V plane in a fused ``[K|V]`` content axis."""

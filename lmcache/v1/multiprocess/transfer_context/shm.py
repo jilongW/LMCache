@@ -108,6 +108,12 @@ class EngineDrivenContextShm(EngineDrivenContext):
         self._pinned_ptr = 0
         self._pinned_size = 0
         self._scratch_allocator = ScratchAllocator(scratch_offset, scratch_size)
+        self._scratch_offset = scratch_offset
+        self._scratch_pool = (
+            torch.empty((scratch_size,), dtype=torch.uint8, pin_memory=True)
+            if scratch_size
+            else None
+        )
         try:
             self._shm = shared_memory.SharedMemory(
                 name=shm_name.lstrip("/"), create=False
@@ -163,6 +169,21 @@ class EngineDrivenContextShm(EngineDrivenContext):
             for descriptor in descriptors
         ]
 
+    def _scratch_tensor_view(
+        self,
+        offset: int,
+        num_bytes: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return a typed view into the process-local pinned scratch pool."""
+        if self._scratch_pool is None:
+            raise RuntimeError("engine-driven pinned scratch pool is not configured")
+        local_offset = offset - self._scratch_offset
+        if local_offset < 0 or local_offset + num_bytes > self._scratch_pool.numel():
+            raise ValueError("scratch allocation exceeds pinned scratch pool")
+        return self._scratch_pool[local_offset : local_offset + num_bytes].view(dtype).view(shape)
+
     def allocate_scratch_tensors(
         self,
         shape: torch.Size,
@@ -173,7 +194,9 @@ class EngineDrivenContextShm(EngineDrivenContext):
         max_retries: int = 3,
         timeout_s: float = 0.5,
     ) -> tuple[list[torch.Tensor], ScratchAllocation] | None:
-        """Allocate raw chunk views from this worker's scratch range."""
+        """Allocate raw chunk views from this worker's pinned scratch pool."""
+        if self._scratch_pool is None:
+            raise RuntimeError("engine-driven pinned scratch pool is not configured")
         itemsize = torch.empty((), dtype=dtype).element_size()
         chunk_bytes = int(shape.numel()) * itemsize
         allocation = self._scratch_allocator.allocate(
@@ -183,13 +206,13 @@ class EngineDrivenContextShm(EngineDrivenContext):
             timeout_s=timeout_s,
         )
         if allocation is None:
-            return None
+            raise RuntimeError("engine-driven pinned scratch pool is exhausted")
         tensors = [
-            self._make_tensor_view(
+            self._scratch_tensor_view(
                 allocation.offset + index * chunk_bytes,
                 chunk_bytes,
-                list(shape),
-                str(dtype).removeprefix("torch."),
+                shape,
+                dtype,
             )
             for index in range(count)
         ]
@@ -204,9 +227,11 @@ class EngineDrivenContextShm(EngineDrivenContext):
         max_retries: int = 3,
         timeout_s: float = 0.5,
     ) -> tuple[list[tuple[torch.Tensor, ...]], ScratchAllocation] | None:
-        """Allocate heterogeneous contiguous tensor views per scratch item."""
+        """Allocate heterogeneous pinned tensor views per scratch item."""
         if count <= 0 or not specs:
             raise ValueError("count and specs must be non-empty")
+        if self._scratch_pool is None:
+            raise RuntimeError("engine-driven pinned scratch pool is not configured")
         offsets: list[int] = []
         chunk_bytes = 0
         for shape, dtype in specs:
@@ -221,14 +246,14 @@ class EngineDrivenContextShm(EngineDrivenContext):
             timeout_s=timeout_s,
         )
         if allocation is None:
-            return None
+            raise RuntimeError("engine-driven pinned scratch pool is exhausted")
         groups = [
             tuple(
-                self._make_tensor_view(
+                self._scratch_tensor_view(
                     allocation.offset + item_index * chunk_bytes + spec_offset,
                     int(shape.numel()) * torch.empty((), dtype=dtype).element_size(),
-                    list(shape),
-                    str(dtype).removeprefix("torch."),
+                    shape,
+                    dtype,
                 )
                 for (shape, dtype), spec_offset in zip(specs, offsets, strict=True)
             )

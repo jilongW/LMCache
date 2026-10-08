@@ -196,6 +196,8 @@ def _multi_layer_block_kv_transfer(
         and direction == lmcache_native.TransferDirection.H2D
         and engine_kv_format == native_xpu_format
         and fallback_objects is not None
+        and not _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR
+        and not all(source.is_pinned() for source in fallback_objects)
     ):
         try:
             staged_objects: list[int] = []
@@ -929,15 +931,7 @@ def scatter_cpu_to_paged_kv(
         # Defensive check: Ensure all incoming CPU chunks are pinned memory.
         # Otherwise, the underlying CUDA kernel may throw an Illegal
         # Memory Access error during H2D transfer.
-        use_xpu_usm_staging = (
-            torch_device_type == "xpu"
-            and engine_kv_format
-            == lmcache_native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
-        )
-        dynamically_pinned = (
-            not use_xpu_usm_staging
-            and not all(chunk.is_pinned() for chunk in chunks)
-        )
+        dynamically_pinned = not all(chunk.is_pinned() for chunk in chunks)
         if dynamically_pinned:
             logger.debug(
                 "Received unpinned CPU tensors in scatter_cpu_to_paged_kv. "

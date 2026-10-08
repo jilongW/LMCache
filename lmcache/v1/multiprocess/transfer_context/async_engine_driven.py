@@ -493,35 +493,8 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                         wait=True,
                                     )
                                 )
-                                if scratch is not None:
-                                    group_out, raw_scratch_allocation = scratch
-                                    scratch_allocations.append(raw_scratch_allocation)
-                                else:
-                                    raw_scratch_allocation = None
-                                    requested_bytes = (
-                                        int(raw_shape.numel())
-                                        * torch.empty((), dtype=raw_dtype).element_size()
-                                        * len(selection.chunk_indices)
-                                    )
-                                    logger.info(
-                                        "Async engine-driven scratch allocation "
-                                        "unavailable for request_id=%s group=%s "
-                                        "chunks=%d requested=%.3f MiB after "
-                                        "wait/retry; falling back to pinned "
-                                        "staging buffers",
-                                        _request_id,
-                                        plan.group_info.engine_group_id
-                                        if plan.group_info is not None
-                                        else -1,
-                                        len(selection.chunk_indices),
-                                        requested_bytes / (1 << 20),
-                                    )
-                                    group_out = self._alloc_pinned_staging(
-                                        raw_shape,
-                                        raw_dtype,
-                                        len(selection.out_indices),
-                                    )
-                                    staged_chunks.extend(group_out)
+                                group_out, raw_scratch_allocation = scratch
+                                scratch_allocations.append(raw_scratch_allocation)
                             else:
                                 raw_scratch_allocation = None
                                 group_out = self._alloc_pinned_staging(
