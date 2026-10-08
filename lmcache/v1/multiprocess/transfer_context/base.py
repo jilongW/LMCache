@@ -149,6 +149,20 @@ logger.info(
     "tensor" if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR else "ptr",
 )
 
+# Non-flash-infer XPU formats whose native SYCL block-ID kernel has been
+# verified correct (D2H/H2D round-trip against the torch reference, multiple
+# shapes incl. non-divisible head counts) and is safe to route off the
+# torch_ops fallback. Only add a format here after such verification --
+# other formats' native XPU kernels may still have unverified layout bugs,
+# which is why the fallback below defaults to torch_ops for anything not on
+# this list (or not the single flash-infer format checked separately above).
+_XPU_NATIVE_VERIFIED_FORMATS: frozenset = frozenset(
+    {
+        # vLLM non-MLA blocks-first, fused K/V (NHD) -- attention's format.
+        lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS,
+    }
+)
+
 
 def _multi_layer_block_kv_transfer(
     paged_buffer_ptrs: torch.Tensor | list[torch.Tensor],
@@ -173,6 +187,7 @@ def _multi_layer_block_kv_transfer(
     if (
         device.type == "xpu"
         and engine_kv_format != native_xpu_format
+        and engine_kv_format not in _XPU_NATIVE_VERIFIED_FORMATS
         and fallback_paged_buffer is not None
         and fallback_objects is not None
     ):

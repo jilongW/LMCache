@@ -366,28 +366,44 @@ void submit_multi_layer_kernel_fused_packed(
           0, layer_id, token_id, xwords_per_token, num_tokens,
             num_layers);
 
-        for (int i = tid; i < xwords_per_token; i += num_threads) {
-          const int head = i / xwords_per_head;
-          const int head_offset = i % xwords_per_head;
-          int64_t page_offset;
-          if constexpr (format == EngineKVFormat::NL_X_NB_NH_BS_CS ||
-                        format == EngineKVFormat::NL_X_NB_NH_BS_TWO_HS) {
-            page_offset = static_cast<int64_t>(slot_idx) * block_size *
-                              xwords_per_token +
-                          static_cast<int64_t>(block_offset) *
-                              xwords_per_token + i;
-          } else {
-            page_offset = static_cast<int64_t>(slot_idx) * block_size *
-                              xwords_per_token +
-                          static_cast<int64_t>(head) * block_size *
-                              xwords_per_head +
-                          static_cast<int64_t>(block_offset) *
-                              xwords_per_head + head_offset;
+        if constexpr (format == EngineKVFormat::NL_X_NB_NH_BS_CS ||
+                      format == EngineKVFormat::NL_X_NB_NH_BS_TWO_HS) {
+          // HND layout [NB, NH, BS, CS]: head strides a full block
+          // (BS * xwords_per_head), block_offset strides one head's
+          // content (xwords_per_head). head/head_offset vary within
+          // the loop so they can't be hoisted further than per-element.
+          for (int i = tid; i < xwords_per_token; i += num_threads) {
+            const int head = i / xwords_per_head;
+            const int head_offset = i - head * xwords_per_head;
+            const int64_t page_offset =
+                static_cast<int64_t>(slot_idx) * block_size *
+                    xwords_per_token +
+                static_cast<int64_t>(head) * block_size * xwords_per_head +
+                static_cast<int64_t>(block_offset) * xwords_per_head +
+                head_offset;
+            if constexpr (DIRECTION) {
+              key_value_ptr[lmc_base + i] = paged_buffer_ptr[page_offset];
+            } else {
+              paged_buffer_ptr[page_offset] = key_value_ptr[lmc_base + i];
+            }
           }
-          if constexpr (DIRECTION) {
-            key_value_ptr[lmc_base + i] = paged_buffer_ptr[page_offset];
-          } else {
-            paged_buffer_ptr[page_offset] = key_value_ptr[lmc_base + i];
+        } else {
+          // NHD layout [NB, BS, NH, CS]: block_offset strides a full
+          // token (xwords_per_token); head/head_offset together are
+          // just i within that token, so this collapses to a single
+          // loop-invariant base plus "+ i" -- same shape as the fused
+          // K+V kernel's inner loop, no per-element div/mod at all.
+          const int64_t page_base = static_cast<int64_t>(slot_idx) *
+                                         block_size * xwords_per_token +
+                                     static_cast<int64_t>(block_offset) *
+                                         xwords_per_token;
+          for (int i = tid; i < xwords_per_token; i += num_threads) {
+            const int64_t page_offset = page_base + i;
+            if constexpr (DIRECTION) {
+              key_value_ptr[lmc_base + i] = paged_buffer_ptr[page_offset];
+            } else {
+              paged_buffer_ptr[page_offset] = key_value_ptr[lmc_base + i];
+            }
           }
         }
       });
