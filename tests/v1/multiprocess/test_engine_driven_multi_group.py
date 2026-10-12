@@ -14,6 +14,7 @@ import torch
 
 # First Party
 import lmcache.lmcache_native as lmcache_native
+from lmcache import torch_device_type
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
     AttentionPlaneLayout,
@@ -54,8 +55,18 @@ def _make_kv_caches(
     head_size: int = 8,
     prefix: str = "layer_",
 ) -> dict[str, torch.Tensor]:
+    """Build KV-cache tensors on the real accelerator device, matching
+    production (kv_caches always live on the engine's device). On a real
+    XPU/CUDA host this is required: the real gather/scatter dispatch in
+    ``base.py`` trusts the source tensors' own ``.device`` to decide whether
+    to invoke the compiled native kernel, and that kernel does not accept
+    plain CPU-resident, non-pinned/non-USM pointers -- passing CPU tensors
+    through it on a real accelerator host crashes the device context
+    (UR_RESULT_ERROR_DEVICE_LOST on XPU) instead of failing softly."""
     return {
-        f"{prefix}{i}": torch.randn(2, num_blocks, block_size, num_heads, head_size)
+        f"{prefix}{i}": torch.randn(
+            2, num_blocks, block_size, num_heads, head_size, device=torch_device_type
+        )
         for i in range(num_layers)
     }
 
@@ -800,9 +811,57 @@ def test_register_without_groups_sends_empty_group_infos(
 def test_submit_store_concatenates_chunks_group_major(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two same-shape groups each contribute one chunk; commit_store must
-    receive both, group 0's chunk first."""
+    """D2H and commit chunks both follow the registered group order."""
     fake_context = _FakeEngineDrivenContext()
+    kv_caches = _make_kv_caches(4, num_blocks=8, block_size=4, num_heads=2, head_size=8)
+    ctx = _register_context(monkeypatch, fake_context, kv_caches)
+    gather_order = []
+
+    def record_gather(group_kv_caches, *_args, **_kwargs):
+        group_id = 0 if "layer_0" in group_kv_caches else 1
+        gather_order.append(group_id)
+        return [torch.full((2, 2, 8, 16), group_id + 1, dtype=torch.float32)]
+
+    monkeypatch.setattr(worker_transfer, "gather_paged_kv_to_cpu", record_gather)
+
+    future = ctx.submit_store(
+        "req",
+        MagicMock(),
+        1,
+        kv_caches,
+        [[0, 1], [4, 5]],
+        MagicMock(),
+        blocks_in_chunk=2,
+    )
+
+    assert future.result() is True
+    assert gather_order == [0, 1]
+    assert fake_context.committed_chunks is not None
+    assert len(fake_context.committed_chunks) == 2
+    assert torch.all(fake_context.committed_chunks[0] == 1)
+    assert torch.all(fake_context.committed_chunks[1] == 2)
+
+
+def test_submit_store_commits_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gather/encode pipeline must still call commit_store exactly once
+    per submit_store, not once per group -- a regression here would mean
+    either multiple partial commits (pipelining gone wrong) or a dropped
+    commit (pipeline stalls before the last group is consumed)."""
+
+    class _CountingContext(_FakeEngineDrivenContext):
+        def __init__(self) -> None:
+            super().__init__()
+            self.commit_store_calls = 0
+
+        def commit_store(
+            self, key: object, instance_id: int, chunks: list[torch.Tensor]
+        ) -> bool:
+            self.commit_store_calls += 1
+            return super().commit_store(key, instance_id, chunks)
+
+    fake_context = _CountingContext()
     kv_caches = _make_kv_caches(4, num_blocks=8, block_size=4, num_heads=2, head_size=8)
     ctx = _register_context(monkeypatch, fake_context, kv_caches)
 
@@ -817,10 +876,7 @@ def test_submit_store_concatenates_chunks_group_major(
     )
 
     assert future.result() is True
-    assert fake_context.committed_chunks is not None
-    assert len(fake_context.committed_chunks) == 2
-    for chunk in fake_context.committed_chunks:
-        assert tuple(chunk.shape) == (2, 2, 8, 16)
+    assert fake_context.commit_store_calls == 1
 
 
 def _recurrent_and_attention_groups() -> list[EngineGroupInfo]:
@@ -1410,6 +1466,41 @@ def test_submit_store_quantizes_only_selected_chunks(
         bytearray(spy_codec.encode_calls[0].numpy().tobytes()), dtype=torch.uint8
     )
     assert torch.equal(quant_slot[: expected.numel()], expected)
+
+
+def test_submit_store_propagates_encode_failure_without_committing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If one group's encode raises mid-pipeline, the exception must still
+    propagate out of submit_store (unchanged from the pre-pipeline behavior
+    -- no new exception-swallowing), and commit_store must never be called,
+    since not every group's data has landed yet. The gather executor's
+    background thread must also not be left dangling: the ``with
+    ThreadPoolExecutor(...)`` block's own teardown handles that."""
+    fake_context = _FakeEngineDrivenContext()
+    kv_caches = _make_kv_caches(4, num_blocks=8, block_size=4, num_heads=2, head_size=8)
+    ctx = _register_context(monkeypatch, fake_context, kv_caches)
+
+    encode_calls = 0
+    original_encode = ctx._encode_group_chunks  # noqa: SLF001
+
+    def _encode_second_group_raises(plan, gathered, *args, **kwargs):
+        nonlocal encode_calls
+        encode_calls += 1
+        if encode_calls == 2:
+            raise RuntimeError("boom: simulated encode failure")
+        return original_encode(plan, gathered, *args, **kwargs)
+
+    ctx._encode_group_chunks = _encode_second_group_raises  # noqa: SLF001
+
+    with pytest.raises(RuntimeError, match="boom"):
+        ctx.submit_store(
+            "req", MagicMock(), 1, kv_caches, [[0, 1], [4, 5]], MagicMock(), 2
+        )
+
+    assert encode_calls == 2
+    # commit_store must never be reached once a group's encode raised.
+    assert fake_context.committed_chunks is None
 
 
 def test_submit_retrieve_decodes_only_live_chunks(

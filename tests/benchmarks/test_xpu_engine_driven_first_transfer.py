@@ -31,6 +31,8 @@ from lmcache.v1.multiprocess.transfer_context.base import gather_paged_kv_to_cpu
 if not (torch_device_type == "xpu" and torch_dev.is_available()):
     pytest.skip("Requires an available XPU runtime", allow_module_level=True)
 
+import lmcache.xpu_ops as xpu_ops  # noqa: E402
+
 
 _NUM_BLOCKS = 1
 _BLOCK_SIZE = 1024
@@ -41,6 +43,15 @@ _BLOCKS_PER_CHUNK = 1
 _NUM_GROUPS = 4
 _MAMBA_FORMAT = EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
 _ATTENTION_FORMAT = EngineKVFormat.NL_X_NB_BS_NH_CS
+
+_COPY_MODE_EU = "eu"
+_COPY_MODE_MEMCPY = "memcpy"
+
+_TRANSFER_DIRECTION_D2H = 1  # TransferDirection::D2H, see csrc/kv_transfer_types.h
+# See test_xpu_eu_vs_memcpy_benchmark.py for why this must be >= the largest
+# single per-call transfer size tested here, so each call happens as one
+# queue.memcpy() instead of being chopped into many tiny ones.
+_HOST_BUFFER_ALIGNMENT = 1 << 26  # 64MB, power of two
 
 
 def _make_source(engine_kv_format: EngineKVFormat) -> dict[str, torch.Tensor]:
@@ -88,18 +99,83 @@ def _make_output(engine_kv_format: EngineKVFormat) -> list[torch.Tensor]:
     ]
 
 
+def _memcpy_reshape_gather(
+    source: dict[str, torch.Tensor],
+    engine_kv_format: EngineKVFormat,
+    output: list[torch.Tensor],
+) -> None:
+    """Reproduce the EU kernel's copy+reshape via one queue.memcpy() per
+    contiguous source slice, instead of one fused SYCL parallel_for kernel.
+
+    See test_xpu_eu_vs_memcpy_benchmark.py for why a bare single memcpy is
+    not an equivalent comparison -- this must place each layer (and each
+    k_or_v plane, for mamba) at its correct offset in the output buffer to
+    do the same reshape the EU kernel does.
+    """
+    output_ptr = output[0].data_ptr()
+    if engine_kv_format != _MAMBA_FORMAT:
+        # attention: per-layer source is [1 block, token, head, 2*head_dim]
+        # (fused K/V), output is [layer, token, hidden] contiguous.
+        layer_stride_bytes = _BLOCK_SIZE * _NUM_HEADS * 2 * _HEAD_SIZE * 2
+        for layer_idx, src in enumerate(source.values()):
+            xpu_ops.lmcache_memcpy_async(
+                output_ptr + layer_idx * layer_stride_bytes,
+                src.data_ptr(),
+                layer_stride_bytes,
+                _TRANSFER_DIRECTION_D2H,
+                0,
+                _HOST_BUFFER_ALIGNMENT,
+            )
+    else:
+        # mamba: per-layer source is [1 block, 2(k_or_v), token, head,
+        # head_dim] -- fixing k_or_v leaves a contiguous
+        # [token, head, head_dim] range. Output is [k_or_v, layer, token,
+        # hidden] contiguous.
+        bytes_per_layer_kv = _BLOCK_SIZE * _NUM_HEADS * _HEAD_SIZE * 2
+        layer_stride_bytes = bytes_per_layer_kv
+        kv_stride_bytes = 8 * layer_stride_bytes
+        for layer_idx, src in enumerate(source.values()):
+            for k_or_v in range(2):
+                src_offset_bytes = k_or_v * bytes_per_layer_kv
+                dst_offset_bytes = (
+                    k_or_v * kv_stride_bytes + layer_idx * layer_stride_bytes
+                )
+                xpu_ops.lmcache_memcpy_async(
+                    output_ptr + dst_offset_bytes,
+                    src.data_ptr() + src_offset_bytes,
+                    bytes_per_layer_kv,
+                    _TRANSFER_DIRECTION_D2H,
+                    0,
+                    _HOST_BUFFER_ALIGNMENT,
+                )
+
+
+def _do_gather(
+    source: dict[str, torch.Tensor],
+    engine_kv_format: EngineKVFormat,
+    output: list[torch.Tensor],
+    copy_mode: str,
+) -> None:
+    if copy_mode == _COPY_MODE_MEMCPY:
+        _memcpy_reshape_gather(source, engine_kv_format, output)
+    else:
+        gather_paged_kv_to_cpu(
+            source,
+            _BLOCK_IDS,
+            _BLOCKS_PER_CHUNK,
+            engine_kv_format=engine_kv_format,
+            out=output,
+        )
+
+
 def _one_transfer(
-    source: dict[str, torch.Tensor], engine_kv_format: EngineKVFormat
+    source: dict[str, torch.Tensor],
+    engine_kv_format: EngineKVFormat,
+    copy_mode: str = _COPY_MODE_EU,
 ) -> tuple[float, float]:
     output = _make_output(engine_kv_format)
     call_start = time.perf_counter()
-    gather_paged_kv_to_cpu(
-        source,
-        _BLOCK_IDS,
-        _BLOCKS_PER_CHUNK,
-        engine_kv_format=engine_kv_format,
-        out=output,
-    )
+    _do_gather(source, engine_kv_format, output, copy_mode)
     call_ms = (time.perf_counter() - call_start) * 1000.0
     sync_start = time.perf_counter()
     torch_dev.synchronize()
@@ -109,6 +185,7 @@ def _one_transfer(
 
 def _one_engine_driven_request(
     groups: list[tuple[dict[str, torch.Tensor], EngineKVFormat]],
+    copy_mode: str = _COPY_MODE_EU,
 ) -> None:
     copy_stream = torch.xpu.Stream()
     pending: list[tuple[int, EngineKVFormat, float, torch.xpu.Event]] = []
@@ -116,13 +193,7 @@ def _one_engine_driven_request(
         for group_idx, (source, engine_kv_format) in enumerate(groups):
             output = _make_output(engine_kv_format)
             call_start = time.perf_counter()
-            gather_paged_kv_to_cpu(
-                source,
-                _BLOCK_IDS,
-                _BLOCKS_PER_CHUNK,
-                engine_kv_format=engine_kv_format,
-                out=output,
-            )
+            _do_gather(source, engine_kv_format, output, copy_mode)
             submit_ms = (time.perf_counter() - call_start) * 1000.0
             event = torch.xpu.Event()
             event.record(copy_stream)
@@ -146,6 +217,7 @@ def _run_submit_store(
     idle_ms: float,
     warmup: int,
     quantization: bool,
+    use_async: bool = False,
 ) -> None:
     helper_path = os.path.join(
         os.path.dirname(__file__), "bench_engine_driven_shm_timing.py"
@@ -167,6 +239,14 @@ def _run_submit_store(
     kv_caches = helper._qwen35_9b_kv_caches()
     shm_name = f"lmcache_first_transfer_{os.getpid()}"
     shm_addr = shm_create_readwrite(shm_name, helper._SHM_POOL_SIZE)
+    # Shared origin so every printed timestamp can be reconstructed as a
+    # single wall-clock timeline (offset_ms) when parsing the log later,
+    # instead of guessing request/group start times from durations alone.
+    t0 = time.perf_counter()
+
+    def offset_ms() -> float:
+        return (time.perf_counter() - t0) * 1000.0
+
     try:
         original_groups = helper._qwen35_9b_groups
 
@@ -176,7 +256,7 @@ def _run_submit_store(
 
         helper._qwen35_9b_groups = mamba_first_groups
         ctx, shm_ctx = helper._register_shm_context(
-            kv_caches, shm_name, helper._SHM_POOL_SIZE
+            kv_caches, shm_name, helper._SHM_POOL_SIZE, use_async=use_async
         )
         worker_transfer = __import__(
             "lmcache.v1.multiprocess.transfer_context.worker_transfer",
@@ -190,6 +270,7 @@ def _run_submit_store(
 
         def timed_gather(*args, **kwargs):
             nonlocal gather_index
+            start_offset_ms = offset_ms()
             start = time.perf_counter()
             result = original_gather(*args, **kwargs)
             elapsed_ms = (time.perf_counter() - start) * 1000.0
@@ -200,6 +281,8 @@ def _run_submit_store(
                     f"request={active_request} chunk={gather_index} "
                     f"format={engine_format.name if engine_format else 'unknown'} "
                     f"chunk_indices={chunk_indices} "
+                    f"phase=launch start_offset_ms={start_offset_ms:.3f} "
+                    f"end_offset_ms={offset_ms():.3f} "
                     f"gather_call_ms={elapsed_ms:.3f}",
                     flush=True,
                 )
@@ -210,12 +293,15 @@ def _run_submit_store(
 
         def timed_sync(*args, **kwargs):
             nonlocal sync_index
+            start_offset_ms = offset_ms()
             start = time.perf_counter()
             result = original_sync(*args, **kwargs)
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             if active_request >= 0:
                 print(
                     f"request={active_request} sync={sync_index} "
+                    f"phase=wait start_offset_ms={start_offset_ms:.3f} "
+                    f"end_offset_ms={offset_ms():.3f} "
                     f"sync_ms={elapsed_ms:.3f}",
                     flush=True,
                 )
@@ -223,9 +309,53 @@ def _run_submit_store(
             return result
 
         worker_transfer.torch_dev.synchronize = timed_sync
+
+        kvweave_codec = ctx._kvweave_codec
+        original_split_mamba = kvweave_codec.split_mamba_chunk
+        original_split_fused = kvweave_codec.split_fused_attention_heads
+        split_index = 0
+
+        def timed_split_mamba(*args, **kwargs):
+            nonlocal split_index
+            start_offset_ms = offset_ms()
+            start = time.perf_counter()
+            result = original_split_mamba(*args, **kwargs)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            if active_request >= 0:
+                print(
+                    f"request={active_request} split={split_index} kind=mamba "
+                    f"phase=split start_offset_ms={start_offset_ms:.3f} "
+                    f"end_offset_ms={offset_ms():.3f} "
+                    f"split_ms={elapsed_ms:.3f}",
+                    flush=True,
+                )
+            split_index += 1
+            return result
+
+        def timed_split_fused(*args, **kwargs):
+            nonlocal split_index
+            start_offset_ms = offset_ms()
+            start = time.perf_counter()
+            result = original_split_fused(*args, **kwargs)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            if active_request >= 0:
+                print(
+                    f"request={active_request} split={split_index} kind=fused_attention "
+                    f"phase=split start_offset_ms={start_offset_ms:.3f} "
+                    f"end_offset_ms={offset_ms():.3f} "
+                    f"split_ms={elapsed_ms:.3f}",
+                    flush=True,
+                )
+            split_index += 1
+            return result
+
+        kvweave_codec.split_mamba_chunk = timed_split_mamba
+        kvweave_codec.split_fused_attention_heads = timed_split_fused
+
         original_encode = ctx._encode_group_chunks_into_slots
 
         def timed_encode(plan, gathered, slots, *args, **kwargs):
+            start_offset_ms = offset_ms()
             start = time.perf_counter()
             result = original_encode(plan, gathered, slots, *args, **kwargs)
             elapsed_ms = (time.perf_counter() - start) * 1000.0
@@ -237,6 +367,8 @@ def _run_submit_store(
                 )
                 print(
                     f"request={active_request} chunk group={group_id} "
+                    f"phase=encode start_offset_ms={start_offset_ms:.3f} "
+                    f"end_offset_ms={offset_ms():.3f} "
                     f"encode_ms={elapsed_ms:.3f}",
                     flush=True,
                 )
@@ -279,28 +411,42 @@ def _run_submit_store(
         token_ids = tuple(range(_BLOCK_SIZE))
 
         def run_request(request_idx: int) -> None:
-            nonlocal active_request, gather_index, sync_index
+            nonlocal active_request, gather_index, sync_index, split_index
             active_request = request_idx
             if request_idx == 0:
                 gather_index = 0
                 sync_index = 0
+                split_index = 0
             key = IPCCacheServerKey.from_token_ids(
                 "qwen3.5-9b", 1, 0, token_ids,
                 request_id=f"request-{request_idx}",
             )
+            start_offset_ms = offset_ms()
             start = time.perf_counter()
+            print(
+                f"submit-store request={request_idx} "
+                f"start_offset_ms={start_offset_ms:.3f}",
+                flush=True,
+            )
+            # AsyncEngineDrivenTransferContext.submit_store requires a real
+            # local ordering event (raises RuntimeError on None); the
+            # synchronous context accepts None.
+            ordering_event = (
+                ctx.create_recorded_event() if use_async else None
+            )
             result = ctx.submit_store(
                 key.request_id,
                 key,
                 1,
                 kv_caches,
                 block_ids,
-                None,
+                ordering_event,
                 _BLOCKS_PER_CHUNK,
             ).result()
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             print(
                 f"submit-store request={request_idx} result={result} "
+                f"end_offset_ms={offset_ms():.3f} "
                 f"total_ms={elapsed_ms:.3f}",
                 flush=True,
             )
@@ -316,6 +462,9 @@ def _run_submit_store(
         if "worker_transfer" in locals():
             worker_transfer.gather_paged_kv_to_cpu = original_gather
             worker_transfer.torch_dev.synchronize = original_sync
+        if "kvweave_codec" in locals():
+            kvweave_codec.split_mamba_chunk = original_split_mamba
+            kvweave_codec.split_fused_attention_heads = original_split_fused
         shm_munmap(shm_addr, helper._SHM_POOL_SIZE)
         shm_unlink(shm_name)
 
@@ -325,6 +474,7 @@ def _run(
     idle_ms: float,
     warmup: int,
     engine_driven: bool = False,
+    copy_mode: str = _COPY_MODE_EU,
 ) -> None:
     groups = [
         (_make_source(_MAMBA_FORMAT), _MAMBA_FORMAT),
@@ -336,16 +486,16 @@ def _run(
 
     for warmup_idx in range(warmup):
         if engine_driven:
-            _one_engine_driven_request(groups)
+            _one_engine_driven_request(groups, copy_mode)
         else:
             for source, engine_kv_format in groups:
-                _one_transfer(source, engine_kv_format)
+                _one_transfer(source, engine_kv_format, copy_mode)
         print(f"warmup={warmup_idx} done", flush=True)
 
     for request_idx in range(num_requests):
         request_start = time.perf_counter()
         if engine_driven:
-            _one_engine_driven_request(groups)
+            _one_engine_driven_request(groups, copy_mode)
             total_ms = (time.perf_counter() - request_start) * 1000.0
             print(f"request={request_idx} total_ms={total_ms:.3f}", flush=True)
             if request_idx + 1 < num_requests and idle_ms > 0:
@@ -354,7 +504,7 @@ def _run(
 
         group_timings = []
         for group_idx, (source, engine_kv_format) in enumerate(groups):
-            call_ms, sync_ms = _one_transfer(source, engine_kv_format)
+            call_ms, sync_ms = _one_transfer(source, engine_kv_format, copy_mode)
             group_timings.append((call_ms, sync_ms))
             print(
                 f"request={request_idx} group={group_idx} "
@@ -371,6 +521,78 @@ def _run(
 def test_first_transfer_timing() -> None:
     """Keep pytest discovery useful while preserving direct-run output."""
     _run(num_requests=2, idle_ms=0.0, warmup=0)
+
+
+def test_reverse_group_gathers_keep_block_ids_isolated() -> None:
+    """Queued D2H calls must not observe a later group's block-ID mapping."""
+    block_size = 256
+    mamba_source = torch.empty(
+        2,
+        2,
+        block_size,
+        _NUM_HEADS,
+        _HEAD_SIZE,
+        dtype=torch.float16,
+        device="xpu",
+    )
+    mamba_source[0].fill_(10)
+    mamba_source[1].fill_(11)
+    attention_source = torch.empty(
+        2,
+        block_size,
+        _NUM_HEADS,
+        2 * _HEAD_SIZE,
+        dtype=torch.float16,
+        device="xpu",
+    )
+    attention_source[0].fill_(20)
+    attention_source[1].fill_(21)
+    torch_dev.synchronize()
+
+    mamba_caches = {"layer_0": mamba_source}
+    attention_caches = {"layer_0": attention_source}
+    attention_out = torch.empty(
+        1,
+        block_size,
+        _NUM_HEADS * 2 * _HEAD_SIZE,
+        dtype=torch.float16,
+        pin_memory=True,
+    )
+    mamba_outputs = [
+        torch.empty(
+            2,
+            1,
+            block_size,
+            _NUM_HEADS * _HEAD_SIZE,
+            dtype=torch.float16,
+            pin_memory=True,
+        )
+        for _ in range(3)
+    ]
+
+    gather_paged_kv_to_cpu(
+        attention_caches,
+        [1],
+        1,
+        engine_kv_format=_ATTENTION_FORMAT,
+        out=[attention_out],
+    )
+    for block_id, output in zip((0, 1, 0), mamba_outputs, strict=True):
+        gather_paged_kv_to_cpu(
+            mamba_caches,
+            [block_id],
+            1,
+            engine_kv_format=_MAMBA_FORMAT,
+            out=[output],
+        )
+    torch_dev.synchronize()
+
+    assert torch.unique(attention_out).tolist() == [21.0]
+    assert [torch.unique(output).tolist() for output in mamba_outputs] == [
+        [10.0],
+        [11.0],
+        [10.0],
+    ]
 
 
 if __name__ == "__main__":
@@ -393,6 +615,32 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable KVWeave quantization in --submit-store mode.",
     )
+    parser.add_argument(
+        "--async-engine-driven",
+        action="store_true",
+        help=(
+            "In --submit-store mode, register an "
+            "AsyncEngineDrivenTransferContext instead of the synchronous "
+            "EngineDrivenTransferContext, so the trace exercises the "
+            "cross-group D2H/split/encode pipeline "
+            "(async_engine_driven.py) instead of the synchronous bounded "
+            "pipeline (worker_transfer.py)."
+        ),
+    )
+    parser.add_argument(
+        "--copy-mode",
+        choices=[_COPY_MODE_EU, _COPY_MODE_MEMCPY],
+        default=_COPY_MODE_EU,
+        help=(
+            "Gather implementation for --requests/--engine-driven mode: "
+            "'eu' uses the production SYCL parallel_for gather kernel "
+            "(gather_paged_kv_to_cpu); 'memcpy' reproduces the same "
+            "copy+reshape via per-layer queue.memcpy() calls instead, for "
+            "comparison (see test_xpu_eu_vs_memcpy_benchmark.py). Ignored "
+            "with --submit-store, which always exercises the real "
+            "production path.",
+        ),
+    )
     args = parser.parse_args()
     if args.submit_store:
         _run_submit_store(
@@ -400,6 +648,13 @@ if __name__ == "__main__":
             args.idle_ms,
             args.warmup,
             quantization=not args.no_quantization,
+            use_async=args.async_engine_driven,
         )
     else:
-        _run(args.requests, args.idle_ms, args.warmup, args.engine_driven)
+        _run(
+            args.requests,
+            args.idle_ms,
+            args.warmup,
+            args.engine_driven,
+            args.copy_mode,
+        )

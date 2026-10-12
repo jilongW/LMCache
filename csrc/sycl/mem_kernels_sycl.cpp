@@ -473,7 +473,7 @@ void submit_multi_layer_unilateral_kernel(
 // Non-MLA formats (k_or_v_size==2) use the fused K+V kernel.
 // ---------------------------------------------------------------------------
 #define LAUNCH_KERNEL_WITH_FORMAT(T, DIRECTION, FORMAT, USE_BLOCK_IDS)      \
-  submit_multi_layer_kernel<T, DIRECTION, FORMAT, USE_BLOCK_IDS>(            \
+  submit_multi_layer_kernel<T, DIRECTION, FORMAT, USE_BLOCK_IDS>(          \
       queue, key_value_ptr, page_buffer_ptrs, slot_mapping_ptr, num_xwords, \
       num_tokens, num_layers, page_buffer_size, block_size,                 \
       skip_prefix_n_tokens, k_or_v_size, wg_size);
@@ -693,7 +693,7 @@ void multi_layer_kv_transfer_block_ids(
 
 #define LAUNCH_MULTI_LAYER_BLOCK_IDS(type)                              \
   do {                                                                  \
-    multi_layer_kv_transfer_templated<type, true>(                       \
+    multi_layer_kv_transfer_templated<type, true>(                      \
         key_value, key_value_ptrs, block_ids, paged_memory_device,       \
         page_buffer_size, direction, engine_kv_format, block_size,        \
         head_size, skip_prefix_n_tokens);                                 \

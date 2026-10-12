@@ -24,6 +24,7 @@ from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     IPCEvent,
+    _BoundedStoreBatch,
     _raw_gather_shape,
     _select_group_chunks,
     null_chunk_mask_from_groups,
@@ -169,123 +170,157 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
             for key, bucket in buckets.items():
                 self._staging_pool.setdefault(key, []).extend(bucket)
 
-    def _process_shm_quantized_group(
-        self,
-        request_id: str,
-        plan: Any,
-        group_kv_caches: dict[str, torch.Tensor],
-        group_block_ids: list[int],
-        selection: Any,
-        group_slots: list[torch.Tensor],
-        ordering_event: Any,
-    ) -> None:
-        """Process quantized SHM chunks serially."""
+    def _launch_shm_quantized_batch(
+        self, request_id: str, batch: _BoundedStoreBatch
+    ) -> tuple[list[torch.Tensor], ScratchAllocation | None, bool, Any]:
+        """Enqueue one quantized-SHM chunk's D2H gather on the copy stream.
+
+        The caller is responsible for ordering: the outer
+        ``_prepare_gather_and_commit`` loop only reaches a quantized-SHM
+        batch after the stream-wide ``_event.wait(...)`` has already been
+        issued, so this method does not repeat that wait per batch.
+        """
         context = self._engine_driven_context
         assert isinstance(context, EngineDrivenContextShm)
-        raw_shape = _raw_gather_shape(plan)
-        raw_dtype = plan.raw_layout_desc.dtypes[0]
-        chunk_indices = selection.chunk_indices
-        def launch_window(
-            start: int,
-        ) -> tuple[list[torch.Tensor], ScratchAllocation | None, bool, Any]:
-            batch_indices = [chunk_indices[start]]
-            raw_scratch = context.allocate_scratch_tensors(
-                raw_shape, raw_dtype, len(batch_indices), wait=False
+        raw_shape = _raw_gather_shape(batch.plan)
+        raw_dtype = batch.plan.raw_layout_desc.dtypes[0]
+        raw_scratch = context.allocate_scratch_tensors(
+            raw_shape, raw_dtype, 1, wait=False
+        )
+        raw_allocation = None
+        used_fallback = False
+        if raw_scratch is not None:
+            raw_targets, raw_allocation = raw_scratch
+        else:
+            raw_targets = self._alloc_pinned_staging(raw_shape, raw_dtype, 1)
+            used_fallback = True
+            logger.debug(
+                "SHM scratch unavailable for request_id=%s group=%s; "
+                "using CPU fallback for 1 chunk",
+                request_id,
+                batch.group_id,
             )
-            raw_allocation = None
-            used_fallback = False
-            if raw_scratch is not None:
-                raw_targets, raw_allocation = raw_scratch
-            else:
-                raw_targets = self._alloc_pinned_staging(
-                    raw_shape, raw_dtype, len(batch_indices)
-                )
-                used_fallback = True
-                logger.debug(
-                    "SHM scratch unavailable for request_id=%s group=%s; "
-                    "using CPU fallback for %d chunks",
-                    request_id,
-                    plan.group_info.engine_group_id
-                    if plan.group_info is not None
-                    else -1,
-                    len(batch_indices),
-                )
-            event = torch_dev.Event()
-            with torch.inference_mode(), torch_dev.stream(self._copy_stream):
-                if start == 0:
-                    ordering_event.wait(stream=self._copy_stream)
-                gathered = gather_paged_kv_to_cpu(
-                    group_kv_caches,
-                    group_block_ids,
-                    plan.blocks_per_chunk,
-                    layout_hints=self._layout_hints,
-                    engine_kv_format=plan.engine_kv_format,
-                    out=raw_targets,
-                    chunk_indices=batch_indices,
-                )
-                event.record(self._copy_stream)
-            return gathered, raw_allocation, used_fallback, event
+        event = torch_dev.Event()
+        with torch.inference_mode(), torch_dev.stream(self._copy_stream):
+            gathered = gather_paged_kv_to_cpu(
+                batch.group_kv_caches,
+                batch.group_block_ids,
+                batch.plan.blocks_per_chunk,
+                layout_hints=self._layout_hints,
+                engine_kv_format=batch.plan.engine_kv_format,
+                out=raw_targets,
+                chunk_indices=[batch.batch_index],
+            )
+            event.record(self._copy_stream)
+        return gathered, raw_allocation, used_fallback, event
 
-        def process_window(
-            start: int,
-            pending: tuple[list[torch.Tensor], ScratchAllocation | None, bool, Any],
-        ) -> None:
-            gathered, raw_allocation, used_fallback, event = pending
-            event.synchronize()
-            split_allocation = None
-            try:
-                mamba_splits = None
-                fused_head_splits = None
-                if (
-                    plan.group_info is not None
-                    and plan.group_info.cache_category == "mamba"
+    def _process_shm_quantized_batch(
+        self,
+        request_id: str,
+        batch: _BoundedStoreBatch,
+        pending: tuple[list[torch.Tensor], ScratchAllocation | None, bool, Any],
+    ) -> None:
+        """Wait, split and encode one already-launched quantized-SHM chunk."""
+        context = self._engine_driven_context
+        assert isinstance(context, EngineDrivenContextShm)
+        gathered, raw_allocation, used_fallback, event = pending
+        event.synchronize()
+        split_allocation = None
+        try:
+            mamba_splits = None
+            fused_head_splits = None
+            if (
+                batch.plan.group_info is not None
+                and batch.plan.group_info.cache_category == "mamba"
+            ):
+                split = self._allocate_mamba_split_scratch(
+                    batch.plan, len(gathered), context, wait=False
+                )
+                if split is not None:
+                    mamba_splits, split_allocation = split
+            elif batch.plan.attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
+                split = self._allocate_fused_head_split_scratch(
+                    batch.plan, len(gathered), context, wait=False
+                )
+                if split is not None:
+                    fused_head_splits, split_allocation = split
+            if mamba_splits is not None:
+                for raw_chunk, split in zip(gathered, mamba_splits, strict=True):
+                    self._kvweave_codec.split_mamba_chunk(  # type: ignore[union-attr]
+                        raw_chunk,
+                        batch.plan.group_info.mamba_real_layout,
+                        batch.plan.group_info.tokens_per_block,
+                        out=split,
+                    )
+            elif fused_head_splits is not None:
+                for raw_chunk, head_split in zip(
+                    gathered, fused_head_splits, strict=True
                 ):
-                    split = self._allocate_mamba_split_scratch(
-                        plan, len(gathered), context, wait=False
+                    self._kvweave_codec.split_fused_attention_heads(  # type: ignore[union-attr]
+                        raw_chunk,
+                        self._kvweave_codec._fused_head_num(raw_chunk.shape[-1]),  # type: ignore[union-attr]
+                        self._kvweave_codec._fused_head_dim(raw_chunk.shape[-1]),  # type: ignore[union-attr]
+                        out=head_split,
                     )
-                    if split is not None:
-                        mamba_splits, split_allocation = split
-                elif plan.attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
-                    split = self._allocate_fused_head_split_scratch(
-                        plan, len(gathered), context, wait=False
-                    )
-                    if split is not None:
-                        fused_head_splits, split_allocation = split
-                if mamba_splits is not None:
-                    for raw_chunk, split in zip(gathered, mamba_splits, strict=True):
-                        self._kvweave_codec.split_mamba_chunk(  # type: ignore[union-attr]
-                            raw_chunk,
-                            plan.group_info.mamba_real_layout,
-                            plan.group_info.tokens_per_block,
-                            out=split,
-                        )
-                elif fused_head_splits is not None:
-                    for raw_chunk, head_split in zip(
-                        gathered, fused_head_splits, strict=True
-                    ):
-                        self._kvweave_codec.split_fused_attention_heads(  # type: ignore[union-attr]
-                            raw_chunk,
-                            self._kvweave_codec._fused_head_num(raw_chunk.shape[-1]),  # type: ignore[union-attr]
-                            self._kvweave_codec._fused_head_dim(raw_chunk.shape[-1]),  # type: ignore[union-attr]
-                            out=head_split,
-                        )
-                self._encode_group_chunks_into_slots(
-                    plan, gathered, group_slots[start : start + len(gathered)],
-                    mamba_splits,
-                    fused_head_splits,
-                )
-            finally:
-                if split_allocation is not None:
-                    context.free_scratch(split_allocation)
-                if raw_allocation is not None:
-                    context.free_scratch(raw_allocation)
-                if used_fallback:
-                    self._release_staging(gathered)
+            self._encode_group_chunks_into_slots(
+                batch.plan,
+                gathered,
+                batch.group_slots[batch.start : batch.start + len(gathered)],
+                mamba_splits,
+                fused_head_splits,
+            )
+        finally:
+            if split_allocation is not None:
+                context.free_scratch(split_allocation)
+            if raw_allocation is not None:
+                context.free_scratch(raw_allocation)
+            if used_fallback:
+                self._release_staging(gathered)
 
-        if not chunk_indices:
+    def _release_pending_batch(
+        self, pending: tuple[list[torch.Tensor], ScratchAllocation | None, bool, Any]
+    ) -> None:
+        """Release a launched-but-not-yet-processed batch's resources.
+
+        Used by :meth:`_run_async_bounded_pipeline` to avoid leaking the
+        next batch's scratch/staging buffers when an earlier batch's
+        processing raises.
+        """
+        context = self._engine_driven_context
+        assert isinstance(context, EngineDrivenContextShm)
+        gathered, raw_allocation, used_fallback, _event = pending
+        if raw_allocation is not None:
+            context.free_scratch(raw_allocation)
+        if used_fallback:
+            self._release_staging(gathered)
+
+    def _run_async_bounded_pipeline(
+        self, request_id: str, batches: list[_BoundedStoreBatch]
+    ) -> None:
+        """Run a cross-group depth-2 gather/process pipeline on the copy stream.
+
+        Every batch's D2H gather is enqueued on ``self._copy_stream`` one
+        batch ahead of its wait/split/encode, so each batch's CPU-side work
+        overlaps with the *next* batch's device-to-host copy -- including
+        across group boundaries, since ``batches`` is already flattened over
+        every quantized-SHM group in this ``submit_store`` call.
+        """
+        if not batches:
             return
-        for start in range(len(chunk_indices)):
-            process_window(start, launch_window(start))
+        pending = self._launch_shm_quantized_batch(request_id, batches[0])
+        try:
+            for i, batch in enumerate(batches):
+                next_pending = (
+                    self._launch_shm_quantized_batch(request_id, batches[i + 1])
+                    if i + 1 < len(batches)
+                    else None
+                )
+                self._process_shm_quantized_batch(request_id, batch, pending)
+                pending = next_pending
+        except BaseException:
+            if pending is not None:
+                self._release_pending_batch(pending)
+            raise
 
     def create_recorded_event(self) -> IPCEvent:
         """Create a local event that orders compute before the copy stream.
@@ -423,21 +458,49 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                             ScratchAllocation | None,
                         ]
                     ] = []
+                    # Quantized-SHM groups' chunks are flattened across ALL
+                    # such groups (not just within one group) into one
+                    # ordered list, processed after this loop by a depth-2
+                    # gather/process pipeline -- see
+                    # _run_async_bounded_pipeline. This lets group N+1's D2H
+                    # gather overlap with group N's CPU-side split/encode,
+                    # instead of each group running its own pipeline in
+                    # isolation (which can't overlap when a group has only
+                    # one chunk, the common case in production).
+                    bounded_batches: list[_BoundedStoreBatch] = []
                     group_offset = 0
+                    groups_with_selections = []
+                    for group_index, (
+                        plan,
+                        group_kv_caches,
+                        group_block_ids,
+                    ) in enumerate(transfer_groups):
+                        selection = _select_group_chunks(
+                            chunk_indices,
+                            group_offset,
+                            len(group_block_ids) // plan.blocks_per_chunk,
+                        )
+                        group_offset += selection.num_group_chunks
+                        groups_with_selections.append(
+                            (
+                                group_index,
+                                plan,
+                                group_kv_caches,
+                                group_block_ids,
+                                selection,
+                            )
+                        )
+
                     with torch.inference_mode(), torch_dev.stream(self._copy_stream):
                         _event.wait(stream=self._copy_stream)
 
                         for (
+                            group_index,
                             plan,
                             group_kv_caches,
                             group_block_ids,
-                        ) in transfer_groups:
-                            selection = _select_group_chunks(
-                                chunk_indices,
-                                group_offset,
-                                len(group_block_ids) // plan.blocks_per_chunk,
-                            )
-                            group_offset += selection.num_group_chunks
+                            selection,
+                        ) in groups_with_selections:
                             if selection.is_empty:
                                 continue
 
@@ -456,14 +519,24 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                     engine_driven_context, EngineDrivenContextShm
                                 )
                             ):
-                                self._process_shm_quantized_group(
-                                    _request_id,
-                                    plan,
-                                    group_kv_caches,
-                                    group_block_ids,
-                                    selection,
-                                    group_slots,
-                                    _event,
+                                _group_id = (
+                                    plan.group_info.engine_group_id
+                                    if plan.group_info is not None
+                                    else -1
+                                )
+                                bounded_batches.extend(
+                                    _BoundedStoreBatch(
+                                        plan=plan,
+                                        group_kv_caches=group_kv_caches,
+                                        group_block_ids=group_block_ids,
+                                        group_slots=group_slots,
+                                        group_id=_group_id,
+                                        start=start,
+                                        batch_index=batch_index,
+                                    )
+                                    for start, batch_index in enumerate(
+                                        selection.chunk_indices
+                                    )
                                 )
                                 continue
                             # A quantized group's SHM slot is sized for the
@@ -520,6 +593,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                             )
                             group_ranges.append(
                                 (
+                                    group_index,
                                     plan,
                                     start_idx,
                                     len(gather_target),
@@ -530,6 +604,10 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
 
                         gather_done = torch_dev.Event()
                         gather_done.record(self._copy_stream)
+                        if bounded_batches:
+                            self._run_async_bounded_pipeline(
+                                _request_id, bounded_batches
+                            )
                     with self._inflight_lock:
                         if gather_done is not None:
                             self._inflight_gather_events.add(gather_done)
@@ -549,12 +627,13 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     # than left in with their raw, un-encoded bytes.
                     commit_target = []
                     for (
+                        _,
                         plan,
                         start_idx,
                         end_idx,
                         quant_slots,
                         raw_scratch_allocation,
-                    ) in group_ranges:
+                    ) in sorted(group_ranges, key=lambda group: group[0]):
                         if not plan.quantized:
                             commit_target.extend(gather_target[start_idx:end_idx])
                             continue

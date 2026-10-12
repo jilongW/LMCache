@@ -105,6 +105,9 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
+from lmcache.v1.multiprocess.transfer_context.async_engine_driven import (
+    AsyncEngineDrivenTransferContext,
+)
 from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
@@ -368,6 +371,7 @@ def _register_shm_context(
     kv_caches: dict[str, torch.Tensor],
     shm_name: str,
     pool_size: int,
+    use_async: bool = False,
 ) -> tuple[EngineDrivenTransferContext, EngineDrivenContextShm]:
     """Register a real ``EngineDrivenContextShm`` with a mocked RPC client.
 
@@ -376,9 +380,21 @@ def _register_shm_context(
     ``test_engine_driven_context_shm_store_retrieve_flow_with_mocked_mq``'s
     pattern in ``tests/v1/multiprocess/test_engine_driven_transfer.py``.
 
-    Returns the transfer context plus the underlying ``EngineDrivenContextShm``
-    so the caller can carve out extra real SHM slots for timing the
-    write-into-SHM stage independently of ``submit_store``.
+    Args:
+        kv_caches: Worker KV cache tensors to register.
+        shm_name: Name of the SHM segment to create.
+        pool_size: Total size in bytes of the SHM pool.
+        use_async: When ``True``, register an
+            ``AsyncEngineDrivenTransferContext`` instead of the synchronous
+            ``EngineDrivenTransferContext`` -- needed to exercise the
+            cross-group D2H/split/encode pipeline that only the async
+            context implements. ``register()`` is inherited from the sync
+            base class unchanged either way.
+
+    Returns:
+        The transfer context plus the underlying ``EngineDrivenContextShm``
+        so the caller can carve out extra real SHM slots for timing the
+        write-into-SHM stage independently of ``submit_store``.
     """
     created_shm_contexts: list[EngineDrivenContextShm] = []
 
@@ -410,7 +426,11 @@ def _register_shm_context(
         req_client = MagicMock()
         req_client.register_kv_cache_engine_driven_context.return_value = future
 
-        ctx = EngineDrivenTransferContext()
+        ctx = (
+            AsyncEngineDrivenTransferContext()
+            if use_async
+            else EngineDrivenTransferContext()
+        )
         ctx.register(
             instance_id=1,
             kv_caches=kv_caches,

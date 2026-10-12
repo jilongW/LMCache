@@ -3,7 +3,7 @@
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Callable
+from typing import Any, Callable
 from unittest.mock import MagicMock
 import threading
 import time
@@ -20,8 +20,12 @@ from lmcache.v1.multiprocess.transfer_context import (
 from lmcache.v1.multiprocess.transfer_context.async_engine_driven import (
     AsyncEngineDrivenTransferContext,
 )
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
+    GroupTransferPlan,
+    MemoryLayoutDesc,
+    _BoundedStoreBatch,
 )
 
 
@@ -474,4 +478,222 @@ def test_prepare_store_runs_on_background_thread_not_forward_thread(
     # Now release prepare_store and let the background work complete.
     prepare_gate.set()
     t.join(timeout=1)
+    ctx.close()
+
+
+class _FakeShmContext:
+    """Minimal stand-in for EngineDrivenContextShm.
+
+    Only implements what the quantized-SHM store path touches:
+    prepare_store/commit_store (inherited call shape from
+    _FakeStoreContext), plus allocate_scratch_tensors/free_scratch backed by
+    plain CPU tensors instead of a real SHM pinned pool.
+    """
+
+    def __init__(
+        self,
+        commit_impl: Callable[[list[torch.Tensor]], bool],
+        prepare_result: tuple[list[torch.Tensor], list[int]] | None,
+    ) -> None:
+        self.commit_impl = commit_impl
+        self.prepare_result = prepare_result
+        self.layout_desc = SimpleNamespace(
+            shapes=[torch.Size([2, 1, 1, 1])], dtypes=[torch.float32]
+        )
+        self.freed: list[object] = []
+
+    def prepare_store(
+        self, _key: object, _instance_id: int
+    ) -> tuple[list[torch.Tensor], list[int]] | None:
+        return self.prepare_result
+
+    def commit_store(
+        self, _key: object, _instance_id: int, chunks: list[torch.Tensor]
+    ) -> bool:
+        return bool(self.commit_impl(chunks))
+
+    def allocate_scratch_tensors(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        count: int,
+        *,
+        wait: bool,
+        max_retries: int = 3,
+        timeout_s: float = 0.5,
+    ) -> tuple[list[torch.Tensor], object] | None:
+        tensors = [torch.empty(shape, dtype=dtype) for _ in range(count)]
+        allocation = object()
+        return tensors, allocation
+
+    def free_scratch(self, allocation: object) -> None:
+        self.freed.append(allocation)
+
+    def close(self) -> None:
+        return None
+
+
+def _make_quantized_plan(group_id: int) -> GroupTransferPlan:
+    raw_shape = torch.Size([1, 1, 1, 1])
+    return GroupTransferPlan(
+        group_info=EngineGroupInfo(
+            engine_group_id=group_id, cache_category="attention"
+        ),
+        layer_indices=frozenset(),
+        blocks_per_chunk=1,
+        chunk_shape=raw_shape,
+        engine_kv_format=None,
+        attention_plane_layout=None,
+        quantized=True,
+        raw_layout_desc=MemoryLayoutDesc(shapes=[raw_shape], dtypes=[torch.float32]),
+    )
+
+
+def test_submit_store_pipelines_across_quantized_shm_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Group N+1's launch must be enqueued before group N's encode finishes.
+
+    Regression test for the bug where quantized-SHM groups (Branch A) were
+    processed with a fully synchronous outer loop -- each group's
+    launch+wait+split+encode ran to completion before the next group's
+    launch was even issued, so cross-group D2H/CPU overlap never happened
+    in production (4 groups, 1 chunk each).
+    """
+    gather_gate = threading.Event()
+    gather_gate.set()
+    events: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
+    _install_fake_gather(monkeypatch)
+    monkeypatch.setattr(async_engine_driven, "EngineDrivenContextShm", _FakeShmContext)
+
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    fake_context = _FakeShmContext(
+        commit_impl=lambda _c: True,
+        prepare_result=([torch.zeros(1, dtype=torch.uint8) for _ in range(2)], [0, 1]),
+    )
+    ctx._engine_driven_context = fake_context  # type: ignore[assignment]
+
+    plan0 = _make_quantized_plan(0)
+    plan1 = _make_quantized_plan(1)
+    transfer_groups = [
+        (plan0, {"k": torch.zeros(1)}, [0]),
+        (plan1, {"k": torch.zeros(1)}, [0]),
+    ]
+    monkeypatch.setattr(
+        ctx, "iter_transfer_groups", lambda *_a, **_kw: iter(transfer_groups)
+    )
+
+    _orig_launch = AsyncEngineDrivenTransferContext._launch_shm_quantized_batch
+
+    def _record_launch(
+        self: AsyncEngineDrivenTransferContext,
+        request_id: str,
+        batch: _BoundedStoreBatch,
+    ) -> Any:
+        events.append(("launch", batch.group_id))
+        return _orig_launch(self, request_id, batch)
+
+    monkeypatch.setattr(
+        AsyncEngineDrivenTransferContext,
+        "_launch_shm_quantized_batch",
+        _record_launch,
+    )
+
+    def _fake_encode_into_slots(
+        self: AsyncEngineDrivenTransferContext,
+        plan: GroupTransferPlan,
+        gathered: list[torch.Tensor],
+        slots: list[torch.Tensor],
+        mamba_splits: object = None,
+        fused_head_splits: object = None,
+    ) -> None:
+        assert plan.group_info is not None
+        slots[0].fill_(plan.group_info.engine_group_id + 1)
+        events.append(("encode", plan.group_info.engine_group_id))
+
+    monkeypatch.setattr(
+        AsyncEngineDrivenTransferContext,
+        "_encode_group_chunks_into_slots",
+        _fake_encode_into_slots,
+    )
+
+    future = ctx.submit_store(
+        "r1", object(), 1, {"k": torch.zeros(1)}, [[0], [0]], _FakeEvent(gather_gate), 1
+    )
+    assert future.result(timeout=1) is True
+
+    assert [group_id for phase, group_id in events if phase == "launch"] == [0, 1]
+    assert [int(slot.item()) for slot in fake_context.prepare_result[0]] == [1, 2]
+
+    # Group 1's launch must happen before group 0's encode --
+    # proof the pipeline enqueues the next D2H gather ahead of the current
+    # CPU-side split/encode, instead of running group 0 fully to completion
+    # first.
+    assert events.index(("launch", 1)) < events.index(("encode", 0))
+    ctx.close()
+
+
+def test_run_async_bounded_pipeline_frees_next_batch_scratch_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception while processing batch 0 must not leak batch 1's scratch.
+
+    Batch 1's gather is already launched (and its scratch allocated) before
+    batch 0 is processed, per the pipeline's depth-2 lookahead. If
+    processing batch 0 raises, the driver's except branch must free batch
+    1's already-allocated scratch instead of leaking it.
+    """
+    gather_gate = threading.Event()
+    gather_gate.set()
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
+    _install_fake_gather(monkeypatch)
+    monkeypatch.setattr(async_engine_driven, "EngineDrivenContextShm", _FakeShmContext)
+
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    fake_context = _FakeShmContext(commit_impl=lambda _c: True, prepare_result=None)
+    ctx._engine_driven_context = fake_context  # type: ignore[assignment]
+
+    plan0 = _make_quantized_plan(0)
+    plan1 = _make_quantized_plan(1)
+    batches = [
+        _BoundedStoreBatch(
+            plan=plan0,
+            group_kv_caches={"k": torch.zeros(1)},
+            group_block_ids=[0],
+            group_slots=[torch.zeros(1, dtype=torch.uint8)],
+            group_id=0,
+            start=0,
+            batch_index=0,
+        ),
+        _BoundedStoreBatch(
+            plan=plan1,
+            group_kv_caches={"k": torch.zeros(1)},
+            group_block_ids=[0],
+            group_slots=[torch.zeros(1, dtype=torch.uint8)],
+            group_id=1,
+            start=0,
+            batch_index=0,
+        ),
+    ]
+
+    def _boom(
+        self: AsyncEngineDrivenTransferContext,
+        request_id: str,
+        batch: _BoundedStoreBatch,
+        pending: object,
+    ) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        AsyncEngineDrivenTransferContext, "_process_shm_quantized_batch", _boom
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        ctx._run_async_bounded_pipeline("r1", batches)
+
+    # Batch 1's scratch (allocated during its lookahead launch) must have
+    # been freed by the except branch even though it was never processed.
+    assert len(fake_context.freed) == 1
     ctx.close()

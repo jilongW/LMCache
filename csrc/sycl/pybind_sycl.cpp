@@ -25,14 +25,36 @@ namespace py = pybind11;
 namespace {
 
 struct ThreadLocalBlockIdUsm {
-      int64_t* ptr = nullptr;
-      size_t capacity = 0;
-      sycl::context context;
-      bool has_context = false;
+      static constexpr size_t kBuffersPerSlab = 8;
+      static constexpr size_t kInitialBufferCapacity = 1024;
+
+      struct Buffer {
+            sycl::event last_use;
+            bool in_flight = false;
+      };
+
+      struct Slab {
+            int64_t* ptr = nullptr;
+            size_t capacity = 0;
+            sycl::context context;
+            std::vector<Buffer> buffers;
+      };
+
+      std::vector<Slab> slabs;
+      size_t active_slab = static_cast<size_t>(-1);
+      size_t active_buffer = static_cast<size_t>(-1);
 
       ~ThreadLocalBlockIdUsm() {
-            if (ptr != nullptr && has_context) {
-                  sycl::free(ptr, context);
+            for (auto& slab : slabs) {
+                  if (slab.ptr == nullptr) {
+                        continue;
+                  }
+                  for (auto& buffer : slab.buffers) {
+                        if (buffer.in_flight) {
+                              buffer.last_use.wait();
+                        }
+                  }
+                  sycl::free(slab.ptr, slab.context);
             }
       }
 
@@ -40,22 +62,73 @@ struct ThreadLocalBlockIdUsm {
                               const sycl::queue& queue) {
             const size_t count = static_cast<size_t>(source.numel());
             const sycl::context& queue_context = queue.get_context();
-            if (ptr == nullptr || capacity < count ||
-                (has_context && context != queue_context)) {
-                  if (ptr != nullptr && has_context) {
-                        sycl::free(ptr, context);
+            constexpr size_t kNoIndex = static_cast<size_t>(-1);
+            active_slab = kNoIndex;
+            active_buffer = static_cast<size_t>(-1);
+            for (size_t slab_idx = 0; slab_idx < slabs.size(); ++slab_idx) {
+                  auto& slab = slabs[slab_idx];
+                  if (slab.capacity < count || slab.context != queue_context) {
+                        continue;
                   }
-                  ptr = sycl::malloc_host<int64_t>(count, queue_context);
-                  TORCH_CHECK(ptr != nullptr, "failed to allocate USM host block-ID buffer");
-                  capacity = count;
-                  context = queue_context;
-                  has_context = true;
+                  for (size_t buffer_idx = 0;
+                       buffer_idx < slab.buffers.size(); ++buffer_idx) {
+                        auto& buffer = slab.buffers[buffer_idx];
+                        if (buffer.in_flight) {
+                              if (buffer.last_use.get_info<
+                                      sycl::info::event::command_execution_status>() !=
+                                  sycl::info::event_command_status::complete) {
+                                    continue;
+                              }
+                              buffer.in_flight = false;
+                        }
+                        active_slab = slab_idx;
+                        active_buffer = buffer_idx;
+                        break;
+                  }
+                  if (active_slab != kNoIndex) {
+                        break;
+                  }
             }
-            std::memcpy(ptr, source.data_ptr<int64_t>(),
+
+            if (active_slab == kNoIndex) {
+                  Slab slab;
+                  slab.capacity = count > kInitialBufferCapacity
+                                          ? count
+                                          : kInitialBufferCapacity;
+                  TORCH_CHECK(
+                          slab.capacity <= static_cast<size_t>(-1) /
+                                                   kBuffersPerSlab,
+                          "block-ID USM slab size overflows size_t");
+                  slab.ptr = sycl::malloc_host<int64_t>(
+                          slab.capacity * kBuffersPerSlab, queue_context);
+                  TORCH_CHECK(slab.ptr != nullptr,
+                              "failed to allocate USM block-ID slab");
+                  slab.context = queue_context;
+                  slab.buffers.resize(kBuffersPerSlab);
+                  slabs.push_back(std::move(slab));
+                  active_slab = slabs.size() - 1;
+                  active_buffer = 0;
+            }
+
+            auto& slab = slabs[active_slab];
+            int64_t* buffer_ptr =
+                    slab.ptr + active_buffer * slab.capacity;
+            std::memcpy(buffer_ptr, source.data_ptr<int64_t>(),
                         count * sizeof(int64_t));
             return torch::from_blob(
-                ptr, {static_cast<int64_t>(count)},
+                buffer_ptr, {static_cast<int64_t>(count)},
                 torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+      }
+
+      void mark_submitted(sycl::queue& queue) {
+            if (active_slab == static_cast<size_t>(-1)) {
+                  return;
+            }
+            auto& buffer = slabs[active_slab].buffers[active_buffer];
+            buffer.last_use = queue.ext_oneapi_submit_barrier();
+            buffer.in_flight = true;
+            active_slab = static_cast<size_t>(-1);
+            active_buffer = static_cast<size_t>(-1);
       }
 };
 
@@ -129,6 +202,7 @@ PYBIND11_MODULE(xpu_ops, m) {
                                           shape_desc.bs, shape_desc.hs,
                                                               skip_prefix_n_blocks * shape_desc.bs);
                         }
+                        g_block_id_usm.mark_submitted(queue);
                   },
                   py::arg("paged_buffer_ptrs_tensor"), py::arg("lmcache_objects_ptrs"),
                   py::arg("block_ids"), py::arg("device"), py::arg("direction"),

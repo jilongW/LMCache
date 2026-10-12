@@ -4,10 +4,12 @@
 # Standard
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Protocol, cast
 import os
+import threading
 
 # Third Party
 import msgspec
@@ -65,6 +67,8 @@ logger = init_logger(__name__)
 # ``lmcache_driven``); ``auto`` reproduces the historical device-type-based
 # dispatch.
 ENV_MP_TRANSFER_MODE = "LMCACHE_MP_TRANSFER_MODE"
+
+
 # Helper functions
 def _supports_async_primitives() -> bool:
     """Probe whether the worker device supports the async store primitives.
@@ -466,6 +470,43 @@ class GroupChunkSelection:
     def is_empty(self) -> bool:
         """Whether this group has no chunks to gather and can be skipped."""
         return self.chunk_indices is not None and not self.chunk_indices
+
+
+@dataclass(frozen=True)
+class _BoundedStoreBatch:
+    """One quantized-SHM chunk's worth of work, flattened out of its group.
+
+    ``EngineDrivenTransferContext._run_bounded_store_pipeline`` processes a
+    list of these spanning every quantized-SHM group in one ``submit_store``
+    call, so group/kv-cache/block-id/slot fields repeat across every batch
+    belonging to the same group (cheap: these are references, not copies).
+    """
+
+    plan: "GroupTransferPlan"
+    group_kv_caches: dict[str, torch.Tensor]
+    group_block_ids: list[int]
+    group_slots: list[torch.Tensor]
+    group_id: int
+    start: int
+    batch_index: int
+
+
+@dataclass
+class _BoundedGatherResult:
+    """One batch's gathered chunk plus the raw scratch backing it.
+
+    Returned by ``_bounded_gather_stage`` (runs on the pipeline's background
+    gather thread) and consumed by ``_bounded_encode_stage`` (runs on the
+    calling thread) via ``_run_bounded_store_pipeline``, which owns freeing
+    ``raw_allocation`` once the encode stage is done with ``gathered``.
+    ``raw_allocation`` is never ``None``: ``allocate_scratch_tensors`` raises
+    on pool exhaustion rather than returning ``None`` (see
+    ``EngineDrivenContextShm.allocate_scratch_tensors``), so a successfully
+    constructed ``_BoundedGatherResult`` always has a real allocation to free.
+    """
+
+    gathered: list[torch.Tensor]
+    raw_allocation: ScratchAllocation
 
 
 def null_chunk_mask_from_groups(
@@ -1162,97 +1203,6 @@ class TransferContext(ABC):
             "Q ring store is not supported by this transfer context"
         )
 
-    def _store_shm_quantized_group_bounded(
-        self,
-        request_id: str,
-        plan: GroupTransferPlan,
-        group_kv_caches: dict[str, torch.Tensor],
-        group_block_ids: list[int],
-        selection: Any,
-        group_slots: list[torch.Tensor],
-    ) -> None:
-        """Process a quantized SHM group in bounded gather/encode batches."""
-        context = self._engine_driven_context
-        assert isinstance(context, EngineDrivenContextShm)
-        raw_shape = _raw_gather_shape(plan)
-        raw_dtype = plan.raw_layout_desc.dtypes[0]
-        for start, batch_index in enumerate(selection.chunk_indices):
-            batch_indices = [batch_index]
-            scratch = context.allocate_scratch_tensors(
-                raw_shape, raw_dtype, len(batch_indices), wait=False
-            )
-            raw_allocation = None
-            if scratch is not None:
-                raw_chunks, raw_allocation = scratch
-            else:
-                logger.debug(
-                    "SHM scratch unavailable for request_id=%s group=%s; "
-                    "using synchronous CPU fallback for %d chunks",
-                    request_id,
-                    plan.group_info.engine_group_id
-                    if plan.group_info is not None
-                    else -1,
-                    len(batch_indices),
-                )
-                raw_chunks = [torch.empty(raw_shape, dtype=raw_dtype) for _ in batch_indices]
-            split_allocation = None
-            try:
-                gathered = gather_paged_kv_to_cpu(
-                    group_kv_caches,
-                    group_block_ids,
-                    plan.blocks_per_chunk,
-                    layout_hints=self._layout_hints,
-                    engine_kv_format=plan.engine_kv_format,
-                    out=raw_chunks,
-                    chunk_indices=batch_indices,
-                )
-                torch_dev.synchronize()
-                mamba_splits = None
-                fused_head_splits = None
-                if (
-                    plan.group_info is not None
-                    and plan.group_info.cache_category == "mamba"
-                ):
-                    split = self._allocate_mamba_split_scratch(
-                        plan, len(gathered), context, wait=False
-                    )
-                    if split is not None:
-                        mamba_splits, split_allocation = split
-                elif plan.attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
-                    split = self._allocate_fused_head_split_scratch(
-                        plan, len(gathered), context, wait=False
-                    )
-                    if split is not None:
-                        fused_head_splits, split_allocation = split
-                if mamba_splits is not None:
-                    for raw_chunk, split in zip(gathered, mamba_splits, strict=True):
-                        self._kvweave_codec.split_mamba_chunk(  # type: ignore[union-attr]
-                            raw_chunk,
-                            plan.group_info.mamba_real_layout,
-                            plan.group_info.tokens_per_block,
-                            out=split,
-                        )
-                elif fused_head_splits is not None:
-                    for raw_chunk, head_split in zip(gathered, fused_head_splits, strict=True):
-                        self._kvweave_codec.split_fused_attention_heads(  # type: ignore[union-attr]
-                            raw_chunk,
-                            self._kvweave_codec._fused_head_num(raw_chunk.shape[-1]),  # type: ignore[union-attr]
-                            self._kvweave_codec._fused_head_dim(raw_chunk.shape[-1]),  # type: ignore[union-attr]
-                            out=head_split,
-                        )
-                self._encode_group_chunks_into_slots(
-                    plan,
-                    gathered,
-                            group_slots[start : start + len(gathered)],
-                    mamba_splits,
-                    fused_head_splits,
-                )
-            finally:
-                if split_allocation is not None:
-                    context.free_scratch(split_allocation)
-                if raw_allocation is not None:
-                    context.free_scratch(raw_allocation)
-
     def submit_store(
         self,
         request_id: str,
@@ -1595,6 +1545,24 @@ class EngineDrivenTransferContext(TransferContext):
         # reused by submit_store()/submit_retrieve() so both call the exact
         # same encode_chunk()/decode_chunk() (see MIGRATION_PLAN.md R3).
         self._kvweave_codec: KVWeaveCodec | None = None
+        # Resident one-worker executor for _run_bounded_store_pipeline's
+        # gather/encode overlap. Creating/tearing down a ThreadPoolExecutor
+        # per submit_store call costs ~0.15ms of thread-spawn overhead (one
+        # per call, not per batch) -- measurable against the ~1ms per-batch
+        # gather this pipeline tries to hide, so it's kept resident instead.
+        # ``_bounded_gather_executor_lock`` guards against this becoming a
+        # new cross-request serialization point: submit_store only uses the
+        # resident executor while holding the lock non-blockingly; a second,
+        # truly concurrent submit_store call on this same instance (e.g. from
+        # the ATOM integration, which does not guarantee single-threaded
+        # dispatch the way the vLLM integration does) finds the lock held and
+        # falls back to processing its own batches sequentially on its own
+        # calling thread -- matching this pipeline's pre-existing behavior
+        # before this optimization, never worse than that.
+        self._bounded_gather_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="lmcache_bounded_gather"
+        )
+        self._bounded_gather_executor_lock = threading.Lock()
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -2125,6 +2093,184 @@ class EngineDrivenTransferContext(TransferContext):
             wait=wait,
         )
 
+    def _bounded_gather_stage(
+        self, request_id: str, batch: _BoundedStoreBatch
+    ) -> _BoundedGatherResult:
+        """Gather one quantized-SHM chunk into raw scratch (pipeline stage 1).
+
+        Runs on the pipeline's dedicated gather executor thread (see
+        ``_run_bounded_store_pipeline``) so this batch's blocking
+        ``torch_dev.synchronize()`` overlaps with the *previous* batch's
+        split+encode on the calling thread. If gather or synchronize raises,
+        this batch's own raw scratch is freed here before re-raising, so the
+        driver never has to guess whether a failed ``Future`` left scratch
+        allocated.
+        """
+        context = self._engine_driven_context
+        assert isinstance(context, EngineDrivenContextShm)
+        raw_shape = _raw_gather_shape(batch.plan)
+        raw_dtype = batch.plan.raw_layout_desc.dtypes[0]  # type: ignore[union-attr]
+        raw_chunks, raw_allocation = context.allocate_scratch_tensors(
+            raw_shape, raw_dtype, 1, wait=False
+        )
+        try:
+            gathered = gather_paged_kv_to_cpu(
+                batch.group_kv_caches,
+                batch.group_block_ids,
+                batch.plan.blocks_per_chunk,
+                layout_hints=self._layout_hints,
+                engine_kv_format=batch.plan.engine_kv_format,
+                out=raw_chunks,
+                chunk_indices=[batch.batch_index],
+            )
+            torch_dev.synchronize()
+        except BaseException:
+            context.free_scratch(raw_allocation)
+            raise
+        return _BoundedGatherResult(gathered=gathered, raw_allocation=raw_allocation)
+
+    def _bounded_encode_stage(
+        self,
+        request_id: str,
+        batch: _BoundedStoreBatch,
+        gather_result: _BoundedGatherResult,
+    ) -> None:
+        """Split + encode one already-gathered quantized-SHM chunk (stage 2).
+
+        Runs on the calling thread, concurrently with the gather executor
+        thread's blocking gather of the *next* batch (see
+        ``_run_bounded_store_pipeline``). Only frees its own split-scratch
+        allocation -- the caller owns freeing
+        ``gather_result.raw_allocation``.
+        """
+        context = self._engine_driven_context
+        assert isinstance(context, EngineDrivenContextShm)
+        gathered = gather_result.gathered
+        split_allocation: ScratchAllocation | None = None
+        try:
+            mamba_splits: list[MambaChunkSplit] | None = None
+            fused_head_splits: list[torch.Tensor] | None = None
+            if (
+                batch.plan.group_info is not None
+                and batch.plan.group_info.cache_category == "mamba"
+            ):
+                split = self._allocate_mamba_split_scratch(
+                    batch.plan, len(gathered), context, wait=False
+                )
+                if split is not None:
+                    mamba_splits, split_allocation = split
+            elif batch.plan.attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
+                split = self._allocate_fused_head_split_scratch(
+                    batch.plan, len(gathered), context, wait=False
+                )
+                if split is not None:
+                    fused_head_splits, split_allocation = split
+            if mamba_splits is not None:
+                for raw_chunk, split in zip(gathered, mamba_splits, strict=True):
+                    self._kvweave_codec.split_mamba_chunk(  # type: ignore[union-attr]
+                        raw_chunk,
+                        batch.plan.group_info.mamba_real_layout,
+                        batch.plan.group_info.tokens_per_block,
+                        out=split,
+                    )
+            elif fused_head_splits is not None:
+                for raw_chunk, head_split in zip(
+                    gathered, fused_head_splits, strict=True
+                ):
+                    self._kvweave_codec.split_fused_attention_heads(  # type: ignore[union-attr]
+                        raw_chunk,
+                        self._kvweave_codec._fused_head_num(raw_chunk.shape[-1]),  # type: ignore[union-attr]
+                        self._kvweave_codec._fused_head_dim(raw_chunk.shape[-1]),  # type: ignore[union-attr]
+                        out=head_split,
+                    )
+            self._encode_group_chunks_into_slots(
+                batch.plan,
+                gathered,
+                batch.group_slots[batch.start : batch.start + len(gathered)],
+                mamba_splits,
+                fused_head_splits,
+            )
+        finally:
+            if split_allocation is not None:
+                context.free_scratch(split_allocation)
+
+    def _run_bounded_store_pipeline(
+        self, request_id: str, batches: list[_BoundedStoreBatch]
+    ) -> None:
+        """Process every quantized-SHM chunk in one store call.
+
+        Normally runs a depth-2 pipeline: batch i+1's gather (on the
+        instance's resident background thread, including its
+        blocking-but-GIL-releasing ``torch_dev.synchronize()``) overlaps with
+        batch i's split+encode (on the calling thread). ``batches`` is
+        already flattened across every quantized-SHM group in this
+        ``submit_store`` call, in protocol order, so the pipeline window
+        spans group boundaries rather than resetting per group.
+
+        The background executor is a resident instance field
+        (``self._bounded_gather_executor``), reused across calls rather than
+        created per call, since creating/tearing down a ``ThreadPoolExecutor``
+        costs ~0.15ms of thread-spawn overhead per ``submit_store`` call --
+        measurable against the ~1ms per-batch gather this pipeline tries to
+        hide. Reusing an instance-level executor without any guard would
+        create a new cross-request serialization point if ``submit_store`` is
+        ever called concurrently on the same instance (e.g. from the ATOM
+        integration, which does not guarantee single-threaded dispatch the
+        way the vLLM integration does): a second concurrent call would queue
+        behind the first's gathers on the one shared worker thread, which
+        doesn't happen today. ``self._bounded_gather_executor_lock``
+        (non-blocking) guards against that: if it's already held by another
+        concurrent ``submit_store`` call, this call falls back to processing
+        its own batches sequentially on its own calling thread (no pipelining,
+        but also no new contention) -- the same shape of work this method
+        replaced, just without the overlap optimization for that one call.
+        """
+        if not batches:
+            return
+        context = self._engine_driven_context
+        assert isinstance(context, EngineDrivenContextShm)
+        if not self._bounded_gather_executor_lock.acquire(blocking=False):
+            for batch in batches:
+                gather_result = self._bounded_gather_stage(request_id, batch)
+                try:
+                    self._bounded_encode_stage(request_id, batch, gather_result)
+                finally:
+                    context.free_scratch(gather_result.raw_allocation)
+            return
+        try:
+            executor = self._bounded_gather_executor
+            pending_future: Future[_BoundedGatherResult] | None = None
+            try:
+                pending_future = executor.submit(
+                    self._bounded_gather_stage, request_id, batches[0]
+                )
+                for i, batch in enumerate(batches):
+                    gather_result = pending_future.result()
+                    pending_future = None
+                    if i + 1 < len(batches):
+                        pending_future = executor.submit(
+                            self._bounded_gather_stage, request_id, batches[i + 1]
+                        )
+                    try:
+                        self._bounded_encode_stage(request_id, batch, gather_result)
+                    finally:
+                        context.free_scratch(gather_result.raw_allocation)
+            finally:
+                # An exception above may have left the NEXT batch's gather
+                # already submitted (or finished) on the background thread,
+                # holding a raw scratch allocation that the loop iteration
+                # which would have consumed and freed it will now never run.
+                # Drain it here so it isn't leaked.
+                if pending_future is not None:
+                    try:
+                        leftover = pending_future.result()
+                    except BaseException:
+                        pass  # _bounded_gather_stage already freed its own scratch
+                    else:
+                        context.free_scratch(leftover.raw_allocation)
+        finally:
+            self._bounded_gather_executor_lock.release()
+
     def _decode_group_chunks(
         self,
         plan: GroupTransferPlan,
@@ -2250,20 +2396,46 @@ class EngineDrivenTransferContext(TransferContext):
         # ``out_buffers is not None`` (SHM mode -- see below).
         gathered_by_group: list[
             tuple[
+                int,
                 GroupTransferPlan,
                 list[torch.Tensor],
                 list[torch.Tensor] | None,
                 ScratchAllocation | None,
             ]
         ] = []
+        # Quantized-SHM groups' chunks are flattened across ALL such groups
+        # (not just within one group) into one ordered list, processed after
+        # this loop by a depth-2 gather/encode pipeline -- see
+        # _run_bounded_store_pipeline.
+        bounded_batches: list[_BoundedStoreBatch] = []
         group_offset = 0
-        for plan, group_kv_caches, group_block_ids in transfer_groups:
+        groups_with_selections = []
+        for group_index, (plan, group_kv_caches, group_block_ids) in enumerate(
+            transfer_groups
+        ):
             selection = _select_group_chunks(
                 chunk_indices,
                 group_offset,
                 len(group_block_ids) // plan.blocks_per_chunk,
             )
             group_offset += selection.num_group_chunks
+            groups_with_selections.append(
+                (
+                    group_index,
+                    plan,
+                    group_kv_caches,
+                    group_block_ids,
+                    selection,
+                )
+            )
+
+        for (
+            group_index,
+            plan,
+            group_kv_caches,
+            group_block_ids,
+            selection,
+        ) in groups_with_selections:
             if selection.is_empty:
                 continue
             if chunk_indices is None:
@@ -2290,13 +2462,22 @@ class EngineDrivenTransferContext(TransferContext):
                 and plan.quantized
                 and isinstance(self._engine_driven_context, EngineDrivenContextShm)
             ):
-                self._store_shm_quantized_group_bounded(
-                    _request_id,
-                    plan,
-                    group_kv_caches,
-                    group_block_ids,
-                    selection,
-                    group_slots,
+                group_id = (
+                    plan.group_info.engine_group_id
+                    if plan.group_info is not None
+                    else -1
+                )
+                bounded_batches.extend(
+                    _BoundedStoreBatch(
+                        plan=plan,
+                        group_kv_caches=group_kv_caches,
+                        group_block_ids=group_block_ids,
+                        group_slots=group_slots,
+                        group_id=group_id,
+                        start=start,
+                        batch_index=batch_index,
+                    )
+                    for start, batch_index in enumerate(selection.chunk_indices)
                 )
                 continue
             scratch_allocation: ScratchAllocation | None = None
@@ -2327,12 +2508,20 @@ class EngineDrivenTransferContext(TransferContext):
             )
             gathered_by_group.append(
                 (
+                    group_index,
                     plan,
                     gathered,
                     group_slots if plan.quantized else None,
                     scratch_allocation,
                 )
             )
+        # Process every quantized-SHM group's chunks, flattened across group
+        # boundaries, through the depth-2 gather/encode pipeline. This must
+        # complete (every batch's encode landed in its SHM slot) before
+        # commit_store below, same as the non-bounded path's synchronize --
+        # independent of it otherwise, since the two paths touch disjoint
+        # group_slots/cpu_chunks.
+        self._run_bounded_store_pipeline(_request_id, bounded_batches)
         # Gather issues async device->CPU copies on BOTH transports: into the
         # SHM slots when out_buffers is given, otherwise into fresh buffers that
         # commit_store serializes immediately. Either way the copies must be
@@ -2343,7 +2532,9 @@ class EngineDrivenTransferContext(TransferContext):
         torch_dev.synchronize()
 
         cpu_chunks: list[torch.Tensor] = []
-        for plan, gathered, quant_slots, scratch_allocation in gathered_by_group:
+        for _, plan, gathered, quant_slots, scratch_allocation in sorted(
+            gathered_by_group, key=lambda group: group[0]
+        ):
             split_scratch_allocation: ScratchAllocation | None = None
             head_split_scratch_allocation: ScratchAllocation | None = None
             try:
@@ -2616,6 +2807,7 @@ class EngineDrivenTransferContext(TransferContext):
         if self._engine_driven_context is not None:
             self._engine_driven_context.close()
             self._engine_driven_context = None
+        self._bounded_gather_executor.shutdown(wait=True)
 
     def flush_inflight_stores(self) -> None:
         pass
