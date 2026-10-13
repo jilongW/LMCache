@@ -2767,11 +2767,11 @@ class EngineDrivenTransferContext(TransferContext):
                 logger.exception("Failed to decode retrieved CPU context chunks")
                 ok = False
 
-            # All quantized SHM slots have been consumed by R1. Release their
-            # server-side read reservations before R3 so another request can
-            # reuse those compact slots while this request scatters raw data.
-            self._engine_driven_context.commit_retrieve(key, instance_id)
-            retrieve_committed = True
+            # Raw groups scatter directly from SHM, so their read locks must
+            # stay held until the device finishes consuming the source slots.
+            if ok and all(plan.quantized for plan, _, _, _ in decoded_groups):
+                self._engine_driven_context.commit_retrieve(key, instance_id)
+                retrieve_committed = True
 
             try:
                 if not ok:

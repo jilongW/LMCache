@@ -1148,6 +1148,32 @@ def test_submit_retrieve_scatters_chunks_group_major(
     assert torch.all(destination["layer_2"][:, 2] == 0)
 
 
+def test_unquantized_retrieve_keeps_source_locked_until_scatter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_context = _FakeEngineDrivenContext()
+    kv_caches = _make_kv_caches(4, num_blocks=8, block_size=4, num_heads=2, head_size=8)
+    ctx = _register_context(monkeypatch, fake_context, kv_caches)
+    assert ctx.submit_store(
+        "req", MagicMock(), 1, kv_caches, [[0, 1], [4, 5]], MagicMock(), 2
+    ).result()
+    fake_context.retrieve_chunks = fake_context.committed_chunks
+
+    def release_source(_key: object, _instance_id: int) -> bool:
+        assert fake_context.retrieve_chunks is not None
+        for chunk in fake_context.retrieve_chunks:
+            chunk.zero_()
+        return True
+
+    monkeypatch.setattr(fake_context, "commit_retrieve", release_source)
+    destination = {name: torch.zeros_like(tensor) for name, tensor in kv_caches.items()}
+    assert ctx.submit_retrieve(
+        "req", MagicMock(), 1, destination, [[2, 3], [6, 7]], MagicMock(), 2
+    ).result()
+    assert torch.allclose(destination["layer_0"][:, 2], kv_caches["layer_0"][:, 0])
+    assert torch.allclose(destination["layer_2"][:, 6], kv_caches["layer_2"][:, 4])
+
+
 def test_submit_retrieve_attaches_null_chunk_mask_for_recurrent_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

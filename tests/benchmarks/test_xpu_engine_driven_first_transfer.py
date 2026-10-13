@@ -17,6 +17,7 @@ import argparse
 from importlib.util import module_from_spec, spec_from_file_location
 from unittest.mock import MagicMock
 import os
+import threading
 import time
 
 import pytest
@@ -218,6 +219,7 @@ def _run_submit_store(
     warmup: int,
     quantization: bool,
     use_async: bool = False,
+    pipeline: bool = False,
 ) -> None:
     helper_path = os.path.join(
         os.path.dirname(__file__), "bench_engine_driven_shm_timing.py"
@@ -262,34 +264,55 @@ def _run_submit_store(
             "lmcache.v1.multiprocess.transfer_context.worker_transfer",
             fromlist=["gather_paged_kv_to_cpu"],
         )
+        async_engine_driven = __import__(
+            "lmcache.v1.multiprocess.transfer_context.async_engine_driven",
+            fromlist=["gather_paged_kv_to_cpu"],
+        )
         original_gather = worker_transfer.gather_paged_kv_to_cpu
+        # async_engine_driven.py imports its own independent module-level
+        # binding of gather_paged_kv_to_cpu from base.py; patching
+        # worker_transfer's binding alone never affects calls made from
+        # _launch_shm_quantized_batch (the bounded-pipeline gather path).
+        original_async_gather = async_engine_driven.gather_paged_kv_to_cpu
         original_sync = worker_transfer.torch_dev.synchronize
-        active_request = -1
+        # In pipeline mode, multiple requests' background gather/split/encode
+        # threads run concurrently, so "the active request" is per-thread,
+        # not a single shared counter.
+        active_request_by_thread: dict[int, int] = {}
         gather_index = 0
         sync_index = 0
 
-        def timed_gather(*args, **kwargs):
-            nonlocal gather_index
-            start_offset_ms = offset_ms()
-            start = time.perf_counter()
-            result = original_gather(*args, **kwargs)
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
-            if active_request >= 0:
-                engine_format = kwargs.get("engine_kv_format")
-                chunk_indices = kwargs.get("chunk_indices")
-                print(
-                    f"request={active_request} chunk={gather_index} "
-                    f"format={engine_format.name if engine_format else 'unknown'} "
-                    f"chunk_indices={chunk_indices} "
-                    f"phase=launch start_offset_ms={start_offset_ms:.3f} "
-                    f"end_offset_ms={offset_ms():.3f} "
-                    f"gather_call_ms={elapsed_ms:.3f}",
-                    flush=True,
-                )
-            gather_index += 1
-            return result
+        def active_request() -> int:
+            return active_request_by_thread.get(threading.get_ident(), -1)
 
-        worker_transfer.gather_paged_kv_to_cpu = timed_gather
+        def _make_timed_gather(original):
+            def timed_gather(*args, **kwargs):
+                nonlocal gather_index
+                start_offset_ms = offset_ms()
+                start = time.perf_counter()
+                result = original(*args, **kwargs)
+                elapsed_ms = (time.perf_counter() - start) * 1000.0
+                if active_request() >= 0:
+                    engine_format = kwargs.get("engine_kv_format")
+                    chunk_indices = kwargs.get("chunk_indices")
+                    print(
+                        f"request={active_request()} chunk={gather_index} "
+                        f"format={engine_format.name if engine_format else 'unknown'} "
+                        f"chunk_indices={chunk_indices} "
+                        f"phase=launch start_offset_ms={start_offset_ms:.3f} "
+                        f"end_offset_ms={offset_ms():.3f} "
+                        f"gather_call_ms={elapsed_ms:.3f}",
+                        flush=True,
+                    )
+                gather_index += 1
+                return result
+
+            return timed_gather
+
+        worker_transfer.gather_paged_kv_to_cpu = _make_timed_gather(original_gather)
+        async_engine_driven.gather_paged_kv_to_cpu = _make_timed_gather(
+            original_async_gather
+        )
 
         def timed_sync(*args, **kwargs):
             nonlocal sync_index
@@ -297,9 +320,9 @@ def _run_submit_store(
             start = time.perf_counter()
             result = original_sync(*args, **kwargs)
             elapsed_ms = (time.perf_counter() - start) * 1000.0
-            if active_request >= 0:
+            if active_request() >= 0:
                 print(
-                    f"request={active_request} sync={sync_index} "
+                    f"request={active_request()} sync={sync_index} "
                     f"phase=wait start_offset_ms={start_offset_ms:.3f} "
                     f"end_offset_ms={offset_ms():.3f} "
                     f"sync_ms={elapsed_ms:.3f}",
@@ -309,6 +332,34 @@ def _run_submit_store(
             return result
 
         worker_transfer.torch_dev.synchronize = timed_sync
+
+        # Patched at the Event *class* level (not a module-level function
+        # binding) so it covers every torch_dev.Event() instance created by
+        # _launch_shm_quantized_batch, including the bounded pipeline's
+        # per-chunk event.synchronize() -- the actual D2H-wait that overlaps
+        # (or fails to overlap) with the previous chunk's split/encode.
+        event_cls = type(torch_dev.Event())
+        original_event_synchronize = event_cls.synchronize
+        event_sync_index = 0
+
+        def timed_event_synchronize(self):
+            nonlocal event_sync_index
+            start_offset_ms = offset_ms()
+            start = time.perf_counter()
+            result = original_event_synchronize(self)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            if active_request() >= 0:
+                print(
+                    f"request={active_request()} event_sync={event_sync_index} "
+                    f"phase=event_wait start_offset_ms={start_offset_ms:.3f} "
+                    f"end_offset_ms={offset_ms():.3f} "
+                    f"event_wait_ms={elapsed_ms:.3f}",
+                    flush=True,
+                )
+            event_sync_index += 1
+            return result
+
+        event_cls.synchronize = timed_event_synchronize
 
         kvweave_codec = ctx._kvweave_codec
         original_split_mamba = kvweave_codec.split_mamba_chunk
@@ -321,9 +372,9 @@ def _run_submit_store(
             start = time.perf_counter()
             result = original_split_mamba(*args, **kwargs)
             elapsed_ms = (time.perf_counter() - start) * 1000.0
-            if active_request >= 0:
+            if active_request() >= 0:
                 print(
-                    f"request={active_request} split={split_index} kind=mamba "
+                    f"request={active_request()} split={split_index} kind=mamba "
                     f"phase=split start_offset_ms={start_offset_ms:.3f} "
                     f"end_offset_ms={offset_ms():.3f} "
                     f"split_ms={elapsed_ms:.3f}",
@@ -338,9 +389,9 @@ def _run_submit_store(
             start = time.perf_counter()
             result = original_split_fused(*args, **kwargs)
             elapsed_ms = (time.perf_counter() - start) * 1000.0
-            if active_request >= 0:
+            if active_request() >= 0:
                 print(
-                    f"request={active_request} split={split_index} kind=fused_attention "
+                    f"request={active_request()} split={split_index} kind=fused_attention "
                     f"phase=split start_offset_ms={start_offset_ms:.3f} "
                     f"end_offset_ms={offset_ms():.3f} "
                     f"split_ms={elapsed_ms:.3f}",
@@ -359,14 +410,14 @@ def _run_submit_store(
             start = time.perf_counter()
             result = original_encode(plan, gathered, slots, *args, **kwargs)
             elapsed_ms = (time.perf_counter() - start) * 1000.0
-            if active_request >= 0:
+            if active_request() >= 0:
                 group_id = (
                     plan.group_info.engine_group_id
                     if plan.group_info is not None
                     else -1
                 )
                 print(
-                    f"request={active_request} chunk group={group_id} "
+                    f"request={active_request()} chunk group={group_id} "
                     f"phase=encode start_offset_ms={start_offset_ms:.3f} "
                     f"end_offset_ms={offset_ms():.3f} "
                     f"encode_ms={elapsed_ms:.3f}",
@@ -410,9 +461,35 @@ def _run_submit_store(
         block_ids = [[0] for _ in ctx._group_plans]
         token_ids = tuple(range(_BLOCK_SIZE))
 
-        def run_request(request_idx: int) -> None:
-            nonlocal active_request, gather_index, sync_index, split_index
-            active_request = request_idx
+        if pipeline and not use_async:
+            raise ValueError("pipeline mode requires use_async=True")
+        if use_async:
+            # submit_store's background gather/split/encode work always runs
+            # on a commit_executor worker thread, not the thread that called
+            # submit_store (true whether or not --pipeline overlaps multiple
+            # requests), so tag the worker thread itself -- not the calling
+            # thread -- for the duration of that request's task.
+            original_commit_submit = ctx._commit_executor.submit
+
+            def tagging_submit(fn, *args, **kwargs):
+                request_idx = active_request_by_thread.get(
+                    threading.get_ident(), -1
+                )
+
+                def tagged_fn(*fn_args, **fn_kwargs):
+                    active_request_by_thread[threading.get_ident()] = request_idx
+                    try:
+                        return fn(*fn_args, **fn_kwargs)
+                    finally:
+                        del active_request_by_thread[threading.get_ident()]
+
+                return original_commit_submit(tagged_fn, *args, **kwargs)
+
+            ctx._commit_executor.submit = tagging_submit
+
+        def submit_request(request_idx: int):
+            nonlocal gather_index, sync_index, split_index
+            active_request_by_thread[threading.get_ident()] = request_idx
             if request_idx == 0:
                 gather_index = 0
                 sync_index = 0
@@ -422,7 +499,6 @@ def _run_submit_store(
                 request_id=f"request-{request_idx}",
             )
             start_offset_ms = offset_ms()
-            start = time.perf_counter()
             print(
                 f"submit-store request={request_idx} "
                 f"start_offset_ms={start_offset_ms:.3f}",
@@ -434,7 +510,7 @@ def _run_submit_store(
             ordering_event = (
                 ctx.create_recorded_event() if use_async else None
             )
-            result = ctx.submit_store(
+            future = ctx.submit_store(
                 key.request_id,
                 key,
                 1,
@@ -442,7 +518,11 @@ def _run_submit_store(
                 block_ids,
                 ordering_event,
                 _BLOCKS_PER_CHUNK,
-            ).result()
+            )
+            return future
+
+        def await_request(request_idx: int, future, start: float) -> None:
+            result = future.result()
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             print(
                 f"submit-store request={request_idx} result={result} "
@@ -451,17 +531,45 @@ def _run_submit_store(
                 flush=True,
             )
 
+        def run_request(request_idx: int) -> None:
+            start = time.perf_counter()
+            future = submit_request(request_idx)
+            await_request(request_idx, future, start)
+
         for warmup_idx in range(warmup):
             run_request(-warmup_idx - 1)
             print(f"submit-store warmup={warmup_idx} done", flush=True)
-        for request_idx in range(num_requests):
-            run_request(request_idx)
-            if request_idx + 1 < num_requests and idle_ms > 0:
-                time.sleep(idle_ms / 1000.0)
+
+        if pipeline:
+            # Fire every request's submit_store from this thread first --
+            # each call only does O(1) work before handing off to
+            # commit_executor -- then wait on all futures, so requests'
+            # background gather/split/encode/commit work overlaps instead of
+            # being serialized by a blocking .result() per request.
+            starts = []
+            futures = []
+            for request_idx in range(num_requests):
+                starts.append(time.perf_counter())
+                futures.append(submit_request(request_idx))
+                if request_idx + 1 < num_requests and idle_ms > 0:
+                    time.sleep(idle_ms / 1000.0)
+            for request_idx, (future, start) in enumerate(zip(futures, starts)):
+                await_request(request_idx, future, start)
+        else:
+            for request_idx in range(num_requests):
+                run_request(request_idx)
+                if request_idx + 1 < num_requests and idle_ms > 0:
+                    time.sleep(idle_ms / 1000.0)
     finally:
+        if "original_commit_submit" in locals():
+            ctx._commit_executor.submit = original_commit_submit
         if "worker_transfer" in locals():
             worker_transfer.gather_paged_kv_to_cpu = original_gather
             worker_transfer.torch_dev.synchronize = original_sync
+        if "async_engine_driven" in locals():
+            async_engine_driven.gather_paged_kv_to_cpu = original_async_gather
+        if "event_cls" in locals():
+            event_cls.synchronize = original_event_synchronize
         if "kvweave_codec" in locals():
             kvweave_codec.split_mamba_chunk = original_split_mamba
             kvweave_codec.split_fused_attention_heads = original_split_fused
@@ -628,6 +736,17 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--pipeline",
+        action="store_true",
+        help=(
+            "In --submit-store --async-engine-driven mode, submit every "
+            "request's submit_store up front and wait on all futures "
+            "afterwards, instead of blocking on .result() per request. "
+            "Exercises cross-request overlap on the commit_executor thread "
+            "pool; requires --async-engine-driven."
+        ),
+    )
+    parser.add_argument(
         "--copy-mode",
         choices=[_COPY_MODE_EU, _COPY_MODE_MEMCPY],
         default=_COPY_MODE_EU,
@@ -642,6 +761,8 @@ if __name__ == "__main__":
         ),
     )
     args = parser.parse_args()
+    if args.pipeline and not args.async_engine_driven:
+        parser.error("--pipeline requires --async-engine-driven")
     if args.submit_store:
         _run_submit_store(
             args.requests,
@@ -649,6 +770,7 @@ if __name__ == "__main__":
             args.warmup,
             quantization=not args.no_quantization,
             use_async=args.async_engine_driven,
+            pipeline=args.pipeline,
         )
     else:
         _run(
