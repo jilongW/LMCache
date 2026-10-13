@@ -103,6 +103,31 @@ class _KVWeaveCodec:
         if self.device == "xpu" and not torch.xpu.is_available():
             raise RuntimeError("device='xpu' but torch.xpu.is_available() is False")
         self.native = _resolve_native(self.device)
+        self.fused_direct_quant = bool(kwargs.get("fused_direct_quant", True))
+        self.fused_direct_dequant = bool(kwargs.get("fused_direct_dequant", True))
+
+    def supports_fused_direct_quant(self) -> bool:
+        """Whether fused-K/V attention quantizes without a separate head split."""
+        return (
+            self.fused_direct_quant
+            and self.quantize
+            and self.scaling_method in {"per_channel", "per_token"}
+            and hasattr(self.native, "kvweave_serialize_fused_chunk_direct")
+        )
+
+    def supports_fused_direct_dequant(self) -> bool:
+        """Whether fused-K/V attention decodes straight into the fused layout."""
+        # CPU only: on XPU the wide-stride fused writes are slower than dequant + device permute.
+        # Re-measured 2026-10-13 (tests/benchmarks/bench_kvweave_fused_direct_quant.py and an
+        # ad hoc dequant-only microbench): kvweave_dequantize_fused_chunk_direct on XPU is
+        # ~15-20% slower than the existing kvweave_dequantize_chunk_state_into path for
+        # per_channel, roughly a wash (+/-7%) for per_token. Keep this CPU-only until that
+        # changes; see docs/env_vars.md LMCACHE_MP_KVWEAVE_FUSED_DIRECT_DEQUANT.
+        return (
+            self.fused_direct_dequant
+            and self.device == "cpu"
+            and hasattr(self.native, "kvweave_dequantize_fused_chunk_direct")
+        )
 
     @staticmethod
     def _tensor_bytes(tensor: torch.Tensor) -> bytes:
@@ -213,12 +238,16 @@ class _KVWeaveCodec:
         rh, asym, precond = (False, False, False) if method == "per_tensor" else (self.rh, self.asym, self.precond)
         header = self._quant_header(shape, work.dtype, method, rh, asym, precond)
         ids = KVWeaveCodecConfig.next_scale_ids(2)
+        signs, perm = self._attention_precond(
+            method, rh, precond, shape.chunk_tokens, shape.hidden_dim
+        )
         payload = bytes(self.native.kvweave_serialize_chunk(
             shape.tensor4d, header, ids[0], ids[1], qbit=self.qbit,
             blocks_num=max(1, shape.chunk_tokens // self.block_size),
             block_size=self.block_size, head_num=self._head_num(shape.hidden_dim),
             head_dim=self._head_dim(shape.hidden_dim), num_layers=shape.num_layers,
-            rh=rh, asym=asym, scaling_method=method, num_threads=self.num_threads,
+            rh=rh, asym=asym, scaling_method=method, signs=signs, perm=perm,
+            num_threads=self.num_threads,
         ))
         raw_bytes = work.numel() * work.element_size()
         logger.debug(
@@ -240,11 +269,14 @@ class _KVWeaveCodec:
         shape = parsed["shape4d"]
         q_dtype = torch.int8 if parsed["qbit"] <= 8 else torch.int16
         q = self._payload_tail(payload, parsed["q_offset"], q_dtype)
+        signs, perm = self._attention_precond(
+            parsed["scaling"], parsed["rh"], parsed["precond"], shape[2], shape[3]
+        )
         kwargs = dict(
             qbit=parsed["qbit"], blocks_num=parsed["blocks_num"], block_size=self.block_size,
             head_num=parsed["head_num"], head_dim=parsed["head_dim"], rh=parsed["rh"],
             asym=parsed["asym"], scaling_method=parsed["scaling"], output_dtype=dst.dtype,
-            num_threads=self.num_threads,
+            signs=signs, perm=perm, num_threads=self.num_threads,
         )
         if (
             hasattr(self.native, "kvweave_dequantize_chunk_into_4d")
@@ -267,8 +299,15 @@ class _KVWeaveCodec:
         tensor: torch.Tensor,
         scaling_method: str | None = None,
         head_split: torch.Tensor | None = None,
-    ) -> bytes:
-        """Serialize a fused-K/V attention chunk (no leading K/V axis)."""
+        out: torch.Tensor | None = None,
+    ) -> bytes | int:
+        """Serialize a fused-K/V attention chunk (no leading K/V axis).
+
+        Returns the payload as ``bytes``. If ``out`` (a contiguous ``uint8``
+        CPU tensor) is given and the native module can write in place (the
+        direct CPU kernel, or ``kvweave_serialize_chunk_state_into`` on XPU),
+        the payload is written straight into ``out`` and its length returned.
+        """
         if tensor.dim() != 3:
             raise ValueError(
                 f"KVWeave fused-K/V tensor expects [L, T, H], got {tuple(tensor.shape)}"
@@ -304,6 +343,17 @@ class _KVWeaveCodec:
                 tokens, hidden, head_dim, method, per_head_scales
             )
             signs, perm = self._config.mamba_precond_tensors(transform_size)
+        if (
+            per_head_scales
+            and method in {"per_channel", "per_token"}
+            and self.supports_fused_direct_quant()
+        ):
+            result = self.native.kvweave_serialize_fused_chunk_direct(
+                work, header, self.qbit, head_num, head_dim,
+                rh=rh, asym=asym, scaling_method=method,
+                signs=signs, perm=perm, num_threads=self.num_threads, out=out,
+            )
+            return result if out is not None else bytes(result)
         native_src = work
         native_layers = layers
         if per_head_scales:
@@ -319,14 +369,22 @@ class _KVWeaveCodec:
             else:
                 native_src = self.split_fused_attention_heads(work, head_num, head_dim)
             native_layers *= head_num
+        native_kwargs = dict(
+            qbit=self.qbit, blocks_num=blocks_num,
+            block_size=self.block_size, head_num=head_num, head_dim=head_dim,
+            num_layers=native_layers, rh=rh, asym=asym, scaling_method=method,
+            signs=signs, perm=perm,
+            num_threads=self.num_threads,
+        )
+        if out is not None and hasattr(self.native, "kvweave_serialize_chunk_state_into"):
+            return int(self.native.kvweave_serialize_chunk_state_into(
+                native_src.view(-1), out.view(-1), header,
+                KVWeaveCodecConfig.next_scale_id(), **native_kwargs,
+            ))
         return bytes(
             self.native.kvweave_serialize_chunk_state(
                 native_src.view(-1), header, KVWeaveCodecConfig.next_scale_id(),
-                qbit=self.qbit, blocks_num=blocks_num,
-                block_size=self.block_size, head_num=head_num, head_dim=head_dim,
-                num_layers=native_layers, rh=rh, asym=asym, scaling_method=method,
-                signs=signs, perm=perm,
-                num_threads=self.num_threads,
+                **native_kwargs,
             )
         )
 
@@ -382,14 +440,43 @@ class _KVWeaveCodec:
             signs, perm = self._config.mamba_precond_tensors(transform_size)
         native_layers = layers * parsed["head_num"] if parsed["per_head_scales"] else layers
         native_hidden = parsed["head_dim"] if parsed["per_head_scales"] else hidden
-        restored = self.native.kvweave_dequantize_chunk_state(
-            q, parsed["scales"], native_layers, tokens, native_hidden,
+        if (
+            parsed["per_head_scales"]
+            and parsed["scaling"] in {"per_channel", "per_token"}
+            and parsed["qbit"] <= 8
+            and dst.device.type == "cpu"
+            and dst.is_contiguous()
+            and self.supports_fused_direct_dequant()
+        ):
+            self.native.kvweave_dequantize_fused_chunk_direct(
+                q, parsed["scales"], dst, layers, tokens, parsed["head_num"],
+                parsed["head_dim"], parsed["qbit"], rh=parsed["rh"],
+                asym=parsed["asym"], scaling_method=parsed["scaling"],
+                signs=signs, perm=perm, num_threads=self.num_threads,
+            )
+            return
+        native_kwargs = dict(
             qbit=parsed["qbit"], blocks_num=blocks_num,
             block_size=self.block_size, head_num=parsed["head_num"],
             head_dim=parsed["head_dim"], rh=parsed["rh"], asym=parsed["asym"],
             scaling_method=parsed["scaling"], output_dtype=dst.dtype,
             signs=signs, perm=perm,
             num_threads=self.num_threads,
+        )
+        if (
+            hasattr(self.native, "kvweave_dequantize_chunk_state_into")
+            and dst.device.type == "cpu"
+            and dst.is_contiguous()
+        ):
+            # XPU module: DMA straight into dst, head merge done on the device.
+            self.native.kvweave_dequantize_chunk_state_into(
+                q, parsed["scales"], dst.view(-1), native_layers, tokens, native_hidden,
+                merge_head_num=parsed["head_num"] if parsed["per_head_scales"] else 0,
+                **native_kwargs,
+            )
+            return
+        restored = self.native.kvweave_dequantize_chunk_state(
+            q, parsed["scales"], native_layers, tokens, native_hidden, **native_kwargs,
         )
         if parsed["per_head_scales"]:
             if kvweave_quant is not None and hasattr(kvweave_quant, "kvweave_merge_fused_heads"):
@@ -501,7 +588,7 @@ class _KVWeaveCodec:
             return {"raw": True, "shape": shape, "dtype": self._config.CODE_TO_DTYPE.get(dtype_code, torch.float16), "data_offset": offset}
         if magic != self._config.MAGIC_QUANT:
             raise ValueError(f"invalid KVWeave payload magic: {magic!r}")
-        qbit, rh, asym, _, ndim, _, scaling_code, dtype_code = struct.unpack_from(">BBBBBBBB", raw, offset)
+        qbit, rh, asym, precond, ndim, _, scaling_code, dtype_code = struct.unpack_from(">BBBBBBBB", raw, offset)
         offset += 8
         shape = tuple(struct.unpack_from(">" + "i" * ndim, raw, offset))
         offset += 4 * ndim
@@ -513,7 +600,23 @@ class _KVWeaveCodec:
             scales.append(bytes(raw[offset:offset + size]))
             offset += size
         method = {value: key for key, value in self._config.SCALING_TO_CODE.items()}.get(scaling_code, self.scaling_method)
-        return {"raw": False, "shape4d": shape4d, "qbit": qbit, "rh": bool(rh), "asym": bool(asym), "scaling": method, "dtype": self._config.CODE_TO_DTYPE.get(dtype_code, torch.float16), "k_scales": scales[0], "v_scales": scales[1], "q_offset": offset, "blocks_num": max(1, shape4d[2] // self.block_size), "head_num": self._head_num(shape4d[3]), "head_dim": self._head_dim(shape4d[3])}
+        return {"raw": False, "shape4d": shape4d, "qbit": qbit, "rh": bool(rh), "asym": bool(asym), "precond": bool(precond), "scaling": method, "dtype": self._config.CODE_TO_DTYPE.get(dtype_code, torch.float16), "k_scales": scales[0], "v_scales": scales[1], "q_offset": offset, "blocks_num": max(1, shape4d[2] // self.block_size), "head_num": self._head_num(shape4d[3]), "head_dim": self._head_dim(shape4d[3])}
+
+    def _attention_precond(
+        self, method: str, rh: bool, precond: bool, tokens: int, hidden: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return the (signs, perm) P/D pair for the attention path, if any.
+
+        The transform length is the quantization chunk size of one layer plane
+        (same rule as the fused-K/V path). Serialize and deserialize must derive
+        it identically; the header's precond flag is only set when this applies.
+        """
+        if not (rh and precond):
+            return None, None
+        size = self._fused_rh_transform_size(
+            tokens, hidden, self._head_dim(hidden), method
+        )
+        return self._config.mamba_precond_tensors(size)
 
     def _head_num(self, hidden: int) -> int:
         return self.num_kv_heads if self.num_kv_heads > 1 and hidden % self.num_kv_heads == 0 else 1
@@ -565,9 +668,15 @@ class _KVWeaveCodec:
     def _mamba_layout(substate: str, shape: tuple[int, ...], method: str) -> tuple[int, int, int, int]:
         return KVWeaveCodecConfig.mamba_layout(substate, shape, method)
 
+    # One shared config so each transform size's P/D tensors are generated once
+    # and keep a stable data_ptr(): the native precond cache is keyed by the
+    # perm tensor's address, so a fresh config per call (new tensors every time)
+    # missed that cache on every Mamba quantize/dequantize call.
+    _MAMBA_PD_CONFIG = KVWeaveCodecConfig()
+
     @staticmethod
     def _mamba_precond_pair(size: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return KVWeaveCodecConfig().mamba_precond_tensors(size)
+        return _KVWeaveCodec._MAMBA_PD_CONFIG.mamba_precond_tensors(size)
 
     @staticmethod
     def split_mamba_chunk(
@@ -1589,14 +1698,24 @@ class _KVWeaveCodec:
     ) -> int:
         """Encode a chunk and copy its payload directly into ``destination``.
 
-        ``destination`` is normally the durable quantized SHM slot. The
-        native serializer currently returns Python ``bytes``, so this cannot
-        eliminate that native result allocation; it does avoid constructing a
-        second ``bytearray``/``uint8`` staging tensor before the SHM copy.
-        Returns the number of payload bytes written.
+        ``destination`` is normally the durable quantized SHM slot. For fused-K/V
+        attention chunks on a native path that supports it (direct CPU kernel or
+        XPU), the payload is written straight into ``destination`` with no
+        intermediate ``bytes`` object; every other path builds the payload as
+        ``bytes`` and copies it in. Returns the number of payload bytes written.
         """
         if destination.dtype != torch.uint8 or not destination.is_contiguous():
             raise ValueError("destination must be a contiguous torch.uint8 tensor")
+        if mamba_layout is None and attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
+            self._validate_cache_category_dispatch(
+                cache_category, mamba_layout, attention_plane_layout
+            )
+            written = self.serialize_fused_tensor(
+                raw_chunk, head_split=fused_head_split, out=destination.view(-1)
+            )
+            if isinstance(written, int):
+                return written
+            return self._copy_payload_into(written, destination)
         payload = self.encode_chunk(
             cache_category,
             mamba_layout,
@@ -1607,6 +1726,10 @@ class _KVWeaveCodec:
             mamba_split,
             fused_head_split,
         )
+        return self._copy_payload_into(payload, destination)
+
+    @staticmethod
+    def _copy_payload_into(payload: bytes, destination: torch.Tensor) -> int:
         if len(payload) > destination.numel():
             raise ValueError(
                 f"encoded payload ({len(payload)} bytes) exceeds destination "

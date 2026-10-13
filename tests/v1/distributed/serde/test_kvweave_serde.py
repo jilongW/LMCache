@@ -174,6 +174,43 @@ def test_qwen35_fused_attention_uses_independent_head_scales(scaling_method):
     assert torch.max(torch.abs(source.float() - restored.float())) < 0.5
 
 
+@pytest.mark.parametrize("scaling_method", ["per_channel", "per_token"])
+@pytest.mark.parametrize("precond", [False, True])
+def test_qwen35_fused_attention_direct_matches_split_path(scaling_method, precond):
+    settings = dict(
+        num_kv_heads=4, head_dim=256, block_size=64, scaling_method=scaling_method,
+        rh=True, asym=True, precond=precond,
+    )
+    direct = _codec(**settings)
+    split = _codec(**settings, fused_direct_quant=False)
+    if not direct.supports_fused_direct_quant():
+        pytest.skip("kvweave native build lacks kvweave_serialize_fused_chunk_direct")
+    source = torch.randn(8, 64, 2048, dtype=torch.float16)
+
+    direct_payload = direct.serialize_fused_tensor(source)
+    split_payload = split.serialize_fused_tensor(source)
+    slot = torch.zeros(len(direct_payload) + 64, dtype=torch.uint8)
+    written = direct.encode_chunk_into(
+        "attention", None, 64, None, source, slot, AttentionPlaneLayout.FUSED_KV
+    )
+    restored_direct = torch.empty_like(source)
+    restored_split = torch.empty_like(source)
+    direct.deserialize_fused_tensor(
+        torch.frombuffer(bytearray(direct_payload), dtype=torch.uint8), restored_direct
+    )
+    split.deserialize_fused_tensor(
+        torch.frombuffer(bytearray(split_payload), dtype=torch.uint8), restored_split
+    )
+
+    assert len(direct_payload) == len(split_payload)
+    assert written == len(direct_payload)
+    assert bytes(slot[:written].numpy()) == direct_payload
+    # Same math; the default fast-math build may differ from the split path by an ulp.
+    mse_direct = (restored_direct.float() - source.float()).pow(2).mean().item()
+    mse_split = (restored_split.float() - source.float()).pow(2).mean().item()
+    assert abs(mse_direct - mse_split) <= 1e-3 * mse_split
+
+
 def test_rejects_non_kv_shape():
     with pytest.raises(ValueError, match="KVWeave"):
         _codec().serialize_tensor(torch.randn(1, 64, 8))

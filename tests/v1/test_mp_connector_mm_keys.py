@@ -30,6 +30,7 @@ from lmcache.integration.vllm.lmcache_mp_connector import (  # noqa: E402
     LMCacheMPConnector,
 )
 from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
+    LMCacheMPConnectorMetadata,
     LMCacheMPRequestMetadata,
     LMCacheMPRequestState,
     LMCacheMPRequestTracker,
@@ -37,6 +38,32 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
 from lmcache.integration.vllm.utils import mm_hash_to_token_values  # noqa: E402
 
 IMAGE_PLACEHOLDER_ID = 99
+
+
+def test_wait_for_save_waits_for_submitted_store_futures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector.dispatcher = None
+    connector.worker_adapter = MagicMock()
+    metadata = LMCacheMPConnectorMetadata()
+    metadata.requests.append(
+        SimpleNamespace(
+            request_id="req-1",
+            direction="STORE",
+            op=object(),
+            cache_salt="",
+            request_configs=None,
+        )
+    )
+    monkeypatch.setattr(connector, "_get_connector_metadata", lambda: metadata)
+
+    connector.wait_for_save()
+
+    connector.worker_adapter.batched_submit_store_requests.assert_called_once()
+    connector.worker_adapter.wait_for_store_requests.assert_called_once_with(
+        ["req-1"]
+    )
 
 
 @dataclass

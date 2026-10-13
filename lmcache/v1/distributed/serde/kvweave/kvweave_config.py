@@ -296,6 +296,12 @@ class KVWeaveRuntimeConfig:
                 "precond": _env_flag("LMCACHE_MP_KVWEAVE_PRECOND", True),
                 "device": _env_device(),
                 "num_threads": _env_num_threads(),
+                "fused_direct_quant": _env_flag(
+                    "LMCACHE_MP_KVWEAVE_FUSED_DIRECT_QUANT", True
+                ),
+                "fused_direct_dequant": _env_flag(
+                    "LMCACHE_MP_KVWEAVE_FUSED_DIRECT_DEQUANT", True
+                ),
             },
             mamba_options=MambaCodecOptions.from_env(),
         )
