@@ -132,18 +132,36 @@ def _env_device(name: str = "LMCACHE_MP_KVWEAVE_QUANT_DEVICE") -> str:
     return value
 
 
-def _env_num_threads() -> int:
+_FEW_GROUPS_THRESHOLD = 4
+
+
+def _env_num_threads(num_groups: int) -> int:
     """Read the native KVWeave quant kernel's OpenMP thread count.
 
     Previously never wired up despite ``LMCACHE_MP_KVWEAVE_NUM_THREADS``
     being referenced by deployment scripts -- the codec always ran with
     ``num_threads=1`` regardless of this env var.
+
+    The bounded store pipeline only overlaps the *current* chunk's native
+    encode with the *next* chunk's D2H gather (a cheap, mostly-idle wait),
+    never two chunks' encodes concurrently -- so with few groups there are
+    fewer chunks competing for CPU in one ``submit_store`` call, leaving
+    more physical cores free for a single chunk's OpenMP encode. When
+    ``num_groups`` is below ``_FEW_GROUPS_THRESHOLD``, the configured thread
+    count is doubled to use those otherwise-idle cores.
+
+    Args:
+        num_groups: Number of engine groups in this registration (from
+            ``len(engine_group_infos)``), used to scale up the thread count
+            when there are few groups to pipeline across.
     """
     num_threads = int(os.environ.get("LMCACHE_MP_KVWEAVE_NUM_THREADS", "4"))
     if num_threads < 1:
         raise ValueError(
             f"LMCACHE_MP_KVWEAVE_NUM_THREADS={num_threads!r} must be >= 1"
         )
+    if num_groups < _FEW_GROUPS_THRESHOLD:
+        num_threads *= 2
     return num_threads
 
 
@@ -255,7 +273,7 @@ class KVWeaveRuntimeConfig:
     )
 
     @classmethod
-    def from_env(cls) -> "KVWeaveRuntimeConfig":
+    def from_env(cls, num_groups: int) -> "KVWeaveRuntimeConfig":
         """Resolve the full L1 KVWeave runtime configuration from the environment.
 
         ``enabled`` (``LMCACHE_MP_L1_KVWEAVE_QUANT``) is the overall switch;
@@ -266,6 +284,12 @@ class KVWeaveRuntimeConfig:
         by constructing ``_KVWeaveCodec`` directly (its own default is
         ``True`` for both); ``LMCACHE_MP_KVWEAVE_RH``/``LMCACHE_MP_KVWEAVE_ASYM``
         expose that same default as an environment override.
+
+        Args:
+            num_groups: Number of engine groups in this registration, passed
+                through to :func:`_env_num_threads` to scale up the native
+                encode kernel's OpenMP thread count when there are few
+                groups to pipeline across.
         """
         enabled = _env_flag("LMCACHE_MP_L1_KVWEAVE_QUANT", False)
         text_config = _load_model_text_config()
@@ -295,7 +319,7 @@ class KVWeaveRuntimeConfig:
                 "asym": _env_flag("LMCACHE_MP_KVWEAVE_ASYM", True),
                 "precond": _env_flag("LMCACHE_MP_KVWEAVE_PRECOND", True),
                 "device": _env_device(),
-                "num_threads": _env_num_threads(),
+                "num_threads": _env_num_threads(num_groups),
                 "fused_direct_quant": _env_flag(
                     "LMCACHE_MP_KVWEAVE_FUSED_DIRECT_QUANT", True
                 ),

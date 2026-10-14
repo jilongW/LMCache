@@ -1738,7 +1738,7 @@ class EngineDrivenTransferContext(TransferContext):
 
         # Resolved once per registration and reused by every subsequent
         # transfer -- see KVWeaveRuntimeConfig's docstring.
-        kvweave_config = KVWeaveRuntimeConfig.from_env()
+        kvweave_config = KVWeaveRuntimeConfig.from_env(len(self._engine_group_infos))
         self._kvweave_codec = KVWeaveCodec(kvweave_config.attention_codec_kwargs)
 
         # Precompute each group's tensor subset, blocks-per-chunk, chunk

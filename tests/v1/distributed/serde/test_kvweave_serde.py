@@ -312,7 +312,7 @@ def test_runtime_config_resolves_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD", "per_token")
     monkeypatch.setenv("LMCACHE_MP_KVWEAVE_CONV_RH", "true")
 
-    config = KVWeaveRuntimeConfig.from_env()
+    config = KVWeaveRuntimeConfig.from_env(4)
 
     assert config.enabled
     assert not config.linear_quant_enabled
@@ -337,7 +337,7 @@ def test_runtime_config_falls_back_to_qwen35_9b_defaults(monkeypatch):
     monkeypatch.delenv("MODEL_PATH", raising=False)
     monkeypatch.delenv("MODEL", raising=False)
 
-    config = KVWeaveRuntimeConfig.from_env()
+    config = KVWeaveRuntimeConfig.from_env(4)
 
     assert config.attention_codec_kwargs["num_kv_heads"] == 4
     assert config.attention_codec_kwargs["head_dim"] == 256
@@ -349,10 +349,31 @@ def test_runtime_config_falls_back_to_qwen35_9b_defaults(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("num_groups", "expected_num_threads"),
+    [
+        (1, 8),
+        (3, 8),
+        (4, 4),
+        (8, 4),
+    ],
+)
+def test_runtime_config_doubles_threads_for_few_groups(
+    monkeypatch, num_groups, expected_num_threads
+):
+    monkeypatch.delenv("MODEL_PATH", raising=False)
+    monkeypatch.delenv("MODEL", raising=False)
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_NUM_THREADS", "4")
+
+    config = KVWeaveRuntimeConfig.from_env(num_groups)
+
+    assert config.attention_codec_kwargs["num_threads"] == expected_num_threads
+
+
 def test_runtime_config_accepts_attention_qbit_4(monkeypatch):
     monkeypatch.setenv("LMCACHE_MP_KVWEAVE_QBIT", "4")
 
-    config = KVWeaveRuntimeConfig.from_env()
+    config = KVWeaveRuntimeConfig.from_env(4)
 
     assert config.attention_codec_kwargs["qbit"] == 4
 
@@ -361,7 +382,7 @@ def test_runtime_config_rejects_invalid_attention_qbit(monkeypatch):
     monkeypatch.setenv("LMCACHE_MP_KVWEAVE_QBIT", "16")
 
     with pytest.raises(ValueError, match="LMCACHE_MP_KVWEAVE_QBIT"):
-        KVWeaveRuntimeConfig.from_env()
+        KVWeaveRuntimeConfig.from_env(4)
 
 
 def test_runtime_config_falls_back_when_config_json_missing_fields(
@@ -373,7 +394,7 @@ def test_runtime_config_falls_back_when_config_json_missing_fields(
     monkeypatch.setenv("MODEL_PATH", str(tmp_path))
     monkeypatch.setenv("MODEL", "PartialModel")
 
-    config = KVWeaveRuntimeConfig.from_env()
+    config = KVWeaveRuntimeConfig.from_env(4)
 
     assert config.attention_codec_kwargs["num_kv_heads"] == 4
     assert config.attention_codec_kwargs["head_dim"] == 256
