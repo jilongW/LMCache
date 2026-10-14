@@ -253,6 +253,81 @@ def test_split_rejects_misaligned_chunk_tokens():
         _KVWeaveCodec.split_mamba_chunk(torch.randn(2, 2, 7, 8), _layouts(), block_size=2)
 
 
+def _straddling_two_plane_layouts() -> tuple[
+    tuple[MambaSubStateWireLayout, MambaSubStateWireLayout], int, int, int, int
+]:
+    """A two-plane layout where ssm's byte range straddles the plane boundary.
+
+    Every existing two-plane fixture in this file places each sub-state's
+    byte range entirely within one plane or exactly at the plane boundary,
+    so ``split_mamba_chunk``'s/``merge_mamba_chunk``'s boundary-straddling
+    ``while`` loop iteration (``plane_index`` advancing past 0) has never
+    run more than once. Here conv (24 bytes) fits in plane 0, but ssm (56
+    bytes) starts 16 bytes before the plane-0/plane-1 boundary (at
+    ``block_size * hidden * itemsize == 40``) and extends 40 bytes into
+    plane 1 -- forcing exactly 2 loop iterations.
+
+    Returns:
+        ``(layouts, block_size, layers, blocks, hidden)``.
+    """
+    block_size, layers, blocks, hidden = 2, 2, 3, 5
+    conv_layout = MambaSubStateWireLayout(0, 24, "torch.float32", (2, 3))
+    ssm_layout = MambaSubStateWireLayout(24, 56, "torch.float32", (2, 7))
+    return (conv_layout, ssm_layout), block_size, layers, blocks, hidden
+
+
+def test_two_plane_split_handles_boundary_straddling_substate():
+    """A sub-state whose byte range crosses the plane boundary must still
+    round-trip exactly back to the original raw bytes."""
+    layouts, block_size, layers, blocks, hidden = _straddling_two_plane_layouts()
+    raw = torch.randn(2, layers, blocks * block_size, hidden, dtype=torch.float32)
+
+    split = _KVWeaveCodec.split_mamba_chunk(raw, layouts, block_size)
+    assert split.conv.shape == (layers, blocks, 2, 3)
+    assert split.ssm.shape == (layers, blocks, 2, 7)
+
+    merged = _KVWeaveCodec.merge_mamba_chunk(split, layouts, block_size, hidden)
+    assert torch.equal(raw.view(torch.uint8), merged.view(torch.uint8))
+
+    split_again = _KVWeaveCodec.split_mamba_chunk(merged, layouts, block_size)
+    assert torch.equal(split.conv, split_again.conv)
+    assert torch.equal(split.ssm, split_again.ssm)
+
+
+def test_two_plane_split_and_merge_into_out_handle_boundary_straddling():
+    """The pool-scratch ``out=`` paths must match the allocating paths when
+    a sub-state straddles the plane boundary (the production engine-driven
+    store path always uses ``out=``, see ``_bounded_encode_stage``)."""
+    layouts, block_size, layers, blocks, hidden = _straddling_two_plane_layouts()
+    raw = torch.randn(2, layers, blocks * block_size, hidden, dtype=torch.float32)
+    conv_layout, ssm_layout = layouts
+
+    conv_out = torch.empty((layers, blocks, *conv_layout.shape), dtype=torch.float32)
+    ssm_out = torch.empty((layers, blocks, *ssm_layout.shape), dtype=torch.float32)
+    split_into_out = _KVWeaveCodec.split_mamba_chunk(
+        raw, layouts, block_size, out=MambaChunkSplit(conv_out, ssm_out)
+    )
+    assert split_into_out.conv.data_ptr() == conv_out.data_ptr()
+    assert split_into_out.ssm.data_ptr() == ssm_out.data_ptr()
+
+    split_allocating = _KVWeaveCodec.split_mamba_chunk(raw, layouts, block_size)
+    assert torch.equal(split_into_out.conv, split_allocating.conv)
+    assert torch.equal(split_into_out.ssm, split_allocating.ssm)
+
+    merge_destination = torch.empty_like(raw)
+    merged_into_out = _KVWeaveCodec.merge_mamba_chunk(
+        split_into_out,
+        layouts,
+        block_size,
+        hidden,
+        raw_shape=raw.shape,
+        raw_dtype=raw.dtype,
+        out=merge_destination,
+    )
+    assert merged_into_out.data_ptr() == merge_destination.data_ptr()
+    assert torch.equal(raw.view(torch.uint8), merged_into_out.view(torch.uint8))
+
+
 def test_payload_bundle_round_trip():
     blob = _KVWeaveCodec.pack_mamba_payloads(b"conv", b"ssm")
 
