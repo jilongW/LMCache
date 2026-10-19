@@ -492,21 +492,45 @@ class _BoundedStoreBatch:
 
 
 @dataclass
-class _BoundedGatherResult:
-    """One batch's gathered chunk plus the raw scratch backing it.
+class _GroupScratchRing:
+    """Pre-reserved scratch slots for one quantized-SHM group, reused across
+    every chunk of that group within one ``_run_bounded_store_pipeline`` run.
 
-    Returned by ``_bounded_gather_stage`` (runs on the pipeline's background
-    gather thread) and consumed by ``_bounded_encode_stage`` (runs on the
-    calling thread) via ``_run_bounded_store_pipeline``, which owns freeing
-    ``raw_allocation`` once the encode stage is done with ``gathered``.
-    ``raw_allocation`` is never ``None``: ``allocate_scratch_tensors`` raises
-    on pool exhaustion rather than returning ``None`` (see
-    ``EngineDrivenContextShm.allocate_scratch_tensors``), so a successfully
-    constructed ``_BoundedGatherResult`` always has a real allocation to free.
+    Built once per group (on its first batch) instead of allocating/freeing
+    per chunk from the shared ``ScratchAllocator``, while preserving the
+    pipeline's existing live-memory bound:
+
+    * ``raw_slots`` has depth 2, matching the pipeline's at-most-2-
+      concurrent-chunks invariant -- one chunk's split+encode runs on the
+      calling thread while the next chunk's D2H gather runs on the
+      background executor thread (see ``_run_bounded_store_pipeline``).
+    * The split scratch (``mamba_split``/``fused_head_split``) has depth 1:
+      ``_bounded_encode_stage`` calls for one group never overlap each
+      other (both run sequentially on the calling thread), so the same
+      buffer is safe to reuse for every chunk.
+
+    ``close()`` is the only way either allocation is released; callers must
+    not free ``raw_allocation``/``split_allocation`` directly.
     """
 
-    gathered: list[torch.Tensor]
+    raw_slots: list[torch.Tensor]
     raw_allocation: ScratchAllocation
+    mamba_split: MambaChunkSplit | None
+    fused_head_split: torch.Tensor | None
+    split_allocation: ScratchAllocation | None
+    _raw_counter: int = 0
+
+    def next_raw_slot(self) -> torch.Tensor:
+        """Return this ring's next raw-gather slot, round-robin over depth 2."""
+        slot = self.raw_slots[self._raw_counter % len(self.raw_slots)]
+        self._raw_counter += 1
+        return slot
+
+    def close(self, context: EngineDrivenContextShm) -> None:
+        """Release both scratch allocations backing this ring."""
+        context.free_scratch(self.raw_allocation)
+        if self.split_allocation is not None:
+            context.free_scratch(self.split_allocation)
 
 
 def null_chunk_mask_from_groups(
@@ -1843,8 +1867,12 @@ class EngineDrivenTransferContext(TransferContext):
                 "KVWeave group %d: engine_group_id=%s category=%s format=%s "
                 "attention_layout=%s raw_shape=%s quantized=%s",
                 group_idx,
-                plan.group_info.engine_group_id if plan.group_info is not None else None,
-                plan.group_info.cache_category if plan.group_info is not None else "unknown",
+                plan.group_info.engine_group_id
+                if plan.group_info is not None
+                else None,
+                plan.group_info.cache_category
+                if plan.group_info is not None
+                else "unknown",
                 plan.engine_kv_format,
                 plan.attention_plane_layout,
                 tuple(plan.chunk_shape),
@@ -1969,7 +1997,9 @@ class EngineDrivenTransferContext(TransferContext):
                         raw_chunk,
                         plan.attention_plane_layout,
                         mamba_splits[index] if mamba_splits is not None else None,
-                        fused_head_splits[index] if fused_head_splits is not None else None,
+                        fused_head_splits[index]
+                        if fused_head_splits is not None
+                        else None,
                     )
                 ),
                 dtype=torch.uint8,
@@ -1992,7 +2022,9 @@ class EngineDrivenTransferContext(TransferContext):
                 "submitting a store with a quantized group."
             )
         if len(gathered) != len(slots):
-            raise ValueError("gathered chunks and quantized slots must have equal length")
+            raise ValueError(
+                "gathered chunks and quantized slots must have equal length"
+            )
         category = plan.group_info.cache_category if plan.group_info is not None else ""
         mamba_layout = (
             plan.group_info.mamba_real_layout if plan.group_info is not None else None
@@ -2030,6 +2062,26 @@ class EngineDrivenTransferContext(TransferContext):
                 )
                 payload_tensor = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
                 slot.view(-1)[: payload_tensor.numel()].copy_(payload_tensor)
+
+    def _mamba_encode_uses_direct(
+        self, plan: GroupTransferPlan, raw_chunk: torch.Tensor
+    ) -> bool:
+        group_info = plan.group_info
+        if (
+            self._kvweave_codec is None
+            or group_info is None
+            or group_info.cache_category != "mamba"
+            or group_info.mamba_real_layout is None
+            or plan.mamba_options is None
+        ):
+            return False
+        direct_paths = self._kvweave_codec.mamba_encode_direct_paths(
+            group_info.mamba_real_layout,
+            group_info.tokens_per_block,
+            plan.mamba_options,
+            raw_chunk,
+        )
+        return all(direct_paths)
 
     def _allocate_mamba_split_scratch(
         self,
@@ -2072,7 +2124,11 @@ class EngineDrivenTransferContext(TransferContext):
         *,
         wait: bool,
     ) -> tuple[list[torch.Tensor], ScratchAllocation] | None:
-        """Allocate contiguous per-K/V-head fused attention scratch rows."""
+        """Allocate contiguous per-K/V-head fused attention scratch rows.
+
+        Returns ``None`` when the codec quantizes the fused layout directly,
+        so callers skip both the head split and its scratch.
+        """
         if (
             self._kvweave_codec is None
             or plan.raw_layout_desc is None
@@ -2084,6 +2140,8 @@ class EngineDrivenTransferContext(TransferContext):
         if len(raw_shape) != 3:
             raise ValueError("fused attention raw layout must be [L,T,H]")
         layers, tokens, hidden = map(int, raw_shape)
+        if self._kvweave_codec.fused_quant_uses_direct(hidden):
+            return None
         head_num = self._kvweave_codec._fused_head_num(hidden)
         head_dim = self._kvweave_codec._fused_head_dim(hidden)
         return context.allocate_scratch_tensors(
@@ -2093,106 +2151,120 @@ class EngineDrivenTransferContext(TransferContext):
             wait=wait,
         )
 
+    def _build_group_scratch_ring(
+        self, plan: GroupTransferPlan, context: EngineDrivenContextShm
+    ) -> _GroupScratchRing:
+        """Reserve one group's raw-gather (depth 2) and split (depth 1)
+        scratch once, for reuse across every chunk of that group in one
+        ``_run_bounded_store_pipeline`` run. See :class:`_GroupScratchRing`.
+
+        Raises:
+            RuntimeError: If the pinned scratch pool is exhausted. The raw
+                allocation is freed before re-raising if the subsequent
+                split-scratch allocation fails, so a failed build never
+                leaks the raw slots.
+        """
+        raw_shape = _raw_gather_shape(plan)
+        raw_dtype = plan.raw_layout_desc.dtypes[0]  # type: ignore[union-attr]
+        raw_slots, raw_allocation = context.allocate_scratch_tensors(
+            raw_shape, raw_dtype, 2, wait=False
+        )
+        try:
+            mamba_split: MambaChunkSplit | None = None
+            fused_head_split: torch.Tensor | None = None
+            split_allocation: ScratchAllocation | None = None
+            if (
+                plan.group_info is not None
+                and plan.group_info.cache_category == "mamba"
+                and not self._mamba_encode_uses_direct(plan, raw_slots[0])
+            ):
+                split = self._allocate_mamba_split_scratch(plan, 1, context, wait=False)
+                if split is not None:
+                    splits, split_allocation = split
+                    mamba_split = splits[0]
+            elif plan.attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
+                split = self._allocate_fused_head_split_scratch(
+                    plan, 1, context, wait=False
+                )
+                if split is not None:
+                    splits, split_allocation = split
+                    fused_head_split = splits[0]
+        except BaseException:
+            context.free_scratch(raw_allocation)
+            raise
+        return _GroupScratchRing(
+            raw_slots=raw_slots,
+            raw_allocation=raw_allocation,
+            mamba_split=mamba_split,
+            fused_head_split=fused_head_split,
+            split_allocation=split_allocation,
+        )
+
     def _bounded_gather_stage(
-        self, request_id: str, batch: _BoundedStoreBatch
-    ) -> _BoundedGatherResult:
-        """Gather one quantized-SHM chunk into raw scratch (pipeline stage 1).
+        self, request_id: str, batch: _BoundedStoreBatch, ring: _GroupScratchRing
+    ) -> list[torch.Tensor]:
+        """Gather one quantized-SHM chunk into its ring's raw scratch slot
+        (pipeline stage 1).
 
         Runs on the pipeline's dedicated gather executor thread (see
         ``_run_bounded_store_pipeline``) so this batch's blocking
         ``torch_dev.synchronize()`` overlaps with the *previous* batch's
-        split+encode on the calling thread. If gather or synchronize raises,
-        this batch's own raw scratch is freed here before re-raising, so the
-        driver never has to guess whether a failed ``Future`` left scratch
-        allocated.
+        split+encode on the calling thread. ``ring`` owns the scratch's
+        lifecycle -- ``_run_bounded_store_pipeline`` closes every ring
+        exactly once at the end of the call, regardless of whether this
+        stage succeeds or raises.
         """
-        context = self._engine_driven_context
-        assert isinstance(context, EngineDrivenContextShm)
-        raw_shape = _raw_gather_shape(batch.plan)
-        raw_dtype = batch.plan.raw_layout_desc.dtypes[0]  # type: ignore[union-attr]
-        raw_chunks, raw_allocation = context.allocate_scratch_tensors(
-            raw_shape, raw_dtype, 1, wait=False
+        gathered = gather_paged_kv_to_cpu(
+            batch.group_kv_caches,
+            batch.group_block_ids,
+            batch.plan.blocks_per_chunk,
+            layout_hints=self._layout_hints,
+            engine_kv_format=batch.plan.engine_kv_format,
+            out=[ring.next_raw_slot()],
+            chunk_indices=[batch.batch_index],
         )
-        try:
-            gathered = gather_paged_kv_to_cpu(
-                batch.group_kv_caches,
-                batch.group_block_ids,
-                batch.plan.blocks_per_chunk,
-                layout_hints=self._layout_hints,
-                engine_kv_format=batch.plan.engine_kv_format,
-                out=raw_chunks,
-                chunk_indices=[batch.batch_index],
-            )
-            torch_dev.synchronize()
-        except BaseException:
-            context.free_scratch(raw_allocation)
-            raise
-        return _BoundedGatherResult(gathered=gathered, raw_allocation=raw_allocation)
+        torch_dev.synchronize()
+        return gathered
 
     def _bounded_encode_stage(
         self,
-        request_id: str,
         batch: _BoundedStoreBatch,
-        gather_result: _BoundedGatherResult,
+        gathered: list[torch.Tensor],
+        ring: _GroupScratchRing,
     ) -> None:
         """Split + encode one already-gathered quantized-SHM chunk (stage 2).
 
         Runs on the calling thread, concurrently with the gather executor
         thread's blocking gather of the *next* batch (see
-        ``_run_bounded_store_pipeline``). Only frees its own split-scratch
-        allocation -- the caller owns freeing
-        ``gather_result.raw_allocation``.
+        ``_run_bounded_store_pipeline``). Reuses ``ring``'s single split
+        scratch slot -- safe because encode stages for one group never
+        overlap each other.
         """
-        context = self._engine_driven_context
-        assert isinstance(context, EngineDrivenContextShm)
-        gathered = gather_result.gathered
-        split_allocation: ScratchAllocation | None = None
-        try:
-            mamba_splits: list[MambaChunkSplit] | None = None
-            fused_head_splits: list[torch.Tensor] | None = None
-            if (
-                batch.plan.group_info is not None
-                and batch.plan.group_info.cache_category == "mamba"
-            ):
-                split = self._allocate_mamba_split_scratch(
-                    batch.plan, len(gathered), context, wait=False
-                )
-                if split is not None:
-                    mamba_splits, split_allocation = split
-            elif batch.plan.attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
-                split = self._allocate_fused_head_split_scratch(
-                    batch.plan, len(gathered), context, wait=False
-                )
-                if split is not None:
-                    fused_head_splits, split_allocation = split
-            if mamba_splits is not None:
-                for raw_chunk, split in zip(gathered, mamba_splits, strict=True):
-                    self._kvweave_codec.split_mamba_chunk(  # type: ignore[union-attr]
-                        raw_chunk,
-                        batch.plan.group_info.mamba_real_layout,
-                        batch.plan.group_info.tokens_per_block,
-                        out=split,
-                    )
-            elif fused_head_splits is not None:
-                for raw_chunk, head_split in zip(
-                    gathered, fused_head_splits, strict=True
-                ):
-                    self._kvweave_codec.split_fused_attention_heads(  # type: ignore[union-attr]
-                        raw_chunk,
-                        self._kvweave_codec._fused_head_num(raw_chunk.shape[-1]),  # type: ignore[union-attr]
-                        self._kvweave_codec._fused_head_dim(raw_chunk.shape[-1]),  # type: ignore[union-attr]
-                        out=head_split,
-                    )
-            self._encode_group_chunks_into_slots(
-                batch.plan,
-                gathered,
-                batch.group_slots[batch.start : batch.start + len(gathered)],
-                mamba_splits,
-                fused_head_splits,
+        mamba_splits: list[MambaChunkSplit] | None = None
+        fused_head_splits: list[torch.Tensor] | None = None
+        if ring.mamba_split is not None:
+            self._kvweave_codec.split_mamba_chunk(  # type: ignore[union-attr]
+                gathered[0],
+                batch.plan.group_info.mamba_real_layout,  # type: ignore[union-attr]
+                batch.plan.group_info.tokens_per_block,  # type: ignore[union-attr]
+                out=ring.mamba_split,
             )
-        finally:
-            if split_allocation is not None:
-                context.free_scratch(split_allocation)
+            mamba_splits = [ring.mamba_split]
+        elif ring.fused_head_split is not None:
+            self._kvweave_codec.split_fused_attention_heads(  # type: ignore[union-attr]
+                gathered[0],
+                self._kvweave_codec._fused_head_num(gathered[0].shape[-1]),  # type: ignore[union-attr]
+                self._kvweave_codec._fused_head_dim(gathered[0].shape[-1]),  # type: ignore[union-attr]
+                out=ring.fused_head_split,
+            )
+            fused_head_splits = [ring.fused_head_split]
+        self._encode_group_chunks_into_slots(
+            batch.plan,
+            gathered,
+            batch.group_slots[batch.start : batch.start + len(gathered)],
+            mamba_splits,
+            fused_head_splits,
+        )
 
     def _run_bounded_store_pipeline(
         self, request_id: str, batches: list[_BoundedStoreBatch]
@@ -2206,6 +2278,18 @@ class EngineDrivenTransferContext(TransferContext):
         already flattened across every quantized-SHM group in this
         ``submit_store`` call, in protocol order, so the pipeline window
         spans group boundaries rather than resetting per group.
+
+        Each group's raw-gather and split scratch is reserved once, in a
+        :class:`_GroupScratchRing` built on that group's first batch and
+        reused for every subsequent batch of the same group (keyed by
+        ``id(plan)``, stable for a registered group's lifetime) -- instead of
+        the shared ``ScratchAllocator`` taking a lock and scanning/merging
+        its free list on every single chunk. A group's chunks are contiguous
+        in ``batches`` (built group-by-group in ``submit_store``), so this
+        never needs more than one ring per distinct group live at once
+        across the handoff between two groups. Every ring is closed exactly
+        once, in the ``finally`` below, regardless of which branch below ran
+        or whether it raised.
 
         The background executor is a resident instance field
         (``self._bounded_gather_executor``), reused across calls rather than
@@ -2229,47 +2313,62 @@ class EngineDrivenTransferContext(TransferContext):
             return
         context = self._engine_driven_context
         assert isinstance(context, EngineDrivenContextShm)
-        if not self._bounded_gather_executor_lock.acquire(blocking=False):
-            for batch in batches:
-                gather_result = self._bounded_gather_stage(request_id, batch)
-                try:
-                    self._bounded_encode_stage(request_id, batch, gather_result)
-                finally:
-                    context.free_scratch(gather_result.raw_allocation)
-            return
+        rings: dict[int, _GroupScratchRing] = {}
+
+        def ring_for(batch: _BoundedStoreBatch) -> _GroupScratchRing:
+            key = id(batch.plan)
+            ring = rings.get(key)
+            if ring is None:
+                ring = self._build_group_scratch_ring(batch.plan, context)
+                rings[key] = ring
+            return ring
+
         try:
-            executor = self._bounded_gather_executor
-            pending_future: Future[_BoundedGatherResult] | None = None
+            if not self._bounded_gather_executor_lock.acquire(blocking=False):
+                for batch in batches:
+                    ring = ring_for(batch)
+                    gathered = self._bounded_gather_stage(request_id, batch, ring)
+                    self._bounded_encode_stage(batch, gathered, ring)
+                return
             try:
-                pending_future = executor.submit(
-                    self._bounded_gather_stage, request_id, batches[0]
-                )
-                for i, batch in enumerate(batches):
-                    gather_result = pending_future.result()
-                    pending_future = None
-                    if i + 1 < len(batches):
-                        pending_future = executor.submit(
-                            self._bounded_gather_stage, request_id, batches[i + 1]
-                        )
-                    try:
-                        self._bounded_encode_stage(request_id, batch, gather_result)
-                    finally:
-                        context.free_scratch(gather_result.raw_allocation)
+                executor = self._bounded_gather_executor
+                pending_future: Future[list[torch.Tensor]] | None = None
+                try:
+                    pending_future = executor.submit(
+                        self._bounded_gather_stage,
+                        request_id,
+                        batches[0],
+                        ring_for(batches[0]),
+                    )
+                    for i, batch in enumerate(batches):
+                        gathered = pending_future.result()
+                        pending_future = None
+                        if i + 1 < len(batches):
+                            pending_future = executor.submit(
+                                self._bounded_gather_stage,
+                                request_id,
+                                batches[i + 1],
+                                ring_for(batches[i + 1]),
+                            )
+                        self._bounded_encode_stage(batch, gathered, ring_for(batch))
+                finally:
+                    # An exception above may have left the NEXT batch's
+                    # gather already submitted (or finished) on the
+                    # background thread, writing into a ring slot that the
+                    # loop iteration which would have consumed it will now
+                    # never run. Wait for it here before any ring is closed
+                    # below, so a close() never races a still-in-flight
+                    # background write into one of its slots.
+                    if pending_future is not None:
+                        try:
+                            pending_future.result()
+                        except BaseException:
+                            pass  # the original exception (if any) takes priority
             finally:
-                # An exception above may have left the NEXT batch's gather
-                # already submitted (or finished) on the background thread,
-                # holding a raw scratch allocation that the loop iteration
-                # which would have consumed and freed it will now never run.
-                # Drain it here so it isn't leaked.
-                if pending_future is not None:
-                    try:
-                        leftover = pending_future.result()
-                    except BaseException:
-                        pass  # _bounded_gather_stage already freed its own scratch
-                    else:
-                        context.free_scratch(leftover.raw_allocation)
+                self._bounded_gather_executor_lock.release()
         finally:
-            self._bounded_gather_executor_lock.release()
+            for ring in rings.values():
+                ring.close(context)
 
     def _decode_group_chunks(
         self,
@@ -2545,6 +2644,7 @@ class EngineDrivenTransferContext(TransferContext):
                         isinstance(self._engine_driven_context, EngineDrivenContextShm)
                         and plan.group_info is not None
                         and plan.group_info.cache_category == "mamba"
+                        and not self._mamba_encode_uses_direct(plan, gathered[0])
                     ):
                         split_scratch = self._allocate_mamba_split_scratch(
                             plan,
@@ -2585,33 +2685,49 @@ class EngineDrivenTransferContext(TransferContext):
                             plan, len(gathered), self._engine_driven_context, wait=False
                         )
                         if head_split_scratch is not None:
-                            fused_head_splits, head_split_scratch_allocation = head_split_scratch
+                            fused_head_splits, head_split_scratch_allocation = (
+                                head_split_scratch
+                            )
                             for raw_chunk, head_split in zip(
                                 gathered, fused_head_splits, strict=True
                             ):
                                 self._kvweave_codec.split_fused_attention_heads(  # type: ignore[union-attr]
                                     raw_chunk,
-                                    self._kvweave_codec._fused_head_num(raw_chunk.shape[-1]),  # type: ignore[union-attr]
-                                    self._kvweave_codec._fused_head_dim(raw_chunk.shape[-1]),  # type: ignore[union-attr]
+                                    self._kvweave_codec._fused_head_num(
+                                        raw_chunk.shape[-1]
+                                    ),  # type: ignore[union-attr]
+                                    self._kvweave_codec._fused_head_dim(
+                                        raw_chunk.shape[-1]
+                                    ),  # type: ignore[union-attr]
                                     out=head_split,
                                 )
                             if scratch_allocation is not None:
-                                self._engine_driven_context.free_scratch(scratch_allocation)
+                                self._engine_driven_context.free_scratch(
+                                    scratch_allocation
+                                )
                                 scratch_allocation = None
                     self._encode_group_chunks_into_slots(
                         plan, gathered, quant_slots, mamba_splits, fused_head_splits
                     )
                 else:
                     cpu_chunks.extend(
-                        self._encode_group_chunks(plan, gathered, mamba_splits, fused_head_splits)
+                        self._encode_group_chunks(
+                            plan, gathered, mamba_splits, fused_head_splits
+                        )
                     )
             finally:
                 if split_scratch_allocation is not None:
-                    assert isinstance(self._engine_driven_context, EngineDrivenContextShm)
+                    assert isinstance(
+                        self._engine_driven_context, EngineDrivenContextShm
+                    )
                     self._engine_driven_context.free_scratch(split_scratch_allocation)
                 if head_split_scratch_allocation is not None:
-                    assert isinstance(self._engine_driven_context, EngineDrivenContextShm)
-                    self._engine_driven_context.free_scratch(head_split_scratch_allocation)
+                    assert isinstance(
+                        self._engine_driven_context, EngineDrivenContextShm
+                    )
+                    self._engine_driven_context.free_scratch(
+                        head_split_scratch_allocation
+                    )
                 if scratch_allocation is not None:
                     assert isinstance(
                         self._engine_driven_context, EngineDrivenContextShm
@@ -2776,7 +2892,12 @@ class EngineDrivenTransferContext(TransferContext):
             try:
                 if not ok:
                     raise RuntimeError("Skipping scatter after retrieve decode failure")
-                for plan, group_kv_caches, scatter_block_ids, group_chunks in decoded_groups:
+                for (
+                    plan,
+                    group_kv_caches,
+                    scatter_block_ids,
+                    group_chunks,
+                ) in decoded_groups:
                     scatter_cpu_to_paged_kv(
                         group_kv_caches,
                         scatter_block_ids,

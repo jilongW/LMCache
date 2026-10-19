@@ -232,6 +232,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
             if (
                 batch.plan.group_info is not None
                 and batch.plan.group_info.cache_category == "mamba"
+                and not self._mamba_encode_uses_direct(batch.plan, gathered[0])
             ):
                 split = self._allocate_mamba_split_scratch(
                     batch.plan, len(gathered), context, wait=False
@@ -646,6 +647,9 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                 isinstance(engine_driven_context, EngineDrivenContextShm)
                                 and plan.group_info is not None
                                 and plan.group_info.cache_category == "mamba"
+                                and not self._mamba_encode_uses_direct(
+                                    plan, gather_target[start_idx]
+                                )
                             ):
                                 split_scratch = self._allocate_mamba_split_scratch(
                                     plan,

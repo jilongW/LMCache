@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+from dataclasses import replace
+from unittest.mock import MagicMock
+
+# Third Party
 import pytest
 import torch
 
 from lmcache.v1.multiprocess.group_view import MambaSubStateWireLayout
 from lmcache.v1.distributed.serde.kvweave.kvweave_serde import (
     MambaChunkSplit,
+    KVWeaveCodec,
     _KVWeaveCodec,
 )
 from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
@@ -326,6 +332,546 @@ def test_two_plane_split_and_merge_into_out_handle_boundary_straddling():
     )
     assert merged_into_out.data_ptr() == merge_destination.data_ptr()
     assert torch.equal(raw.view(torch.uint8), merged_into_out.view(torch.uint8))
+
+
+def _two_plane_direct_case(
+    case: str,
+) -> tuple[
+    torch.Tensor,
+    tuple[MambaSubStateWireLayout, MambaSubStateWireLayout],
+    int,
+    ConvQKVSplit,
+]:
+    if case == "qwen35":
+        block_size, layers, blocks = 1024, 1, 2
+        conv_shape, ssm_shape = (3, 8192), (32, 128, 128)
+        padding = 4096
+        qkv = ConvQKVSplit(key_dim=2048, value_dim=4096)
+    else:
+        block_size, layers, blocks = 2, 3, 3
+        conv_shape = (9 if case == "conv_straddling" else 3, 8)
+        ssm_shape = (3, 8)
+        padding = 32 if case == "straddling" else 16
+        if case == "element_straddling":
+            block_size, padding = 1, 4
+        qkv = ConvQKVSplit(key_dim=2, value_dim=4)
+    conv_bytes = torch.Size(conv_shape).numel() * torch.float16.itemsize
+    ssm_bytes = torch.Size(ssm_shape).numel() * torch.float32.itemsize
+    page_bytes = conv_bytes + ssm_bytes + padding
+    hidden = page_bytes // (2 * block_size * torch.float16.itemsize)
+    assert hidden * 2 * block_size * torch.float16.itemsize == page_bytes
+    row_bytes = ssm_shape[-1] * torch.float32.itemsize
+    if case in {"aligned", "straddling", "qwen35"}:
+        assert ((page_bytes // 2 - conv_bytes) % row_bytes == 0) == (
+            case != "straddling"
+        )
+    layouts = (
+        MambaSubStateWireLayout(0, conv_bytes, "torch.float16", conv_shape),
+        MambaSubStateWireLayout(
+            conv_bytes, ssm_bytes, "torch.float32", ssm_shape
+        ),
+    )
+    generator = torch.Generator().manual_seed(31)
+    split = MambaChunkSplit(
+        torch.randn(layers, blocks, *conv_shape, generator=generator).half(),
+        torch.randn(layers, blocks, *ssm_shape, generator=generator),
+    )
+    raw = KVWeaveCodec.merge_mamba_chunk(
+        split, layouts, block_size, hidden,
+        raw_shape=torch.Size((2, layers, blocks * block_size, hidden)),
+        raw_dtype=torch.float16,
+    )
+    return raw, layouts, block_size, qkv
+
+
+@pytest.mark.parametrize("case", ["aligned", "straddling", "qwen35"])
+@pytest.mark.parametrize("asym", [False, True])
+def test_two_plane_direct_matches_split_path(
+    case: str, asym: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native direct encode/decode must match a genuinely split-based codec."""
+    raw, layouts, block_size, qkv = _two_plane_direct_case(case)
+    codec = KVWeaveCodec()
+    options = MambaCodecOptions(
+        conv_scaling_method="per_channel", conv_rh=False,
+        ssm_scaling_method="per_channel", ssm_rh=False, asym=asym,
+        conv_qkv_split=qkv,
+    )
+    assert codec.supports_mamba_conv_direct(options, raw)
+    assert codec.supports_mamba_ssm_direct(options, raw)
+    split_payload = codec.encode_chunk(
+        "mamba", layouts, block_size,
+        replace(options, conv_direct_quant_enabled=False,
+                ssm_direct_quant_enabled=False),
+        raw,
+    )
+    with monkeypatch.context() as patch:
+        patch.delattr(codec.native, "kvweave_dequantize_mamba_page_substate_direct")
+        reference = codec.decode_chunk(
+            "mamba", layouts, block_size, raw.shape, raw.dtype,
+            torch.frombuffer(bytearray(split_payload), dtype=torch.uint8),
+        )
+
+    def unexpected_split(*args: object, **kwargs: object) -> None:
+        pytest.fail("both direct substates must bypass split/merge")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(KVWeaveCodec, "split_mamba_chunk", unexpected_split)
+        patch.setattr(KVWeaveCodec, "merge_mamba_chunk", unexpected_split)
+        direct_payload = codec.encode_chunk(
+            "mamba", layouts, block_size, options, raw
+        )
+        chunk = torch.frombuffer(bytearray(direct_payload), dtype=torch.uint8)
+        allocated = codec.decode_chunk(
+            "mamba", layouts, block_size, raw.shape, raw.dtype, chunk
+        )
+        destination = torch.full_like(raw, 17)
+        restored = codec.decode_chunk(
+            "mamba", layouts, block_size, raw.shape, raw.dtype, chunk,
+            out=destination,
+        )
+    assert restored.data_ptr() == destination.data_ptr()
+    assert len(direct_payload) == len(split_payload)
+    expected = KVWeaveCodec.split_mamba_chunk(reference, layouts, block_size)
+    for decoded in (allocated, restored):
+        actual = KVWeaveCodec.split_mamba_chunk(decoded, layouts, block_size)
+        assert torch.equal(actual.conv.view(torch.uint8),
+                           expected.conv.view(torch.uint8))
+        assert torch.equal(actual.ssm.view(torch.uint8),
+                           expected.ssm.view(torch.uint8))
+
+
+@pytest.mark.parametrize("conv_scaling", ["per_channel", "per_token", "per_tensor"])
+@pytest.mark.parametrize("ssm_scaling", ["per_channel", "per_token", "per_tensor"])
+def test_mamba_rh_direct_matches_split_path(
+    conv_scaling: str,
+    ssm_scaling: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RH direct paths match split encoding for every supported scaling mode."""
+    torch.manual_seed(37)
+    layers, blocks, block_size = 2, 2, 4
+    conv_shape, ssm_shape = (4, 16), (2, 4, 8)
+    conv_dtype, ssm_dtype = torch.float16, torch.float32
+    conv_bytes = torch.Size(conv_shape).numel() * conv_dtype.itemsize
+    ssm_bytes = torch.Size(ssm_shape).numel() * ssm_dtype.itemsize
+    hidden = (conv_bytes + ssm_bytes) // (block_size * conv_dtype.itemsize)
+    layouts = (
+        MambaSubStateWireLayout(0, conv_bytes, str(conv_dtype), conv_shape),
+        MambaSubStateWireLayout(
+            conv_bytes, ssm_bytes, str(ssm_dtype), ssm_shape
+        ),
+    )
+    split = MambaChunkSplit(
+        torch.randn(layers, blocks, *conv_shape, dtype=conv_dtype),
+        torch.randn(layers, blocks, *ssm_shape, dtype=ssm_dtype),
+    )
+    raw = KVWeaveCodec.merge_mamba_chunk(
+        split, layouts, block_size, hidden,
+        raw_shape=torch.Size((layers, blocks * block_size, hidden)),
+        raw_dtype=conv_dtype,
+    )
+    codec = KVWeaveCodec()
+    options = MambaCodecOptions(
+        conv_scaling_method=conv_scaling,
+        conv_rh=True,
+        ssm_scaling_method=ssm_scaling,
+        ssm_rh=True,
+        asym=True,
+        conv_qkv_split=ConvQKVSplit(key_dim=4, value_dim=8),
+    )
+    assert codec.supports_mamba_conv_direct(options, raw)
+    assert codec.supports_mamba_ssm_direct(options, raw)
+
+    split_payload = codec.encode_chunk(
+        "mamba", layouts, block_size,
+        replace(options, conv_direct_quant_enabled=False,
+                ssm_direct_quant_enabled=False),
+        raw,
+    )
+    reference = codec.decode_chunk(
+        "mamba", layouts, block_size, raw.shape, raw.dtype,
+        torch.frombuffer(bytearray(split_payload), dtype=torch.uint8),
+    )
+
+    def unexpected_split(*args: object, **kwargs: object) -> None:
+        pytest.fail(
+            "RH direct substates must bypass Python split/merge "
+            f"(positional={len(args)}, keyword={tuple(kwargs)})"
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(KVWeaveCodec, "split_mamba_chunk", unexpected_split)
+        patch.setattr(KVWeaveCodec, "merge_mamba_chunk", unexpected_split)
+        payload = codec.encode_chunk("mamba", layouts, block_size, options, raw)
+        restored = codec.decode_chunk(
+            "mamba", layouts, block_size, raw.shape, raw.dtype,
+            torch.frombuffer(bytearray(payload), dtype=torch.uint8),
+        )
+
+    actual = KVWeaveCodec.split_mamba_chunk(restored, layouts, block_size)
+    expected = KVWeaveCodec.split_mamba_chunk(reference, layouts, block_size)
+    assert torch.equal(actual.conv.view(torch.uint8), expected.conv.view(torch.uint8))
+    assert torch.equal(actual.ssm.view(torch.uint8), expected.ssm.view(torch.uint8))
+
+
+def test_mamba_two_plane_rh_direct_matches_split_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default RH + per_token direct paths cover production two-plane shapes."""
+    raw, layouts, block_size, qkv = _two_plane_direct_case("qwen35")
+    codec = KVWeaveCodec()
+    options = MambaCodecOptions(
+        conv_scaling_method="per_token",
+        conv_rh=True,
+        ssm_scaling_method="per_token",
+        ssm_rh=True,
+        asym=True,
+        conv_qkv_split=qkv,
+    )
+    assert codec.supports_mamba_conv_direct(options, raw)
+    assert codec.supports_mamba_ssm_direct(options, raw)
+    split_options = replace(
+        options,
+        conv_direct_quant_enabled=False,
+        ssm_direct_quant_enabled=False,
+    )
+    split_payload = codec.encode_chunk(
+        "mamba", layouts, block_size, split_options, raw
+    )
+    with monkeypatch.context() as patch:
+        patch.delattr(
+            codec.native, "kvweave_dequantize_mamba_page_substate_direct"
+        )
+        reference = codec.decode_chunk(
+            "mamba", layouts, block_size, raw.shape, raw.dtype,
+            torch.frombuffer(bytearray(split_payload), dtype=torch.uint8),
+        )
+
+    def unexpected_split(*args: object, **kwargs: object) -> None:
+        pytest.fail(
+            "two-plane RH direct substates must bypass Python split/merge "
+            f"(positional={len(args)}, keyword={tuple(kwargs)})"
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(KVWeaveCodec, "split_mamba_chunk", unexpected_split)
+        patch.setattr(KVWeaveCodec, "merge_mamba_chunk", unexpected_split)
+        payload = codec.encode_chunk("mamba", layouts, block_size, options, raw)
+        restored = codec.decode_chunk(
+            "mamba", layouts, block_size, raw.shape, raw.dtype,
+            torch.frombuffer(bytearray(payload), dtype=torch.uint8),
+        )
+
+    actual = KVWeaveCodec.split_mamba_chunk(restored, layouts, block_size)
+    expected = KVWeaveCodec.split_mamba_chunk(reference, layouts, block_size)
+    assert torch.equal(actual.conv.view(torch.uint8), expected.conv.view(torch.uint8))
+    assert torch.equal(actual.ssm.view(torch.uint8), expected.ssm.view(torch.uint8))
+
+
+@pytest.mark.parametrize("async_store", [False, True])
+@pytest.mark.parametrize("rh", [False, True])
+def test_mamba_store_ring_bypasses_pre_split_for_direct_encode(
+    rh: bool, async_store: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context.async_engine_driven import (
+        AsyncEngineDrivenTransferContext,
+    )
+    from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
+    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+        EngineDrivenTransferContext,
+        GroupTransferPlan,
+        _BoundedStoreBatch,
+    )
+
+    raw, layouts, block_size, qkv = _two_plane_direct_case("qwen35")
+    codec = KVWeaveCodec()
+    options = MambaCodecOptions(
+        conv_scaling_method="per_token" if rh else "per_channel",
+        conv_rh=rh,
+        ssm_scaling_method="per_token" if rh else "per_channel",
+        ssm_rh=rh,
+        asym=True,
+        conv_qkv_split=qkv,
+    )
+    payload = codec.encode_chunk("mamba", layouts, block_size, options, raw)
+    plan = GroupTransferPlan(
+        group_info=EngineGroupInfo(
+            engine_group_id=0, layer_indices=(0,),
+            tokens_per_block=block_size, cache_category="mamba",
+            mamba_real_layout=layouts,
+        ),
+        layer_indices=frozenset({0}), blocks_per_chunk=2,
+        chunk_shape=raw.shape, engine_kv_format=None, quantized=True,
+        raw_layout_desc=MemoryLayoutDesc(shapes=[raw.shape], dtypes=[raw.dtype]),
+        mamba_options=options,
+    )
+    worker = EngineDrivenTransferContext()
+    worker._kvweave_codec = codec
+    context = MagicMock(spec=EngineDrivenContextShm)
+    context.allocate_scratch_tensors.return_value = (
+        [raw.clone(), torch.empty_like(raw)], MagicMock()
+    )
+    ring = worker._build_group_scratch_ring(plan, context)
+    assert ring.mamba_split is None
+    assert ring.split_allocation is None
+    context.allocate_scratch_tensor_groups.assert_not_called()
+
+    def unexpected_split(*args: object, **kwargs: object) -> None:
+        pytest.fail("direct store must not prepare Python split scratch")
+
+    calls = []
+    serialize = codec.native.kvweave_serialize_mamba_page_substate_direct
+
+    def track_serialize(*args, **kwargs):
+        calls.append(1)
+        return serialize(*args, **kwargs)
+
+    monkeypatch.setattr(codec, "split_mamba_chunk", unexpected_split)
+    monkeypatch.setattr(
+        codec.native, "kvweave_serialize_mamba_page_substate_direct",
+        track_serialize,
+    )
+    slot = torch.empty(len(payload), dtype=torch.uint8)
+    batch = _BoundedStoreBatch(
+        plan=plan, group_kv_caches={}, group_block_ids=[],
+        group_slots=[slot], group_id=0, start=0, batch_index=0,
+    )
+    if async_store:
+        worker._engine_driven_context = context
+        event = MagicMock()
+        raw_allocation = MagicMock()
+        AsyncEngineDrivenTransferContext._process_shm_quantized_batch(
+            worker, "test-mamba-direct", batch,
+            ([ring.raw_slots[0]], raw_allocation, False, event),
+        )
+        event.synchronize.assert_called_once_with()
+        context.allocate_scratch_tensor_groups.assert_not_called()
+        context.free_scratch.assert_called_once_with(raw_allocation)
+        context.free_scratch.reset_mock()
+    else:
+        worker._bounded_encode_stage(batch, [ring.raw_slots[0]], ring)
+    assert len(calls) == 4
+    restored = codec.decode_chunk(
+        "mamba", layouts, block_size, raw.shape, raw.dtype, slot
+    )
+    expected = codec.decode_chunk(
+        "mamba", layouts, block_size, raw.shape, raw.dtype,
+        torch.frombuffer(bytearray(payload), dtype=torch.uint8),
+    )
+    actual_split = KVWeaveCodec.split_mamba_chunk(restored, layouts, block_size)
+    expected_split = KVWeaveCodec.split_mamba_chunk(expected, layouts, block_size)
+    assert torch.equal(actual_split.conv, expected_split.conv)
+    assert torch.equal(actual_split.ssm, expected_split.ssm)
+    ring.close(context)
+    context.free_scratch.assert_called_once_with(ring.raw_allocation)
+
+
+@pytest.mark.parametrize("async_store", [False, True])
+@pytest.mark.parametrize("fallback", ["disabled", "raw_ssm", "scaling", "layout"])
+def test_mamba_store_keeps_split_when_both_states_cannot_go_direct(
+    fallback: str, async_store: bool,
+) -> None:
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.transfer_context.async_engine_driven import (
+        AsyncEngineDrivenTransferContext,
+    )
+    from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
+    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+        EngineDrivenTransferContext,
+        GroupTransferPlan,
+        _BoundedStoreBatch,
+    )
+
+    case = "conv_straddling" if fallback == "layout" else "aligned"
+    raw, layouts, block_size, qkv = _two_plane_direct_case(case)
+    options = MambaCodecOptions(
+        conv_scaling_method="per_channel", conv_rh=False,
+        ssm_scaling_method="per_channel", ssm_rh=False, asym=True,
+        conv_qkv_split=qkv,
+    )
+    if fallback == "disabled":
+        options = replace(options, conv_direct_quant_enabled=False)
+    elif fallback == "raw_ssm":
+        options = replace(options, ssm_qbit=16)
+    elif fallback == "scaling":
+        options = replace(options, ssm_scaling_method="per_token")
+    plan = GroupTransferPlan(
+        group_info=EngineGroupInfo(
+            engine_group_id=0, layer_indices=(0, 1, 2),
+            tokens_per_block=block_size, cache_category="mamba",
+            mamba_real_layout=layouts,
+        ),
+        layer_indices=frozenset({0, 1, 2}), blocks_per_chunk=3,
+        chunk_shape=raw.shape, engine_kv_format=None, quantized=True,
+        raw_layout_desc=MemoryLayoutDesc(shapes=[raw.shape], dtypes=[raw.dtype]),
+        mamba_options=options,
+    )
+    worker = EngineDrivenTransferContext()
+    worker._kvweave_codec = KVWeaveCodec()
+    assert not worker._mamba_encode_uses_direct(plan, raw)
+    split = KVWeaveCodec.split_mamba_chunk(raw, layouts, block_size)
+    context = MagicMock(spec=EngineDrivenContextShm)
+    context.allocate_scratch_tensors.return_value = (
+        [raw, torch.empty_like(raw)], MagicMock()
+    )
+    context.allocate_scratch_tensor_groups.return_value = (
+        [(split.conv, split.ssm)], MagicMock()
+    )
+    if async_store:
+        worker._engine_driven_context = context
+        worker._encode_group_chunks_into_slots = MagicMock()
+        batch = _BoundedStoreBatch(
+            plan=plan, group_kv_caches={}, group_block_ids=[],
+            group_slots=[torch.empty(1, dtype=torch.uint8)],
+            group_id=0, start=0, batch_index=0,
+        )
+        raw_allocation = MagicMock()
+        event = MagicMock()
+        AsyncEngineDrivenTransferContext._process_shm_quantized_batch(
+            worker, "test-mamba-split", batch,
+            ([raw], raw_allocation, False, event),
+        )
+        event.synchronize.assert_called_once_with()
+        context.allocate_scratch_tensor_groups.assert_called_once()
+        prepared = worker._encode_group_chunks_into_slots.call_args.args[3]
+        assert len(prepared) == 1
+        assert torch.equal(prepared[0].conv, split.conv)
+        assert torch.equal(prepared[0].ssm, split.ssm)
+        assert context.free_scratch.call_count == 2
+        return
+    ring = worker._build_group_scratch_ring(plan, context)
+    assert ring.mamba_split is not None
+    context.allocate_scratch_tensor_groups.assert_called_once()
+    ring.close(context)
+    assert context.free_scratch.call_count == 2
+
+
+@pytest.mark.parametrize("scaling", ["per_channel", "per_token", "per_tensor"])
+@pytest.mark.parametrize("conv_enabled", [False, True])
+@pytest.mark.parametrize("case", ["straddling", "element_straddling"])
+def test_two_plane_ssm_scaling_routes(
+    scaling: str, conv_enabled: bool, case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two-plane SSM direct requires per_channel and whole elements."""
+    raw, layouts, block_size, qkv = _two_plane_direct_case(case)
+    codec = KVWeaveCodec()
+    options = MambaCodecOptions(
+        conv_scaling_method="per_channel", conv_rh=False,
+        ssm_scaling_method=scaling, ssm_rh=False, asym=True,
+        conv_quant_enabled=conv_enabled, conv_qkv_split=qkv,
+    )
+    assert codec.supports_mamba_ssm_direct(options, raw) == (
+        scaling == "per_channel"
+    )
+    serialize = codec.native.kvweave_serialize_mamba_page_substate_direct
+    dequantize = codec.native.kvweave_dequantize_mamba_page_substate_direct
+    two_plane_calls: list[str] = []
+
+    def serialize_checked(*args: object, **kwargs: object) -> bytes:
+        if args[7]:
+            assert kwargs["scaling_method"] == "per_channel"
+            two_plane_calls.append("encode")
+        return serialize(*args, **kwargs)
+
+    def dequantize_checked(*args: object, **kwargs: object) -> None:
+        if args[9]:
+            assert kwargs["scaling_method"] == "per_channel"
+            two_plane_calls.append("decode")
+        return dequantize(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codec.native, "kvweave_serialize_mamba_page_substate_direct",
+                      serialize_checked)
+        patch.setattr(codec.native, "kvweave_dequantize_mamba_page_substate_direct",
+                      dequantize_checked)
+        payload = codec.encode_chunk("mamba", layouts, block_size, options, raw)
+        chunk = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+        destination = torch.zeros_like(raw)
+        restored = codec.decode_chunk(
+            "mamba", layouts, block_size, raw.shape, raw.dtype, chunk,
+            out=destination,
+        )
+    assert two_plane_calls == (
+        ["encode", "decode"]
+        if scaling == "per_channel" and case != "element_straddling"
+        else []
+    )
+    with monkeypatch.context() as patch:
+        patch.delattr(codec.native, "kvweave_dequantize_mamba_page_substate_direct")
+        reference = codec.decode_chunk(
+            "mamba", layouts, block_size, raw.shape, raw.dtype, chunk
+        )
+    actual = KVWeaveCodec.split_mamba_chunk(restored, layouts, block_size)
+    expected = KVWeaveCodec.split_mamba_chunk(reference, layouts, block_size)
+    assert torch.equal(actual.conv, expected.conv)
+    assert torch.equal(actual.ssm, expected.ssm)
+
+
+@pytest.mark.parametrize("planes", [1, 2])
+@pytest.mark.parametrize("scaling", ["per_channel", "per_token", "per_tensor"])
+@pytest.mark.parametrize("rh", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mamba_ssm_direct_support_matrix(
+    planes: int, scaling: str, rh: bool, enabled: bool
+) -> None:
+    """Keep single-plane scaling support and the RH/feature gates intact."""
+    raw = torch.empty((2, 3, 4, 8) if planes == 2 else (3, 4, 8))
+    options = MambaCodecOptions(
+        conv_scaling_method="per_channel", conv_rh=False,
+        ssm_scaling_method=scaling, ssm_rh=rh, asym=True,
+        ssm_direct_quant_enabled=enabled,
+    )
+    assert KVWeaveCodec().supports_mamba_ssm_direct(options, raw) == (
+        enabled and (planes == 1 or scaling == "per_channel" or rh)
+    )
+
+
+def test_two_plane_conv_straddling_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unusual conv layout spanning planes must not use plane-0 direct."""
+    raw, layouts, block_size, qkv = _two_plane_direct_case("conv_straddling")
+    codec = KVWeaveCodec()
+    options = MambaCodecOptions(
+        conv_scaling_method="per_channel", conv_rh=False,
+        ssm_scaling_method="per_channel", ssm_rh=False, asym=True,
+        conv_qkv_split=qkv,
+    )
+    serialize = codec.native.kvweave_serialize_mamba_page_substate_direct
+    dequantize = codec.native.kvweave_dequantize_mamba_page_substate_direct
+
+    def serialize_checked(*args: object, **kwargs: object) -> bytes:
+        assert args[7], "conv crossing planes must fall back on encode"
+        return serialize(*args, **kwargs)
+
+    def dequantize_checked(*args: object, **kwargs: object) -> None:
+        assert args[9], "conv crossing planes must fall back on decode"
+        return dequantize(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codec.native, "kvweave_serialize_mamba_page_substate_direct",
+                      serialize_checked)
+        patch.setattr(codec.native, "kvweave_dequantize_mamba_page_substate_direct",
+                      dequantize_checked)
+        payload = codec.encode_chunk("mamba", layouts, block_size, options, raw)
+        chunk = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+        restored = codec.decode_chunk(
+            "mamba", layouts, block_size, raw.shape, raw.dtype, chunk
+        )
+    with monkeypatch.context() as patch:
+        patch.delattr(codec.native, "kvweave_dequantize_mamba_page_substate_direct")
+        reference = codec.decode_chunk(
+            "mamba", layouts, block_size, raw.shape, raw.dtype, chunk
+        )
+    actual = KVWeaveCodec.split_mamba_chunk(restored, layouts, block_size)
+    expected = KVWeaveCodec.split_mamba_chunk(reference, layouts, block_size)
+    assert torch.equal(actual.conv, expected.conv)
+    assert torch.equal(actual.ssm, expected.ssm)
 
 
 def test_payload_bundle_round_trip():

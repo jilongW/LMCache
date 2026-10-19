@@ -115,6 +115,13 @@ class _KVWeaveCodec:
             and hasattr(self.native, "kvweave_serialize_fused_chunk_direct")
         )
 
+    def fused_quant_uses_direct(self, hidden: int, scaling_method: str | None = None) -> bool:
+        """Whether ``serialize_fused_tensor`` takes the direct kernel for this
+        hidden size, in which case a pre-split ``head_split`` is never read."""
+        method = scaling_method or self.scaling_method
+        per_head_scales = method != "per_tensor" and self._fused_head_num(hidden) > 1
+        return per_head_scales and self.supports_fused_direct_quant()
+
     def supports_fused_direct_dequant(self) -> bool:
         """Whether fused-K/V attention decodes straight into the fused layout."""
         # CPU only: on XPU the wide-stride fused writes are slower than dequant + device permute.
@@ -128,6 +135,105 @@ class _KVWeaveCodec:
             and self.device == "cpu"
             and hasattr(self.native, "kvweave_dequantize_fused_chunk_direct")
         )
+
+    def supports_mamba_ssm_direct(
+        self, mamba_options: MambaCodecOptions, raw_chunk: torch.Tensor
+    ) -> bool:
+        """Whether the Mamba ssm sub-state can quantize/dequantize directly
+        against the opaque page, skipping ``split_mamba_chunk``'s/
+        ``merge_mamba_chunk``'s gather/scatter.
+
+        Requires CPU (no XPU native entry point exists yet). RH is applied
+        using a native contiguous scratch sub-state. Single-plane chunks support
+        ``per_channel``/``per_token``/``per_tensor`` scaling. The no-RH
+        two-plane fast path requires ``per_channel``; RH uses native scratch
+        and can gather across both planes for any scaling method.
+        """
+        is_two_plane = raw_chunk.dim() == 4 and int(raw_chunk.shape[0]) == 2
+        if (
+            is_two_plane
+            and mamba_options.ssm_scaling_method != "per_channel"
+            and not mamba_options.ssm_rh
+        ):
+            return False
+        return (
+            mamba_options.ssm_direct_quant_enabled
+            and self.device == "cpu"
+            and hasattr(self.native, "kvweave_serialize_mamba_page_substate_direct")
+            and hasattr(self.native, "kvweave_dequantize_mamba_page_substate_direct")
+        )
+
+    def supports_mamba_conv_direct(
+        self, mamba_options: MambaCodecOptions, raw_chunk: torch.Tensor
+    ) -> bool:
+        """Whether Mamba conv's query/key/value segments can quantize/
+        dequantize directly against the opaque page, skipping
+        ``split_mamba_chunk``'s/``merge_mamba_chunk``'s gather/scatter.
+
+        Requires CPU. RH uses a native contiguous scratch sub-state. The
+        no-RH fast path requires ``per_channel`` scaling; with RH enabled,
+        the direct gather supports all three scaling methods for Q/K/V
+        sub-ranges.
+
+        Two-plane chunks are supported too: conv's byte range always fits
+        entirely within plane 0 for every known Mamba layout (conv is a
+        narrow convolution history, structurally far smaller than half a
+        page -- see the Phase 3 design doc), so the direct path treats
+        plane 0 as an ordinary single-plane page and needs no native
+        two-plane addressing for conv at all. ``_quantize_mamba_conv_qkv_
+        direct``/``_dequantize_mamba_conv_qkv_direct_into`` defensively
+        re-check this fits-in-plane-0 assumption. Encode/decode dispatch
+        validates the layout too and falls back if it crosses planes.
+        """
+        return (
+            mamba_options.conv_direct_quant_enabled
+            and (
+                mamba_options.conv_scaling_method == "per_channel"
+                or (
+                    mamba_options.conv_rh
+                    and mamba_options.conv_scaling_method
+                    in {"per_token", "per_tensor"}
+                )
+            )
+            and self.device == "cpu"
+            and hasattr(self.native, "kvweave_serialize_mamba_page_substate_direct")
+            and hasattr(self.native, "kvweave_dequantize_mamba_page_substate_direct")
+        )
+
+    def mamba_encode_direct_paths(
+        self,
+        mamba_layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout],
+        tokens_per_block: int,
+        mamba_options: MambaCodecOptions,
+        raw_chunk: torch.Tensor,
+    ) -> tuple[bool, bool]:
+        """Return conv/SSM direct eligibility before any split is prepared."""
+        conv_layout, ssm_layout = mamba_layout
+        is_two_plane = raw_chunk.dim() == 4 and int(raw_chunk.shape[0]) == 2
+        plane_bytes = (
+            tokens_per_block * raw_chunk.shape[-1] * raw_chunk.element_size()
+        )
+        ssm_element_size = KVWeaveCodecConfig.mamba_dtype(
+            ssm_layout.dtype_str
+        ).itemsize
+        conv_direct = (
+            mamba_options.conv_quant_enabled
+            and self.supports_mamba_conv_direct(mamba_options, raw_chunk)
+            and conv_layout.byte_offset + conv_layout.byte_length <= plane_bytes
+        )
+        ssm_direct = (
+            mamba_options.ssm_quant_enabled
+            and mamba_options.ssm_qbit != 16
+            and self.supports_mamba_ssm_direct(mamba_options, raw_chunk)
+            and (
+                not is_two_plane
+                or (
+                    plane_bytes % ssm_element_size == 0
+                    and ssm_layout.byte_offset % ssm_element_size == 0
+                )
+            )
+        )
+        return conv_direct, ssm_direct
 
     @staticmethod
     def _tensor_bytes(tensor: torch.Tensor) -> bytes:
@@ -343,11 +449,7 @@ class _KVWeaveCodec:
                 tokens, hidden, head_dim, method, per_head_scales
             )
             signs, perm = self._config.mamba_precond_tensors(transform_size)
-        if (
-            per_head_scales
-            and method in {"per_channel", "per_token"}
-            and self.supports_fused_direct_quant()
-        ):
+        if self.fused_quant_uses_direct(hidden, method):
             result = self.native.kvweave_serialize_fused_chunk_direct(
                 work, header, self.qbit, head_num, head_dim,
                 rh=rh, asym=asym, scaling_method=method,
@@ -773,6 +875,75 @@ class _KVWeaveCodec:
         return MambaChunkSplit(conv, ssm)
 
     @staticmethod
+    def write_mamba_substate_into(
+        tensor: torch.Tensor,
+        desc: MambaSubStateWireLayout,
+        out: torch.Tensor,
+        layers: int,
+        blocks: int,
+        block_size: int,
+        hidden_dim: int,
+        planes: int,
+        output_dtype: torch.dtype,
+    ) -> None:
+        """Write one real Mamba sub-state's bytes into its region of a
+        caller-owned opaque page buffer.
+
+        This is :meth:`merge_mamba_chunk`'s per-substate write step, exposed
+        standalone so callers that already have one sub-state's bytes ready
+        (e.g. a direct dequantize scatter) can write just that one substate
+        without needing the other substate's tensor in hand -- unlike
+        :meth:`merge_mamba_chunk`, which always requires both.
+
+        Args:
+            tensor: The real sub-state tensor, shape
+                ``(layers, blocks, *desc.shape)``.
+            desc: The sub-state's byte layout within one page.
+            out: Contiguous opaque page buffer to write into, in place.
+            layers, blocks: The chunk's layer/block counts.
+            block_size: Tokens per block.
+            hidden_dim: The opaque page's last-dimension width.
+            planes: ``1`` for a single-plane page, ``2`` for a two-plane page.
+            output_dtype: The opaque page's element dtype.
+
+        Raises:
+            ValueError: If ``tensor``'s byte size does not match
+                ``desc.byte_length``, or exceeds the page's byte size.
+        """
+        page_bytes = planes * block_size * hidden_dim * output_dtype.itemsize
+        raw = tensor.contiguous().view(torch.uint8).reshape(layers, blocks, -1)
+        end = desc.byte_offset + desc.byte_length
+        if raw.shape[-1] != desc.byte_length or end > page_bytes:
+            raise ValueError("Mamba sub-state tensor does not match byte layout")
+        if planes == 1:
+            out.view(torch.uint8).reshape(layers, blocks, page_bytes)[
+                :, :, desc.byte_offset:end
+            ] = raw
+            return
+        plane_bytes = block_size * hidden_dim * output_dtype.itemsize
+        source_offset = 0
+        page_offset = desc.byte_offset
+        while source_offset < desc.byte_length:
+            plane_index = page_offset // plane_bytes
+            plane_offset = page_offset % plane_bytes
+            copy_bytes = min(
+                desc.byte_length - source_offset,
+                plane_bytes - plane_offset,
+            )
+            # Vectorized over all (layer, block) pairs at once instead
+            # of a per-block Python loop -- out[plane_index] is
+            # already contiguous (slicing a contiguous tensor's
+            # outermost dim).
+            dest_view = out[plane_index].view(torch.uint8).reshape(
+                layers, blocks, plane_bytes
+            )
+            dest_view[:, :, plane_offset : plane_offset + copy_bytes] = raw[
+                :, :, source_offset : source_offset + copy_bytes
+            ]
+            source_offset += copy_bytes
+            page_offset += copy_bytes
+
+    @staticmethod
     def merge_mamba_chunk(split: MambaChunkSplit, layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout], block_size: int, hidden_dim: int, raw_shape: torch.Size | None = None, raw_dtype: torch.dtype | None = None, out: torch.Tensor | None = None) -> torch.Tensor:
         """Rebuild the opaque page view, optionally in a caller-owned buffer."""
         conv_layout, ssm_layout = layout
@@ -787,42 +958,14 @@ class _KVWeaveCodec:
                 raise ValueError("raw_shape and raw_dtype are required with out")
             if out.shape != raw_shape or out.dtype != raw_dtype or not out.is_contiguous():
                 raise ValueError("out must be a contiguous tensor matching raw_shape/raw_dtype")
-
-            def write_to_out(tensor: torch.Tensor, desc: MambaSubStateWireLayout) -> None:
-                raw = tensor.contiguous().view(torch.uint8).reshape(layers, blocks, -1)
-                end = desc.byte_offset + desc.byte_length
-                if raw.shape[-1] != desc.byte_length or end > page_bytes:
-                    raise ValueError("Mamba sub-state tensor does not match byte layout")
-                if planes == 1:
-                    out.view(torch.uint8).reshape(layers, blocks, page_bytes)[
-                        :, :, desc.byte_offset:end
-                    ] = raw
-                    return
-                plane_bytes = block_size * hidden_dim * output_dtype.itemsize
-                source_offset = 0
-                page_offset = desc.byte_offset
-                while source_offset < desc.byte_length:
-                    plane_index = page_offset // plane_bytes
-                    plane_offset = page_offset % plane_bytes
-                    copy_bytes = min(
-                        desc.byte_length - source_offset,
-                        plane_bytes - plane_offset,
-                    )
-                    # Vectorized over all (layer, block) pairs at once instead
-                    # of a per-block Python loop -- out[plane_index] is
-                    # already contiguous (slicing a contiguous tensor's
-                    # outermost dim).
-                    dest_view = out[plane_index].view(torch.uint8).reshape(
-                        layers, blocks, plane_bytes
-                    )
-                    dest_view[:, :, plane_offset : plane_offset + copy_bytes] = raw[
-                        :, :, source_offset : source_offset + copy_bytes
-                    ]
-                    source_offset += copy_bytes
-                    page_offset += copy_bytes
-
-            write_to_out(split.conv, conv_layout)
-            write_to_out(split.ssm, ssm_layout)
+            _KVWeaveCodec.write_mamba_substate_into(
+                split.conv, conv_layout, out, layers, blocks, block_size,
+                hidden_dim, planes, output_dtype,
+            )
+            _KVWeaveCodec.write_mamba_substate_into(
+                split.ssm, ssm_layout, out, layers, blocks, block_size,
+                hidden_dim, planes, output_dtype,
+            )
             return out
         pages = torch.zeros(layers, blocks, page_bytes, dtype=torch.uint8)
         for tensor, desc in ((split.conv, conv_layout), (split.ssm, ssm_layout)):
@@ -881,6 +1024,282 @@ class _KVWeaveCodec:
             len(payload) / raw_bytes if raw_bytes else 0.0,
         )
         return payload
+
+    @staticmethod
+    def _quantize_mamba_ssm_direct(
+        raw_chunk: torch.Tensor,
+        ssm_layout: MambaSubStateWireLayout,
+        block_size: int,
+        layers: int,
+        blocks: int,
+        *,
+        scaling_method: str,
+        rh: bool,
+        asym: bool,
+        qbit: int,
+    ) -> bytes:
+        """Quantize the ssm sub-state straight out of the opaque page tensor.
+
+        Zero-copy counterpart of :meth:`_quantize_mamba_substate_payload`:
+        reads directly from ``raw_chunk``'s ssm byte range instead of first
+        gathering a real ssm tensor via :meth:`split_mamba_chunk`. Supports
+        RH and both single-plane and two-plane chunks (two-plane only with
+        ``scaling_method="per_channel"``) -- callers must check
+        :meth:`supports_mamba_ssm_direct` first.
+        """
+        ssm_dtype = KVWeaveCodecConfig.mamba_dtype(ssm_layout.dtype_str)
+        shape = (layers, blocks, *ssm_layout.shape)
+        blocks_num, heads, head_dim, chunks = _KVWeaveCodec._mamba_layout(
+            "ssm", shape, scaling_method
+        )
+        signs = perm = None
+        if rh:
+            transform_size = max(int(np.prod(shape)) // shape[0] // chunks, 1)
+            signs, perm = _KVWeaveCodec._mamba_precond_pair(transform_size)
+        flags = (
+            (KVWeaveCodecConfig.MAMBA_FLAG_RH if rh else 0)
+            | (KVWeaveCodecConfig.MAMBA_FLAG_ASYM if asym else 0)
+        )
+        header = KVWeaveCodecConfig.MAMBA_MAGIC + struct.pack(
+            ">BBBBBB" + "i" * len(shape), qbit,
+            KVWeaveCodecConfig.DTYPE_TO_CODE[ssm_dtype], flags,
+            KVWeaveCodecConfig.SCALING_TO_CODE[scaling_method],
+            KVWeaveCodecConfig.SUBSTATE_TO_CODE["ssm"], len(shape), *shape,
+        )
+        is_two_plane = raw_chunk.dim() == 4 and int(raw_chunk.shape[0]) == 2
+        page_bytes = block_size * raw_chunk.shape[-1] * raw_chunk.element_size()
+        if is_two_plane:
+            page_bytes *= 2
+        elem_size = torch.empty((), dtype=ssm_dtype).element_size()
+        rows_per_page = ssm_layout.byte_length // elem_size // head_dim
+        native = _resolve_native("cpu")
+        payload = bytes(native.kvweave_serialize_mamba_page_substate_direct(
+            raw_chunk, page_bytes, ssm_layout.byte_offset, head_dim, rows_per_page,
+            layers, blocks, is_two_plane, header, KVWeaveCodecConfig.next_scale_id(),
+            qbit=qbit, blocks_num=blocks_num, block_size=1, head_num=heads,
+            head_dim=head_dim, asym=asym, scaling_method=scaling_method,
+            substate_dtype=ssm_dtype, col_offset=0,
+            rh=rh, signs=signs, perm=perm,
+        ))
+        logger.debug(
+            "Mamba quantize ssm (direct) shape=%s dtype=%s qbit=%d "
+            "payload_bytes=%d",
+            shape, ssm_dtype, qbit, len(payload),
+        )
+        return payload
+
+    @staticmethod
+    def _dequantize_mamba_ssm_direct_into(
+        ssm_payload: bytes,
+        ssm_layout: MambaSubStateWireLayout,
+        block_size: int,
+        target: torch.Tensor,
+    ) -> None:
+        """Dequantize an ssm payload straight into the opaque page tensor.
+
+        Zero-copy counterpart of :meth:`dequantize_mamba_substate_4bit`
+        followed by :meth:`merge_mamba_chunk`'s ssm write: scatters directly
+        into ``target``'s ssm byte range instead of materializing an
+        independent ssm tensor first. RH payloads are inverse-transformed in
+        native scratch before scattering. ``target`` must be a contiguous opaque
+        page tensor (the same shape/dtype :meth:`merge_mamba_chunk` would
+        produce). Two-plane targets require ``per_channel`` scaling.
+        """
+        p = _KVWeaveCodec._read_mamba_substate_payload(ssm_payload)
+        _KVWeaveCodec._dequantize_mamba_ssm_direct_into_parsed(
+            p, ssm_layout, block_size, target
+        )
+
+    @staticmethod
+    def _dequantize_mamba_ssm_direct_into_parsed(
+        parsed_ssm_payload: dict[str, object],
+        ssm_layout: MambaSubStateWireLayout,
+        block_size: int,
+        target: torch.Tensor,
+    ) -> None:
+        """Same as :meth:`_dequantize_mamba_ssm_direct_into`, but takes an
+        already-:meth:`_read_mamba_substate_payload`-parsed payload to avoid
+        parsing the payload header twice when the caller needed to inspect
+        it first to decide whether the direct path applies.
+
+        ``target`` may be a contiguous single-plane or two-plane opaque page
+        tensor; two-plane is only supported when the payload's
+        ``scaling_method`` is ``"per_channel"``. The caller must verify this
+        from the payload before selecting the direct decode path.
+        """
+        p = parsed_ssm_payload
+        is_two_plane = target.dim() == 4 and int(target.shape[0]) == 2
+        page_bytes = block_size * target.shape[-1] * target.element_size()
+        if is_two_plane:
+            page_bytes *= 2
+        head_dim = p["head_dim"]
+        elem_size = torch.empty((), dtype=p["output_dtype"]).element_size()
+        rows_per_page = ssm_layout.byte_length // elem_size // head_dim
+        native = _resolve_native("cpu")
+        native.kvweave_dequantize_mamba_page_substate_direct(
+            p["q_data"], p["scales"], target, page_bytes, ssm_layout.byte_offset,
+            head_dim, rows_per_page, p["num_layers"], p["num_blocks"], is_two_plane,
+            qbit=p["qbit"], blocks_num=p["blocks_num"], block_size=1,
+            head_num=p["head_num"], head_dim=head_dim, asym=p["asym"],
+            scaling_method=p["scaling_method"], substate_dtype=p["output_dtype"],
+            col_offset=0,
+            rh=p["rh"], signs=p["signs"], perm=p["perm"],
+        )
+
+    @staticmethod
+    def _quantize_mamba_conv_qkv_direct(
+        raw_chunk: torch.Tensor,
+        conv_layout: MambaSubStateWireLayout,
+        conv_qkv_split: ConvQKVSplit,
+        block_size: int,
+        layers: int,
+        blocks: int,
+        *,
+        scaling_method: str,
+        rh: bool,
+        asym: bool,
+        qbit: int,
+    ) -> bytes:
+        """Quantize conv's query/key/value segments straight out of the
+        opaque page tensor, as a 3-way bundle (see :meth:`pack_conv_qkv_payloads`).
+
+        Zero-copy counterpart of :meth:`_split_conv_qkv` followed by
+        :meth:`_quantize_mamba_substate_payload` for each segment: each
+        segment is quantized by reading its column sub-range directly out of
+        ``raw_chunk``'s conv byte region instead of first gathering a real
+        conv tensor via :meth:`split_mamba_chunk` and slicing it. Supports
+        both single-plane and two-plane chunks (conv's byte range always
+        fits entirely within plane 0 for every known Mamba layout -- see the
+        Phase 3 design doc -- so the two-plane case is handled by treating
+        ``raw_chunk[0]`` as an ordinary single-plane 3-D tensor with
+        ``page_bytes`` halved to one plane's size, reusing the single-plane
+        native kernel unchanged). Supports RH using native scratch and
+        Q/K/V ``per_token`` scaling -- callers must check
+        :meth:`supports_mamba_conv_direct` first.
+        """
+        conv_dtype = KVWeaveCodecConfig.mamba_dtype(conv_layout.dtype_str)
+        conv_dim = conv_layout.shape[-1]
+        key_dim, value_dim = conv_qkv_split.key_dim, conv_qkv_split.value_dim
+        if conv_dim != key_dim * 2 + value_dim:
+            raise ValueError(
+                f"conv_state last dim ({conv_dim}) does not match "
+                f"key_dim*2 + value_dim ({key_dim * 2 + value_dim})"
+            )
+        kernel_hist = conv_layout.shape[-2]
+        elem_size = torch.empty((), dtype=conv_dtype).element_size()
+        rows_per_page = conv_layout.byte_length // elem_size // conv_dim
+        is_two_plane = raw_chunk.dim() == 4 and int(raw_chunk.shape[0]) == 2
+        hidden = raw_chunk.shape[-1]
+        page_bytes = block_size * hidden * raw_chunk.element_size()
+        if is_two_plane:
+            # This expression already measures one plane, not the full page.
+            native_raw = raw_chunk[0]
+        else:
+            native_raw = raw_chunk
+        if conv_layout.byte_offset + conv_layout.byte_length > page_bytes:
+            raise ValueError(
+                "conv's byte range does not fit within plane 0 -- the "
+                "direct conv path assumes conv always fits in a single "
+                "plane; caller must have validated this via "
+                "supports_mamba_conv_direct before calling this method."
+            )
+        native = _resolve_native("cpu")
+
+        segments = (
+            ("query", 0, key_dim),
+            ("key", key_dim, key_dim),
+            ("value", 2 * key_dim, value_dim),
+        )
+        payloads: list[bytes] = []
+        for _name, col_offset, seg_dim in segments:
+            shape = (layers, blocks, kernel_hist, seg_dim)
+            blocks_num, heads, head_dim, chunks = _KVWeaveCodec._mamba_layout(
+                "conv", shape, scaling_method
+            )
+            signs = perm = None
+            if rh:
+                transform_size = max(
+                    int(np.prod(shape)) // shape[0] // chunks, 1
+                )
+                signs, perm = _KVWeaveCodec._mamba_precond_pair(transform_size)
+            flags = (
+                (KVWeaveCodecConfig.MAMBA_FLAG_RH if rh else 0)
+                | (KVWeaveCodecConfig.MAMBA_FLAG_ASYM if asym else 0)
+            )
+            header = KVWeaveCodecConfig.MAMBA_MAGIC + struct.pack(
+                ">BBBBBB" + "i" * len(shape), qbit,
+                KVWeaveCodecConfig.DTYPE_TO_CODE[conv_dtype], flags,
+                KVWeaveCodecConfig.SCALING_TO_CODE[scaling_method],
+                KVWeaveCodecConfig.SUBSTATE_TO_CODE["conv"], len(shape), *shape,
+            )
+            payload = bytes(native.kvweave_serialize_mamba_page_substate_direct(
+                native_raw, page_bytes, conv_layout.byte_offset, conv_dim, rows_per_page,
+                layers, blocks, False, header, KVWeaveCodecConfig.next_scale_id(),
+                qbit=qbit, blocks_num=blocks_num, block_size=1, head_num=heads,
+                head_dim=head_dim, asym=asym, scaling_method=scaling_method,
+                substate_dtype=conv_dtype, col_offset=col_offset,
+                rh=rh, signs=signs, perm=perm,
+            ))
+            payloads.append(payload)
+        return _KVWeaveCodec.pack_conv_qkv_payloads(*payloads)
+
+    @staticmethod
+    def _dequantize_mamba_conv_qkv_direct_into(
+        conv_qkv_payload: bytes,
+        conv_layout: MambaSubStateWireLayout,
+        block_size: int,
+        target: torch.Tensor,
+    ) -> None:
+        """Dequantize conv's 3-way query/key/value bundle straight into the
+        opaque page tensor.
+
+        Zero-copy counterpart of three :meth:`dequantize_mamba_substate_4bit`
+        calls followed by ``torch.cat`` and :meth:`merge_mamba_chunk`'s conv
+        write: scatters each segment directly into ``target``'s conv byte
+        region instead of materializing independent q/k/v tensors and
+        concatenating them first. ``target`` may be a contiguous
+        single-plane or two-plane opaque page tensor -- conv's byte range
+        always fits entirely within plane 0 (see the Phase 3 design doc),
+        so the two-plane case is handled by scattering into ``target[0]``
+        as an ordinary single-plane 3-D tensor with ``page_bytes`` halved,
+        reusing the single-plane native kernel unchanged. Callers must
+        check :meth:`supports_mamba_conv_direct` first. Each segment's own
+        self-describing header gives its width, so query/key/value column
+        offsets are derived in order (query=0, key=query's width, etc.)
+        without needing the caller to pass ``ConvQKVSplit`` separately.
+
+        """
+        conv_dim = conv_layout.shape[-1]
+        is_two_plane = target.dim() == 4 and int(target.shape[0]) == 2
+        page_bytes = block_size * target.shape[-1] * target.element_size()
+        if is_two_plane:
+            native_target = target[0]
+        else:
+            native_target = target
+        if conv_layout.byte_offset + conv_layout.byte_length > page_bytes:
+            raise ValueError(
+                "conv's byte range does not fit within plane 0 -- the "
+                "direct conv path assumes conv always fits in a single "
+                "plane; caller must have validated this via "
+                "supports_mamba_conv_direct before calling this method."
+            )
+        native = _resolve_native("cpu")
+        col_offset = 0
+        for payload in _KVWeaveCodec.unpack_conv_qkv_payloads(conv_qkv_payload):
+            p = _KVWeaveCodec._read_mamba_substate_payload(payload)
+            head_dim = p["head_dim"]
+            elem_size = torch.empty((), dtype=p["output_dtype"]).element_size()
+            rows_per_page = conv_layout.byte_length // elem_size // conv_dim
+            native.kvweave_dequantize_mamba_page_substate_direct(
+                p["q_data"], p["scales"], native_target, page_bytes, conv_layout.byte_offset,
+                conv_dim, rows_per_page, p["num_layers"], p["num_blocks"], False,
+                qbit=p["qbit"], blocks_num=p["blocks_num"], block_size=1,
+                head_num=p["head_num"], head_dim=head_dim, asym=p["asym"],
+                scaling_method=p["scaling_method"], substate_dtype=p["output_dtype"],
+                col_offset=col_offset,
+                rh=p["rh"], signs=p["signs"], perm=p["perm"],
+            )
+            col_offset += head_dim
 
     @staticmethod
     def _quantize_mamba_substates_batch_xpu(jobs: list[dict]) -> list[bytes]:
@@ -1627,22 +2046,42 @@ class _KVWeaveCodec:
         if mamba_layout is not None:
             if mamba_options is None:
                 raise RuntimeError("Mamba codec options are not initialized")
-            split = mamba_split or self.split_mamba_chunk(
-                raw_chunk, mamba_layout, tokens_per_block
-            )
+            conv_layout, ssm_layout = mamba_layout
+            is_two_plane = raw_chunk.dim() == 4 and int(raw_chunk.shape[0]) == 2
             conv_enabled = getattr(mamba_options, "conv_quant_enabled", True)
             ssm_enabled = getattr(mamba_options, "ssm_quant_enabled", True)
             ssm_raw_fallback = ssm_enabled and mamba_options.ssm_qbit == 16
+            eligible_direct = self.mamba_encode_direct_paths(
+                mamba_layout, tokens_per_block, mamba_options, raw_chunk
+            )
+            conv_direct, ssm_direct = (
+                eligible_direct if mamba_split is None else (False, False)
+            )
+            layers = int(raw_chunk.shape[1] if is_two_plane else raw_chunk.shape[0])
+            blocks = int(raw_chunk.shape[-2]) // tokens_per_block
+
+            # split_mamba_chunk's gather is needed only for whichever
+            # sub-state(s) aren't covered by a direct path: conv's
+            # query/key/value quantization (conv_direct) or conv_payload's
+            # disabled branch (needs real split.conv bytes either way) for
+            # conv; similarly for ssm. When both substates are handled
+            # without split (direct, or simply disabled upstream of needing
+            # real bytes), skip the gather entirely.
+            need_split_conv = not conv_direct
+            need_split_ssm = not (ssm_direct and ssm_enabled)
+            split = mamba_split
+            if split is None and (need_split_conv or need_split_ssm):
+                split = self.split_mamba_chunk(raw_chunk, mamba_layout, tokens_per_block)
 
             # Collect every substate that needs a native quantize call
-            # (conv's query/key/value when enabled, ssm when enabled and not
-            # the raw-fp16 fallback) and quantize them together: on
-            # device="xpu" this collapses what would otherwise be up to 4
-            # independent host<->XPU round trips (one per substate) into as
-            # few as 1, since they usually share the KV cache's tensor
-            # dtype. See _quantize_mamba_jobs.
+            # (conv's query/key/value when enabled and not conv_direct, ssm
+            # when enabled, not the raw-fp16 fallback, and not ssm_direct)
+            # and quantize them together: on device="xpu" this collapses what
+            # would otherwise be up to 4 independent host<->XPU round trips
+            # (one per substate) into as few as 1, since they usually share
+            # the KV cache's tensor dtype. See _quantize_mamba_jobs.
             jobs = []
-            if conv_enabled:
+            if conv_enabled and not conv_direct:
                 query, key, value = self._split_conv_qkv(
                     split.conv, mamba_options.conv_qkv_split
                 )
@@ -1653,7 +2092,7 @@ class _KVWeaveCodec:
                         rh=mamba_options.conv_rh, asym=mamba_options.asym,
                         qbit=mamba_options.conv_qbit,
                     ))
-            if ssm_enabled and not ssm_raw_fallback:
+            if ssm_enabled and not ssm_raw_fallback and not ssm_direct:
                 jobs.append(dict(
                     tensor=split.ssm, substate="ssm",
                     scaling_method=mamba_options.ssm_scaling_method,
@@ -1664,9 +2103,18 @@ class _KVWeaveCodec:
             payloads = iter(self._quantize_mamba_jobs(jobs, self.device))
 
             if conv_enabled:
-                conv_payload = b"\x01" + self.pack_conv_qkv_payloads(
-                    *(next(payloads) for _ in range(3))
-                )
+                if conv_direct:
+                    conv_payload = b"\x01" + self._quantize_mamba_conv_qkv_direct(
+                        raw_chunk, conv_layout, mamba_options.conv_qkv_split,
+                        tokens_per_block, layers, blocks,
+                        scaling_method=mamba_options.conv_scaling_method,
+                        rh=mamba_options.conv_rh,
+                        asym=mamba_options.asym, qbit=mamba_options.conv_qbit,
+                    )
+                else:
+                    conv_payload = b"\x01" + self.pack_conv_qkv_payloads(
+                        *(next(payloads) for _ in range(3))
+                    )
             else:
                 conv_payload = b"\x00" + self._tensor_bytes(split.conv)
 
@@ -1674,6 +2122,13 @@ class _KVWeaveCodec:
                 if ssm_raw_fallback:
                     ssm_payload = b"\x02" + self._tensor_bytes(
                         split.ssm.to(dtype=torch.float16)
+                    )
+                elif ssm_direct:
+                    ssm_payload = b"\x01" + self._quantize_mamba_ssm_direct(
+                        raw_chunk, ssm_layout, tokens_per_block, layers, blocks,
+                        scaling_method=mamba_options.ssm_scaling_method,
+                        rh=mamba_options.ssm_rh,
+                        asym=mamba_options.asym, qbit=mamba_options.ssm_qbit,
                     )
                 else:
                     ssm_payload = b"\x01" + next(payloads)
@@ -1773,23 +2228,115 @@ class _KVWeaveCodec:
             layers = raw_shape[1] if len(raw_shape) == 4 else raw_shape[0]
             tokens = raw_shape[-2]
             blocks = max(tokens // tokens_per_block, 1)
-            if self.device == "xpu":
-                conv, ssm = self._decode_mamba_substates_xpu_batched(
-                    conv_payload, ssm_payload, conv_layout, ssm_layout, layers, blocks
+            is_two_plane = len(raw_shape) == 4
+            plane_bytes = tokens_per_block * raw_shape[-1] * raw_dtype.itemsize
+            has_direct_native = hasattr(
+                self.native, "kvweave_dequantize_mamba_page_substate_direct"
+            )
+
+            ssm_quantized = ssm_payload[0] == 1
+            ssm_parsed = (
+                _KVWeaveCodec._read_mamba_substate_payload(ssm_payload[1:])
+                if ssm_quantized else None
+            )
+            # The no-RH two-plane kernel is per_channel-only; RH gathers into
+            # native scratch and can handle other scaling methods.
+            ssm_direct = (
+                self.device == "cpu"
+                and ssm_quantized
+                and (
+                    not is_two_plane
+                    or ssm_parsed["scaling_method"] == "per_channel"
+                    or ssm_parsed["rh"]
+                )
+                and (
+                    not is_two_plane
+                    or (
+                        plane_bytes % ssm_parsed["output_dtype"].itemsize == 0
+                        and ssm_layout.byte_offset
+                        % ssm_parsed["output_dtype"].itemsize == 0
+                    )
+                )
+                and has_direct_native
+            )
+
+            conv_quantized = conv_payload[0] == 1
+            conv_query_parsed = None
+            if conv_quantized:
+                query_payload, _key_payload, _value_payload = (
+                    self.unpack_conv_qkv_payloads(conv_payload[1:])
+                )
+                conv_query_parsed = _KVWeaveCodec._read_mamba_substate_payload(query_payload)
+            conv_direct = (
+                self.device == "cpu"
+                and conv_quantized
+                and (
+                    conv_query_parsed["scaling_method"] == "per_channel"
+                    or (
+                        conv_query_parsed["rh"]
+                        and conv_query_parsed["scaling_method"]
+                        in {"per_token", "per_tensor"}
+                    )
+                )
+                and has_direct_native
+                and conv_layout.byte_offset + conv_layout.byte_length <= plane_bytes
+            )
+
+            hidden_dim = raw_shape[-1]
+
+            if not conv_direct and not ssm_direct:
+                # Neither substate has a direct scatter path available
+                # (XPU device, unsupported scaling/layout, etc.) -- fall
+                # back to the original gather-both-then-merge-both path.
+                if self.device == "xpu":
+                    conv, ssm = self._decode_mamba_substates_xpu_batched(
+                        conv_payload, ssm_payload, conv_layout, ssm_layout, layers, blocks
+                    )
+                else:
+                    conv = self._decode_conv_substate(conv_payload, conv_layout, layers, blocks, device=self.device)
+                    ssm = self._decode_mamba_substate(ssm_payload, ssm_layout, layers, blocks, device=self.device)
+                return self.merge_mamba_chunk(
+                    MambaChunkSplit(conv, ssm), mamba_layout, tokens_per_block,
+                    hidden_dim, raw_shape=raw_shape, raw_dtype=raw_dtype, out=out,
+                )
+
+            # At least one substate scatters directly into the opaque page;
+            # the other (if any) is decoded into a real tensor and written
+            # into the same buffer via write_mamba_substate_into, instead of
+            # routing through merge_mamba_chunk (which would need both
+            # substates as real tensors) or reading the just-scattered bytes
+            # back out via split_mamba_chunk (which would turn the scatter's
+            # saved copy into a gather, erasing the benefit of going direct).
+            target = out if out is not None else torch.empty(raw_shape, dtype=raw_dtype)
+            planes = 1 if len(raw_shape) == 3 else 2
+
+            if conv_direct:
+                self._dequantize_mamba_conv_qkv_direct_into(
+                    conv_payload[1:], conv_layout, tokens_per_block, target
                 )
             else:
                 conv = self._decode_conv_substate(conv_payload, conv_layout, layers, blocks, device=self.device)
+                self.write_mamba_substate_into(
+                    conv, conv_layout, target, layers, blocks, tokens_per_block,
+                    hidden_dim, planes, raw_dtype,
+                )
+
+            if ssm_direct:
+                self._dequantize_mamba_ssm_direct_into_parsed(
+                    ssm_parsed, ssm_layout, tokens_per_block, target
+                )
+            else:
                 ssm = self._decode_mamba_substate(ssm_payload, ssm_layout, layers, blocks, device=self.device)
-            hidden_dim = raw_shape[-1]
-            merged = self.merge_mamba_chunk(
-                MambaChunkSplit(conv, ssm), mamba_layout, tokens_per_block,
-                hidden_dim, raw_shape=raw_shape, raw_dtype=raw_dtype, out=out,
-            )
-            # ``merged`` is an opaque page view. Its bytes already contain
+                self.write_mamba_substate_into(
+                    ssm, ssm_layout, target, layers, blocks, tokens_per_block,
+                    hidden_dim, planes, raw_dtype,
+                )
+
+            # ``target`` is an opaque page view. Its bytes already contain
             # each sub-state in its own wire dtype; converting the page tensor
             # numerically would corrupt fp32 SSM bytes when the page dtype is
             # fp16 (the normal Qwen3.5 layout).
-            return merged
+            return target
         destination = out if out is not None else torch.empty(raw_shape, dtype=raw_dtype)
         if destination.shape != raw_shape or destination.dtype != raw_dtype:
             raise ValueError("out must match raw_shape and raw_dtype")

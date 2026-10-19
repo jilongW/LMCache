@@ -183,6 +183,8 @@ class MambaCodecOptions:
     ssm_qbit: int = 4
     conv_quant_enabled: bool = True
     ssm_quant_enabled: bool = True
+    ssm_direct_quant_enabled: bool = True
+    conv_direct_quant_enabled: bool = True
     conv_qkv_split: ConvQKVSplit = field(
         default_factory=lambda: ConvQKVSplit(key_dim=2048, value_dim=4096)
     )
@@ -207,6 +209,26 @@ class MambaCodecOptions:
         With the default ``conv_scaling_method="per_token"``, RH operates
         across each Q/K/V segment's last dimension. It remains enabled when
         those widths are powers of 2, as they are for Qwen3.5-9B.
+
+        ``LMCACHE_MP_KVWEAVE_SSM_DIRECT_QUANT`` (default ``true``) gates the
+        CPU ssm encode path, avoiding ``split_mamba_chunk``'s gather. It
+        supports RH through a native scratch sub-state. Single-plane chunks
+        support all scaling methods; the no-RH two-plane fast path requires
+        ``per_channel`` and element-aligned plane boundaries/substate
+        offsets. RH can gather two-plane states with any scaling method.
+
+        ``LMCACHE_MP_KVWEAVE_CONV_DIRECT_QUANT`` (default ``true``) similarly
+        enables CPU conv Q/K/V direct encode. The no-RH fast path uses
+        ``per_channel``; RH direct supports all scaling methods. For two-plane
+        chunks the conv byte range must fit entirely in plane 0.
+
+        Decode selects direct scatter independently from the payload's
+        scaling/RH metadata, layout and native support, not these encode
+        switches.
+
+        Synchronous and asynchronous SHM store skip pre-split scratch when
+        both substates are eligible for direct encode. Otherwise they
+        retain the pooled split path.
         """
         _env_scaling_method(
             "LMCACHE_MP_KVWEAVE_LINEAR_SCALING_METHOD", "per_channel"
@@ -238,6 +260,12 @@ class MambaCodecOptions:
             ),
             ssm_quant_enabled=_env_flag(
                 "LMCACHE_MP_KVWEAVE_SSM_QUANT_ENABLED", True
+            ),
+            ssm_direct_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_SSM_DIRECT_QUANT", True
+            ),
+            conv_direct_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_CONV_DIRECT_QUANT", True
             ),
             conv_qkv_split=conv_qkv_split,
         )
