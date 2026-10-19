@@ -570,9 +570,11 @@ def test_mamba_two_plane_rh_direct_matches_split_path(
 
 
 @pytest.mark.parametrize("async_store", [False, True])
-@pytest.mark.parametrize("rh", [False, True])
+@pytest.mark.parametrize("scaling,rh", [
+    ("per_channel", False), ("per_token", False), ("per_token", True)
+])
 def test_mamba_store_ring_bypasses_pre_split_for_direct_encode(
-    rh: bool, async_store: bool, monkeypatch: pytest.MonkeyPatch
+    scaling: str, rh: bool, async_store: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from lmcache.v1.distributed.api import MemoryLayoutDesc
     from lmcache.v1.multiprocess.group_view import EngineGroupInfo
@@ -589,9 +591,9 @@ def test_mamba_store_ring_bypasses_pre_split_for_direct_encode(
     raw, layouts, block_size, qkv = _two_plane_direct_case("qwen35")
     codec = KVWeaveCodec()
     options = MambaCodecOptions(
-        conv_scaling_method="per_token" if rh else "per_channel",
+        conv_scaling_method=scaling,
         conv_rh=rh,
-        ssm_scaling_method="per_token" if rh else "per_channel",
+        ssm_scaling_method=scaling,
         ssm_rh=rh,
         asym=True,
         conv_qkv_split=qkv,
@@ -698,7 +700,7 @@ def test_mamba_store_keeps_split_when_both_states_cannot_go_direct(
     elif fallback == "raw_ssm":
         options = replace(options, ssm_qbit=16)
     elif fallback == "scaling":
-        options = replace(options, ssm_scaling_method="per_token")
+        options = replace(options, ssm_scaling_method="per_tensor")
     plan = GroupTransferPlan(
         group_info=EngineGroupInfo(
             engine_group_id=0, layer_indices=(0, 1, 2),
@@ -757,7 +759,7 @@ def test_two_plane_ssm_scaling_routes(
     scaling: str, conv_enabled: bool, case: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two-plane SSM direct requires per_channel and whole elements."""
+    """Two-plane direct supports token/channel scaling and whole elements."""
     raw, layouts, block_size, qkv = _two_plane_direct_case(case)
     codec = KVWeaveCodec()
     options = MambaCodecOptions(
@@ -766,7 +768,7 @@ def test_two_plane_ssm_scaling_routes(
         conv_quant_enabled=conv_enabled, conv_qkv_split=qkv,
     )
     assert codec.supports_mamba_ssm_direct(options, raw) == (
-        scaling == "per_channel"
+        scaling in {"per_channel", "per_token"}
     )
     serialize = codec.native.kvweave_serialize_mamba_page_substate_direct
     dequantize = codec.native.kvweave_dequantize_mamba_page_substate_direct
@@ -774,13 +776,13 @@ def test_two_plane_ssm_scaling_routes(
 
     def serialize_checked(*args: object, **kwargs: object) -> bytes:
         if args[7]:
-            assert kwargs["scaling_method"] == "per_channel"
+            assert kwargs["scaling_method"] in {"per_channel", "per_token"}
             two_plane_calls.append("encode")
         return serialize(*args, **kwargs)
 
     def dequantize_checked(*args: object, **kwargs: object) -> None:
         if args[9]:
-            assert kwargs["scaling_method"] == "per_channel"
+            assert kwargs["scaling_method"] in {"per_channel", "per_token"}
             two_plane_calls.append("decode")
         return dequantize(*args, **kwargs)
 
@@ -798,7 +800,7 @@ def test_two_plane_ssm_scaling_routes(
         )
     assert two_plane_calls == (
         ["encode", "decode"]
-        if scaling == "per_channel" and case != "element_straddling"
+        if scaling in {"per_channel", "per_token"} and case != "element_straddling"
         else []
     )
     with monkeypatch.context() as patch:
@@ -816,8 +818,10 @@ def test_two_plane_ssm_scaling_routes(
 @pytest.mark.parametrize("scaling", ["per_channel", "per_token", "per_tensor"])
 @pytest.mark.parametrize("rh", [False, True])
 @pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("fused_scaling", [False, True])
 def test_mamba_ssm_direct_support_matrix(
-    planes: int, scaling: str, rh: bool, enabled: bool
+    planes: int, scaling: str, rh: bool, enabled: bool,
+    fused_scaling: bool, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep single-plane scaling support and the RH/feature gates intact."""
     raw = torch.empty((2, 3, 4, 8) if planes == 2 else (3, 4, 8))
@@ -826,8 +830,13 @@ def test_mamba_ssm_direct_support_matrix(
         ssm_scaling_method=scaling, ssm_rh=rh, asym=True,
         ssm_direct_quant_enabled=enabled,
     )
-    assert KVWeaveCodec().supports_mamba_ssm_direct(options, raw) == (
-        enabled and (planes == 1 or scaling == "per_channel" or rh)
+    codec = KVWeaveCodec()
+    monkeypatch.setattr(codec.native, "MAMBA_FUSED_SCALING", fused_scaling)
+    assert codec.supports_mamba_ssm_direct(options, raw) == (
+        enabled and (
+            planes == 1 or scaling == "per_channel" or rh
+            or (fused_scaling and scaling == "per_token")
+        )
     )
 
 

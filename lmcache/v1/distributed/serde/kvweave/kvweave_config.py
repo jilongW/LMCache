@@ -212,14 +212,16 @@ class MambaCodecOptions:
 
         ``LMCACHE_MP_KVWEAVE_SSM_DIRECT_QUANT`` (default ``true``) gates the
         CPU ssm encode path, avoiding ``split_mamba_chunk``'s gather. It
-        supports RH through a native scratch sub-state. Single-plane chunks
-        support all scaling methods; the no-RH two-plane fast path requires
-        ``per_channel`` and element-aligned plane boundaries/substate
-        offsets. RH can gather two-plane states with any scaling method.
+        supports RH; compatible native builds fuse eligible 4/8-bit
+        ``per_token`` rows and ``per_channel`` tiles with either RH setting.
+        Two-plane pages require element-aligned boundaries/substate offsets.
+        Per-tensor RH retains native scratch; per-tensor without RH still
+        requires split for two-plane pages. Older builds keep their gates.
 
         ``LMCACHE_MP_KVWEAVE_CONV_DIRECT_QUANT`` (default ``true``) similarly
-        enables CPU conv Q/K/V direct encode. The no-RH fast path uses
-        ``per_channel``; RH direct supports all scaling methods. For two-plane
+        enables CPU conv Q/K/V direct encode. Compatible builds fuse
+        ``per_channel``/``per_token`` with either RH setting; RH direct
+        supports all scaling methods. For two-plane
         chunks the conv byte range must fit entirely in plane 0.
 
         Decode selects direct scatter independently from the payload's

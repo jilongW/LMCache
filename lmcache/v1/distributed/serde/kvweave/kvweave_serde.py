@@ -143,17 +143,21 @@ class _KVWeaveCodec:
         against the opaque page, skipping ``split_mamba_chunk``'s/
         ``merge_mamba_chunk``'s gather/scatter.
 
-        Requires CPU (no XPU native entry point exists yet). RH is applied
-        using a native contiguous scratch sub-state. Single-plane chunks support
-        ``per_channel``/``per_token``/``per_tensor`` scaling. The no-RH
-        two-plane fast path requires ``per_channel``; RH uses native scratch
-        and can gather across both planes for any scaling method.
+        Requires CPU (no XPU native entry point exists yet). Compatible
+        native builds fuse per-token rows and per-channel tiles, with or
+        without RH. Older builds retain their original eligibility.
+        Two-plane chunks require element-aligned offsets and boundaries;
+        per_tensor without RH still uses the split path.
         """
         is_two_plane = raw_chunk.dim() == 4 and int(raw_chunk.shape[0]) == 2
         if (
             is_two_plane
             and mamba_options.ssm_scaling_method != "per_channel"
             and not mamba_options.ssm_rh
+            and not (
+                mamba_options.ssm_scaling_method == "per_token"
+                and getattr(self.native, "MAMBA_FUSED_SCALING", False)
+            )
         ):
             return False
         return (
@@ -170,10 +174,9 @@ class _KVWeaveCodec:
         dequantize directly against the opaque page, skipping
         ``split_mamba_chunk``'s/``merge_mamba_chunk``'s gather/scatter.
 
-        Requires CPU. RH uses a native contiguous scratch sub-state. The
-        no-RH fast path requires ``per_channel`` scaling; with RH enabled,
-        the direct gather supports all three scaling methods for Q/K/V
-        sub-ranges.
+        Requires CPU. Compatible native builds fuse per-token Q/K/V rows
+        and per-channel tiles, with or without RH. Older native builds
+        require per_channel without RH. Per-tensor RH retains native scratch.
 
         Two-plane chunks are supported too: conv's byte range always fits
         entirely within plane 0 for every known Mamba layout (conv is a
@@ -189,6 +192,10 @@ class _KVWeaveCodec:
             mamba_options.conv_direct_quant_enabled
             and (
                 mamba_options.conv_scaling_method == "per_channel"
+                or (
+                    mamba_options.conv_scaling_method == "per_token"
+                    and getattr(self.native, "MAMBA_FUSED_SCALING", False)
+                )
                 or (
                     mamba_options.conv_rh
                     and mamba_options.conv_scaling_method
@@ -1043,8 +1050,9 @@ class _KVWeaveCodec:
         Zero-copy counterpart of :meth:`_quantize_mamba_substate_payload`:
         reads directly from ``raw_chunk``'s ssm byte range instead of first
         gathering a real ssm tensor via :meth:`split_mamba_chunk`. Supports
-        RH and both single-plane and two-plane chunks (two-plane only with
-        ``scaling_method="per_channel"``) -- callers must check
+        RH and both single-plane and two-plane chunks; compatible native
+        builds support per_channel/per_token with either RH setting.
+        Callers must check
         :meth:`supports_mamba_ssm_direct` first.
         """
         ssm_dtype = KVWeaveCodecConfig.mamba_dtype(ssm_layout.dtype_str)
@@ -1100,10 +1108,11 @@ class _KVWeaveCodec:
         Zero-copy counterpart of :meth:`dequantize_mamba_substate_4bit`
         followed by :meth:`merge_mamba_chunk`'s ssm write: scatters directly
         into ``target``'s ssm byte range instead of materializing an
-        independent ssm tensor first. RH payloads are inverse-transformed in
-        native scratch before scattering. ``target`` must be a contiguous opaque
+        independent ssm tensor first. Eligible token rows and channel tiles
+        use per-thread scratch, with optional inverse RH.
+        ``target`` must be a contiguous opaque
         page tensor (the same shape/dtype :meth:`merge_mamba_chunk` would
-        produce). Two-plane targets require ``per_channel`` scaling.
+        produce). Two-plane scaling support depends on the native capability.
         """
         p = _KVWeaveCodec._read_mamba_substate_payload(ssm_payload)
         _KVWeaveCodec._dequantize_mamba_ssm_direct_into_parsed(
@@ -1123,9 +1132,8 @@ class _KVWeaveCodec:
         it first to decide whether the direct path applies.
 
         ``target`` may be a contiguous single-plane or two-plane opaque page
-        tensor; two-plane is only supported when the payload's
-        ``scaling_method`` is ``"per_channel"``. The caller must verify this
-        from the payload before selecting the direct decode path.
+        tensor. The caller must verify scaling support from the payload and
+        native capabilities before selecting the direct decode path.
         """
         p = parsed_ssm_payload
         is_two_plane = target.dim() == 4 and int(target.shape[0]) == 2
@@ -1173,8 +1181,8 @@ class _KVWeaveCodec:
         Phase 3 design doc -- so the two-plane case is handled by treating
         ``raw_chunk[0]`` as an ordinary single-plane 3-D tensor with
         ``page_bytes`` halved to one plane's size, reusing the single-plane
-        native kernel unchanged). Supports RH using native scratch and
-        Q/K/V ``per_token`` scaling -- callers must check
+        native kernel unchanged). Compatible native builds fuse Q/K/V
+        per_token rows and per_channel tiles, with or without RH. Callers must check
         :meth:`supports_mamba_conv_direct` first.
         """
         conv_dtype = KVWeaveCodecConfig.mamba_dtype(conv_layout.dtype_str)
@@ -2239,8 +2247,7 @@ class _KVWeaveCodec:
                 _KVWeaveCodec._read_mamba_substate_payload(ssm_payload[1:])
                 if ssm_quantized else None
             )
-            # The no-RH two-plane kernel is per_channel-only; RH gathers into
-            # native scratch and can handle other scaling methods.
+            # Older native builds lack no-RH two-plane per-token support.
             ssm_direct = (
                 self.device == "cpu"
                 and ssm_quantized
@@ -2248,6 +2255,10 @@ class _KVWeaveCodec:
                     not is_two_plane
                     or ssm_parsed["scaling_method"] == "per_channel"
                     or ssm_parsed["rh"]
+                    or (
+                        ssm_parsed["scaling_method"] == "per_token"
+                        and getattr(self.native, "MAMBA_FUSED_SCALING", False)
+                    )
                 )
                 and (
                     not is_two_plane
@@ -2272,6 +2283,10 @@ class _KVWeaveCodec:
                 and conv_quantized
                 and (
                     conv_query_parsed["scaling_method"] == "per_channel"
+                    or (
+                        conv_query_parsed["scaling_method"] == "per_token"
+                        and getattr(self.native, "MAMBA_FUSED_SCALING", False)
+                    )
                     or (
                         conv_query_parsed["rh"]
                         and conv_query_parsed["scaling_method"]
