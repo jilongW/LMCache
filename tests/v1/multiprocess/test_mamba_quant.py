@@ -37,6 +37,57 @@ def _layouts() -> tuple[MambaSubStateWireLayout, MambaSubStateWireLayout]:
     )
 
 
+@pytest.mark.parametrize("direct", [False, True])
+def test_mamba_cpu_threads_reach_all_native_calls(direct, monkeypatch):
+    raw, layouts, block_size, qkv = _two_plane_direct_case("aligned")
+    codec = KVWeaveCodec({"num_threads": 2})
+    options = MambaCodecOptions(
+        conv_scaling_method="per_channel", conv_rh=False,
+        ssm_scaling_method="per_channel", ssm_rh=False, asym=True,
+        conv_qkv_split=qkv,
+        conv_direct_quant_enabled=direct, ssm_direct_quant_enabled=direct,
+    )
+    calls = []
+
+    def checked(name, original):
+        def invoke(*args, **kwargs):
+            assert kwargs["num_threads"] == 2
+            calls.append(name)
+            return original(*args, **kwargs)
+        return invoke
+
+    encode_name = (
+        "kvweave_serialize_mamba_page_substate_direct"
+        if direct else "kvweave_serialize_chunk_state"
+    )
+    decode_name = (
+        "kvweave_dequantize_mamba_page_substate_direct"
+        if direct else "kvweave_dequantize_chunk_state"
+    )
+    for name in (encode_name, decode_name):
+        monkeypatch.setattr(codec.native, name, checked(name, getattr(codec.native, name)))
+    if not direct:
+        monkeypatch.delattr(codec.native, "kvweave_dequantize_mamba_page_substate_direct")
+    payload = codec.encode_chunk("mamba", layouts, block_size, options, raw)
+    chunk = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+    codec.decode_chunk(
+        "mamba", layouts, block_size, raw.shape, raw.dtype, chunk,
+        out=torch.zeros_like(raw),
+    )
+    assert calls.count(encode_name) == 4
+    assert calls.count(decode_name) == 4
+
+
+@pytest.mark.parametrize("device,threads,expected", [
+    ("cpu", 2, {"num_threads": 2}), ("cpu", 0, {}),
+    ("xpu", 2, {}), ("xpu", 0, {}),
+])
+def test_mamba_thread_kwargs_are_cpu_only(device, threads, expected):
+    from lmcache.v1.distributed.serde.kvweave.kvweave_serde import _cpu_thread_kwargs
+
+    assert _cpu_thread_kwargs(device, threads) == expected
+
+
 def test_split_and_merge_preserve_real_substate_bytes():
     raw = torch.randn(2, 2, 8, 8, dtype=torch.float32)
     split = _KVWeaveCodec.split_mamba_chunk(raw, _layouts(), block_size=2)

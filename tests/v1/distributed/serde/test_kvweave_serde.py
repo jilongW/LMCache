@@ -312,7 +312,7 @@ def test_xpu_device_requires_native_extension_or_raises(monkeypatch):
     import lmcache.v1.distributed.serde.kvweave.kvweave_serde as kvweave_serde_mod
 
     monkeypatch.setattr(kvweave_serde_mod, "kvweave_quant_xpu", None)
-    with pytest.raises(RuntimeError, match="xpu"):
+    with pytest.raises(RuntimeError, match="XPU"):
         _codec(device="xpu")
 
 

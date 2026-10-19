@@ -32,6 +32,16 @@ except ImportError:  # pragma: no cover
 logger = init_logger(__name__)
 
 
+def _cpu_thread_kwargs(device: str, num_threads: int) -> dict:
+    """``num_threads`` kwarg for the CPU (OpenMP) native module only.
+
+    Without it the CPU kernels use ``omp_get_max_threads()`` (torch's thread
+    count), which oversubscribes against torch's own pool; the SYCL module
+    has no such argument.
+    """
+    return {"num_threads": num_threads} if device == "cpu" and num_threads > 0 else {}
+
+
 def _resolve_native(device: str):
     """Return the native quantization module for ``device`` ('cpu' or 'xpu').
 
@@ -995,6 +1005,7 @@ class _KVWeaveCodec:
         asym: bool,
         qbit: int = KVWeaveCodecConfig.MAMBA_QBIT,
         device: str = "cpu",
+        num_threads: int = 0,
     ) -> bytes:
         """Quantize one real Mamba sub-state with native state kernels."""
         if tensor.dtype not in KVWeaveCodecConfig.DTYPE_TO_CODE:
@@ -1022,6 +1033,7 @@ class _KVWeaveCodec:
             block_size=1, head_num=heads, head_dim=head_dim,
             num_layers=shape[0], rh=rh, asym=asym,
             scaling_method=scaling_method, signs=signs, perm=perm,
+            **_cpu_thread_kwargs(device, num_threads),
         ))
         raw_bytes = work.numel() * work.element_size()
         logger.debug(
@@ -1044,6 +1056,7 @@ class _KVWeaveCodec:
         rh: bool,
         asym: bool,
         qbit: int,
+        num_threads: int = 0,
     ) -> bytes:
         """Quantize the ssm sub-state straight out of the opaque page tensor.
 
@@ -1088,6 +1101,7 @@ class _KVWeaveCodec:
             head_dim=head_dim, asym=asym, scaling_method=scaling_method,
             substate_dtype=ssm_dtype, col_offset=0,
             rh=rh, signs=signs, perm=perm,
+            **_cpu_thread_kwargs("cpu", num_threads),
         ))
         logger.debug(
             "Mamba quantize ssm (direct) shape=%s dtype=%s qbit=%d "
@@ -1102,6 +1116,7 @@ class _KVWeaveCodec:
         ssm_layout: MambaSubStateWireLayout,
         block_size: int,
         target: torch.Tensor,
+        num_threads: int = 0,
     ) -> None:
         """Dequantize an ssm payload straight into the opaque page tensor.
 
@@ -1116,7 +1131,7 @@ class _KVWeaveCodec:
         """
         p = _KVWeaveCodec._read_mamba_substate_payload(ssm_payload)
         _KVWeaveCodec._dequantize_mamba_ssm_direct_into_parsed(
-            p, ssm_layout, block_size, target
+            p, ssm_layout, block_size, target, num_threads=num_threads
         )
 
     @staticmethod
@@ -1125,6 +1140,7 @@ class _KVWeaveCodec:
         ssm_layout: MambaSubStateWireLayout,
         block_size: int,
         target: torch.Tensor,
+        num_threads: int = 0,
     ) -> None:
         """Same as :meth:`_dequantize_mamba_ssm_direct_into`, but takes an
         already-:meth:`_read_mamba_substate_payload`-parsed payload to avoid
@@ -1152,6 +1168,7 @@ class _KVWeaveCodec:
             scaling_method=p["scaling_method"], substate_dtype=p["output_dtype"],
             col_offset=0,
             rh=p["rh"], signs=p["signs"], perm=p["perm"],
+            **_cpu_thread_kwargs("cpu", num_threads),
         )
 
     @staticmethod
@@ -1167,6 +1184,7 @@ class _KVWeaveCodec:
         rh: bool,
         asym: bool,
         qbit: int,
+        num_threads: int = 0,
     ) -> bytes:
         """Quantize conv's query/key/value segments straight out of the
         opaque page tensor, as a 3-way bundle (see :meth:`pack_conv_qkv_payloads`).
@@ -1247,6 +1265,7 @@ class _KVWeaveCodec:
                 head_dim=head_dim, asym=asym, scaling_method=scaling_method,
                 substate_dtype=conv_dtype, col_offset=col_offset,
                 rh=rh, signs=signs, perm=perm,
+                **_cpu_thread_kwargs("cpu", num_threads),
             ))
             payloads.append(payload)
         return _KVWeaveCodec.pack_conv_qkv_payloads(*payloads)
@@ -1257,6 +1276,7 @@ class _KVWeaveCodec:
         conv_layout: MambaSubStateWireLayout,
         block_size: int,
         target: torch.Tensor,
+        num_threads: int = 0,
     ) -> None:
         """Dequantize conv's 3-way query/key/value bundle straight into the
         opaque page tensor.
@@ -1306,6 +1326,7 @@ class _KVWeaveCodec:
                 scaling_method=p["scaling_method"], substate_dtype=p["output_dtype"],
                 col_offset=col_offset,
                 rh=p["rh"], signs=p["signs"], perm=p["perm"],
+                **_cpu_thread_kwargs("cpu", num_threads),
             )
             col_offset += head_dim
 
@@ -1370,7 +1391,7 @@ class _KVWeaveCodec:
         ))
 
     @staticmethod
-    def _quantize_mamba_jobs(jobs: list[dict], device: str) -> list[bytes]:
+    def _quantize_mamba_jobs(jobs: list[dict], device: str, num_threads: int = 0) -> list[bytes]:
         """Quantize N independent Mamba substate jobs (e.g. conv-query/
         conv-key/conv-value/ssm), batching same-dtype groups into a single
         XPU round trip when ``device == "xpu"``. CPU device, a single job,
@@ -1383,6 +1404,7 @@ class _KVWeaveCodec:
                 _KVWeaveCodec.quantize_mamba_substate_4bit(
                     job["tensor"], substate=job["substate"], scaling_method=job["scaling_method"],
                     rh=job["rh"], asym=job["asym"], qbit=job["qbit"], device=device,
+                    num_threads=num_threads,
                 )
                 for job in jobs
             ]
@@ -1397,6 +1419,7 @@ class _KVWeaveCodec:
                 results[idx] = _KVWeaveCodec.quantize_mamba_substate_4bit(
                     job["tensor"], substate=job["substate"], scaling_method=job["scaling_method"],
                     rh=job["rh"], asym=job["asym"], qbit=job["qbit"], device=device,
+                    num_threads=num_threads,
                 )
                 continue
             batch_payloads = _KVWeaveCodec._quantize_mamba_substates_batch_xpu(
@@ -1413,6 +1436,7 @@ class _KVWeaveCodec:
         layers: int,
         blocks: int,
         device: str = "cpu",
+        num_threads: int = 0,
     ) -> torch.Tensor:
         """Decode one sub-state payload, honoring its leading quant-enabled flag.
 
@@ -1432,7 +1456,7 @@ class _KVWeaveCodec:
             return torch.frombuffer(payload, dtype=torch.float16).reshape(
                 layers, blocks, *layout.shape
             ).to(dtype=KVWeaveCodecConfig.mamba_dtype(layout.dtype_str))
-        return _KVWeaveCodec.dequantize_mamba_substate_4bit(payload, device=device)
+        return _KVWeaveCodec.dequantize_mamba_substate_4bit(payload, device=device, num_threads=num_threads)
 
     @staticmethod
     def _decode_conv_substate(
@@ -1441,6 +1465,7 @@ class _KVWeaveCodec:
         layers: int,
         blocks: int,
         device: str = "cpu",
+        num_threads: int = 0,
     ) -> torch.Tensor:
         """Decode conv_state's payload, honoring its leading quant-enabled flag.
 
@@ -1467,7 +1492,7 @@ class _KVWeaveCodec:
         query, key, value = _KVWeaveCodec.unpack_conv_qkv_payloads(payload)
         return torch.cat(
             [
-                _KVWeaveCodec.dequantize_mamba_substate_4bit(sub, device=device)
+                _KVWeaveCodec.dequantize_mamba_substate_4bit(sub, device=device, num_threads=num_threads)
                 for sub in (query, key, value)
             ],
             dim=-1,
@@ -1536,7 +1561,7 @@ class _KVWeaveCodec:
         }
 
     @staticmethod
-    def dequantize_mamba_substate_4bit(payload: bytes, device: str = "cpu") -> torch.Tensor:
+    def dequantize_mamba_substate_4bit(payload: bytes, device: str = "cpu", num_threads: int = 0) -> torch.Tensor:
         """Decode a self-describing native Mamba sub-state payload."""
         p = _KVWeaveCodec._read_mamba_substate_payload(payload)
         native = _resolve_native(device)
@@ -1548,6 +1573,7 @@ class _KVWeaveCodec:
             scaling_method=p["scaling_method"],
             output_dtype=p["output_dtype"],
             signs=p["signs"], perm=p["perm"],
+            **_cpu_thread_kwargs(device, num_threads),
         )
         return restored.reshape(p["shape"])
 
@@ -1582,7 +1608,7 @@ class _KVWeaveCodec:
         return [r.reshape(p["shape"]) for r, p in zip(results, parsed_list)]
 
     @staticmethod
-    def _dequantize_mamba_payloads(payloads: list[bytes], device: str) -> list[torch.Tensor]:
+    def _dequantize_mamba_payloads(payloads: list[bytes], device: str, num_threads: int = 0) -> list[torch.Tensor]:
         """Dequantize N independent Mamba substate payloads, batching
         same-output-dtype groups into a single XPU round trip when
         ``device == "xpu"`` (mirrors :meth:`_quantize_mamba_jobs`). CPU
@@ -1592,7 +1618,7 @@ class _KVWeaveCodec:
         """
         if device != "xpu" or len(payloads) <= 1:
             return [
-                _KVWeaveCodec.dequantize_mamba_substate_4bit(p, device=device) for p in payloads
+                _KVWeaveCodec.dequantize_mamba_substate_4bit(p, device=device, num_threads=num_threads) for p in payloads
             ]
         parsed_list = [_KVWeaveCodec._read_mamba_substate_payload(p) for p in payloads]
         results: list[torch.Tensor] = [None] * len(payloads)  # type: ignore[list-item]
@@ -1684,11 +1710,12 @@ class _KVWeaveCodec:
         asym: bool = False,
         qbit: int = KVWeaveCodecConfig.MAMBA_QBIT,
         device: str = "cpu",
+        num_threads: int = 0,
     ) -> bytes:
         """Quantize a Mamba sub-state using the verified state layout contract."""
         return _KVWeaveCodec._quantize_mamba_substate_payload(
             tensor, substate=substate, scaling_method=scaling_method,
-            rh=rh, asym=asym, qbit=qbit, device=device,
+            rh=rh, asym=asym, qbit=qbit, device=device, num_threads=num_threads,
         )
 
     @staticmethod
@@ -2108,7 +2135,7 @@ class _KVWeaveCodec:
                     qbit=mamba_options.ssm_qbit,
                 ))
 
-            payloads = iter(self._quantize_mamba_jobs(jobs, self.device))
+            payloads = iter(self._quantize_mamba_jobs(jobs, self.device, self.num_threads))
 
             if conv_enabled:
                 if conv_direct:
@@ -2118,6 +2145,7 @@ class _KVWeaveCodec:
                         scaling_method=mamba_options.conv_scaling_method,
                         rh=mamba_options.conv_rh,
                         asym=mamba_options.asym, qbit=mamba_options.conv_qbit,
+                        num_threads=self.num_threads,
                     )
                 else:
                     conv_payload = b"\x01" + self.pack_conv_qkv_payloads(
@@ -2137,6 +2165,7 @@ class _KVWeaveCodec:
                         scaling_method=mamba_options.ssm_scaling_method,
                         rh=mamba_options.ssm_rh,
                         asym=mamba_options.asym, qbit=mamba_options.ssm_qbit,
+                        num_threads=self.num_threads,
                     )
                 else:
                     ssm_payload = b"\x01" + next(payloads)
@@ -2308,8 +2337,14 @@ class _KVWeaveCodec:
                         conv_payload, ssm_payload, conv_layout, ssm_layout, layers, blocks
                     )
                 else:
-                    conv = self._decode_conv_substate(conv_payload, conv_layout, layers, blocks, device=self.device)
-                    ssm = self._decode_mamba_substate(ssm_payload, ssm_layout, layers, blocks, device=self.device)
+                    conv = self._decode_conv_substate(
+                        conv_payload, conv_layout, layers, blocks,
+                        device=self.device, num_threads=self.num_threads,
+                    )
+                    ssm = self._decode_mamba_substate(
+                        ssm_payload, ssm_layout, layers, blocks,
+                        device=self.device, num_threads=self.num_threads,
+                    )
                 return self.merge_mamba_chunk(
                     MambaChunkSplit(conv, ssm), mamba_layout, tokens_per_block,
                     hidden_dim, raw_shape=raw_shape, raw_dtype=raw_dtype, out=out,
@@ -2327,10 +2362,14 @@ class _KVWeaveCodec:
 
             if conv_direct:
                 self._dequantize_mamba_conv_qkv_direct_into(
-                    conv_payload[1:], conv_layout, tokens_per_block, target
+                    conv_payload[1:], conv_layout, tokens_per_block, target,
+                    num_threads=self.num_threads,
                 )
             else:
-                conv = self._decode_conv_substate(conv_payload, conv_layout, layers, blocks, device=self.device)
+                conv = self._decode_conv_substate(
+                    conv_payload, conv_layout, layers, blocks,
+                    device=self.device, num_threads=self.num_threads,
+                )
                 self.write_mamba_substate_into(
                     conv, conv_layout, target, layers, blocks, tokens_per_block,
                     hidden_dim, planes, raw_dtype,
@@ -2338,10 +2377,14 @@ class _KVWeaveCodec:
 
             if ssm_direct:
                 self._dequantize_mamba_ssm_direct_into_parsed(
-                    ssm_parsed, ssm_layout, tokens_per_block, target
+                    ssm_parsed, ssm_layout, tokens_per_block, target,
+                    num_threads=self.num_threads,
                 )
             else:
-                ssm = self._decode_mamba_substate(ssm_payload, ssm_layout, layers, blocks, device=self.device)
+                ssm = self._decode_mamba_substate(
+                    ssm_payload, ssm_layout, layers, blocks,
+                    device=self.device, num_threads=self.num_threads,
+                )
                 self.write_mamba_substate_into(
                     ssm, ssm_layout, target, layers, blocks, tokens_per_block,
                     hidden_dim, planes, raw_dtype,
