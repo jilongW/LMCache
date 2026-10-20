@@ -95,9 +95,19 @@ def test_linear_attention_quant_status() -> None:
 
     assert _linear_attention_quant_status([attention], [quantized_layout]) == "n/a"
     assert _linear_attention_quant_status([attention, linear], [None, None]) == "0"
-    assert _linear_attention_quant_status(
-        [attention, linear], [None, quantized_layout]
-    ) == "1"
+    assert (
+        _linear_attention_quant_status([attention, linear], [None, quantized_layout])
+        == "1"
+    )
+    raw_layout = serialize_memory_layout_desc(
+        MemoryLayoutDesc(shapes=[torch.Size([2, 8, 4096])], dtypes=[torch.uint8])
+    )
+    assert (
+        _linear_attention_quant_status(
+            [attention, linear], [quantized_layout, raw_layout]
+        )
+        == "0"
+    )
 
 
 def _make_group_object_keys(
@@ -311,21 +321,33 @@ def test_register_accepts_quantization_on_variable_size_l1(
         assert 1 in module._engine_driven_contexts  # noqa: SLF001
 
 
+@pytest.mark.parametrize("quantized", [False, True])
 def test_register_group_layout_descs_override_per_group_layout(
     stub_native_storage_ops: None,
+    quantized: bool,
 ) -> None:
     """A non-``None`` ``group_layout_descs`` entry overrides that group's
     server-derived layout; a ``None`` entry keeps the server's own
-    derivation (see MIGRATION_PLAN.md Phase D item 4)."""
+    derivation, regardless of whether quantization is enabled."""
     with ExitStack() as stack:
         mock_storage = MagicMock()
         mock_storage.is_l1_variable_size.return_value = True
         _patch_engine_context(stack, mock_storage, [b"h1", b"h2"])
         ctx = _make_context()
+        ctx.shm_pool_info.update(shm_name="test-pool", pool_size=1024 * 1024)
         module = EngineDrivenTransferModule(ctx)
 
-        quantized_layout = serialize_memory_layout_desc(
-            MemoryLayoutDesc(shapes=[torch.Size([123])], dtypes=[torch.uint8])
+        worker_layout = MemoryLayoutDesc(
+            shapes=[torch.Size([123]) if quantized else torch.Size([2, 8, 4096])],
+            dtypes=[torch.uint8],
+        )
+        groups = _hybrid_groups()
+        groups[0] = EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=(0, 1),
+            tokens_per_block=1,
+            cache_category="mamba",
+            recurrent_state=True,
         )
         payload = RegisterEngineDrivenContextPayload(
             instance_id=1,
@@ -337,17 +359,17 @@ def test_register_group_layout_descs_override_per_group_layout(
             dtype_str="float32",
             use_mla=False,
             num_physical_slots=8,
-            engine_group_infos=_hybrid_groups(),
-            group_layout_descs=[quantized_layout, None],
-            enable_l1_kvweave_quant=True,
+            engine_group_infos=groups,
+            group_layout_descs=[serialize_memory_layout_desc(worker_layout), None],
+            enable_l1_kvweave_quant=quantized,
         )
         response = module.register_kv_cache_engine_driven_context(payload)
 
         assert response.error is None
         entry = module._engine_driven_contexts[1]  # noqa: SLF001
-        # Group 0's layout is the worker-supplied quantized override.
-        assert tuple(entry.metadata_by_group[0].layout_desc.shapes[0]) == (123,)
-        assert entry.metadata_by_group[0].layout_desc.dtypes[0] == torch.uint8
+        actual = entry.metadata_by_group[0].layout_desc
+        assert actual.shapes == worker_layout.shapes
+        assert actual.dtypes == worker_layout.dtypes
         # Group 1 has no override: server derives it as before (2 layers x
         # 2 x 8 physical slots x 16 hidden dim).
         assert tuple(entry.metadata_by_group[1].layout_desc.shapes[0]) == (
@@ -356,6 +378,28 @@ def test_register_group_layout_descs_override_per_group_layout(
             8,
             16,
         )
+
+        def reserve_write(
+            keys: list[ObjectKey], layout: MemoryLayoutDesc, mode: str
+        ) -> dict[ObjectKey, MagicMock]:
+            reserved = {}
+            for i, key in enumerate(keys):
+                obj = _reserved_memory_obj(layout)
+                obj.shm_offset = key.object_group_id * 262144 + i * obj.tensor.nbytes
+                obj.shm_byte_length = obj.tensor.nbytes
+                reserved[key] = obj
+            return reserved
+
+        mock_storage.reserve_write.side_effect = reserve_write
+        prepared = module.prepare_store(_default_key(), 1)
+        slots = prepared.context["slots"]
+        assert len(slots) == 4
+        expected_size = 123 if quantized else 65536
+        for slot in slots[:2]:
+            assert slot["shape"] == list(worker_layout.shapes[0])
+            assert slot["dtype"] == "uint8"
+            assert slot["length"] == expected_size
+        assert prepared.context["chunk_indices"] == [0, 1, 2, 3]
 
 
 def test_register_falls_back_to_single_metadata_without_groups(

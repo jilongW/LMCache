@@ -287,6 +287,7 @@ class KVWeaveRuntimeConfig:
     enabled: bool
     linear_quant_enabled: bool
     linear_max_size_ratio: float
+    full_attention_quant_enabled: bool = True
     split_attention_quant_enabled: bool = True
     fused_attention_quant_enabled: bool = True
     attention_codec_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -308,7 +309,10 @@ class KVWeaveRuntimeConfig:
 
         ``enabled`` (``LMCACHE_MP_L1_KVWEAVE_QUANT``) is the overall switch;
         ``linear_quant_enabled`` (``LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED``,
-        default ``true``) independently gates Mamba/linear groups under it.
+        default ``true``) independently gates Mamba/linear groups under it,
+        and ``full_attention_quant_enabled``
+        (``LMCACHE_MP_KVWEAVE_FULL_ATTENTION_QUANT_ENABLED``, default ``true``)
+        gates every attention group, regardless of its K/V plane layout.
         ``attention_codec_kwargs`` is ready to pass straight into
         ``KVWeaveCodec(...)``. ``rh``/``asym`` were previously only settable
         by constructing ``_KVWeaveCodec`` directly (its own default is
@@ -330,6 +334,9 @@ class KVWeaveRuntimeConfig:
             ),
             linear_max_size_ratio=float(
                 os.environ.get("LMCACHE_MP_KVWEAVE_LINEAR_MAX_SIZE_RATIO", "1.20")
+            ),
+            full_attention_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_FULL_ATTENTION_QUANT_ENABLED", True
             ),
             split_attention_quant_enabled=_env_flag(
                 "LMCACHE_MP_KVWEAVE_SPLIT_ATTENTION_QUANT_ENABLED", True

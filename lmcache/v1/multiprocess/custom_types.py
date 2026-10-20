@@ -260,12 +260,12 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
         group_layout_descs: Per-group override of the layout descriptor the
             server would otherwise derive from ``hidden_dim_size``/
             ``group_hidden_dim_sizes``, aligned with ``engine_group_infos``.
-            An entry is non-``None`` only for a group the worker has
-            decided to quantize (KVWeave), where it carries the encoded
-            ``uint8`` byte layout so the server allocates SHM chunks sized
-            for the quantized payload rather than the raw KV tensor.
-            ``None`` (whole field or a given entry) means the server
-            derives the layout as before.
+            Every group carries its actual transfer layout: the encoded
+            ``uint8`` byte layout for a quantized group (KVWeave), or its
+            raw chunk shape and dtype otherwise. This sizes SHM slots
+            correctly for non-attention state and mixed group dtypes.
+            ``None`` (whole field or a given entry) preserves the legacy
+            attention-shaped server derivation for older clients.
         enable_l1_kvweave_quant: Worker's declared intent to quantize at
             least one group's chunks for this registration. The server is
             the sole authority on whether this is actually permitted --

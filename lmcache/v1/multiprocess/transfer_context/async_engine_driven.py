@@ -60,7 +60,9 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
        SHM buffers are available, gather writes directly into SHM views
        (matching the synchronous path). Otherwise, gather targets pinned
        staging buffers, bucketed per group since groups can have different
-       chunk shapes.
+       chunk shapes. Raw Mamba SHM groups also gather through single-chunk
+       scratch, wait for completion, and copy raw bytes into their SHM slots
+       without splitting or encoding.
     3. commit: wait for gather completion (via a recorded CUDA event), then
        perform commit_store() with every group's gathered chunks concatenated
        group-major, and resolve the returned future.
@@ -173,7 +175,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
     def _launch_shm_quantized_batch(
         self, request_id: str, batch: _BoundedStoreBatch
     ) -> tuple[list[torch.Tensor], ScratchAllocation | None, bool, Any]:
-        """Enqueue one quantized-SHM chunk's D2H gather on the copy stream.
+        """Enqueue one quantized or raw Mamba SHM chunk's scratch gather.
 
         The caller is responsible for ordering: the outer
         ``_prepare_gather_and_commit`` loop only reaches a quantized-SHM
@@ -220,13 +222,19 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         batch: _BoundedStoreBatch,
         pending: tuple[list[torch.Tensor], ScratchAllocation | None, bool, Any],
     ) -> None:
-        """Wait, split and encode one already-launched quantized-SHM chunk."""
+        """Wait for a scratch gather, then encode or copy raw data into SHM."""
         context = self._engine_driven_context
         assert isinstance(context, EngineDrivenContextShm)
         gathered, raw_allocation, used_fallback, event = pending
         event.synchronize()
         split_allocation = None
         try:
+            if not batch.plan.quantized:
+                self._copy_raw_group_chunks_into_slots(
+                    gathered,
+                    batch.group_slots[batch.start : batch.start + len(gathered)],
+                )
+                return
             mamba_splits = None
             fused_head_splits = None
             if (
@@ -289,7 +297,8 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         """
         context = self._engine_driven_context
         assert isinstance(context, EngineDrivenContextShm)
-        gathered, raw_allocation, used_fallback, _event = pending
+        gathered, raw_allocation, used_fallback, event = pending
+        event.synchronize()
         if raw_allocation is not None:
             context.free_scratch(raw_allocation)
         if used_fallback:
@@ -298,26 +307,31 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
     def _run_async_bounded_pipeline(
         self, request_id: str, batches: list[_BoundedStoreBatch]
     ) -> None:
-        """Run a cross-group depth-2 gather/process pipeline on the copy stream.
+        """Stage SHM chunks on the copy stream, encoding only quantized groups.
 
-        Every batch's D2H gather is enqueued on ``self._copy_stream`` one
-        batch ahead of its wait/split/encode, so each batch's CPU-side work
-        overlaps with the *next* batch's device-to-host copy -- including
-        across group boundaries, since ``batches`` is already flattened over
-        every quantized-SHM group in this ``submit_store`` call.
+        Consecutive quantized batches retain depth-2 gather/encode overlap.
+        Raw Mamba batches complete gather, event wait and raw SHM copy before
+        launching another batch; they have no encoding work to overlap.
         """
         if not batches:
             return
-        pending = self._launch_shm_quantized_batch(request_id, batches[0])
+        pending = None
         try:
             for i, batch in enumerate(batches):
-                next_pending = (
-                    self._launch_shm_quantized_batch(request_id, batches[i + 1])
-                    if i + 1 < len(batches)
-                    else None
-                )
-                self._process_shm_quantized_batch(request_id, batch, pending)
+                if pending is None:
+                    pending = self._launch_shm_quantized_batch(request_id, batch)
+                next_pending = None
+                if (
+                    batch.plan.quantized
+                    and i + 1 < len(batches)
+                    and batches[i + 1].plan.quantized
+                ):
+                    next_pending = self._launch_shm_quantized_batch(
+                        request_id, batches[i + 1]
+                    )
+                current = pending
                 pending = next_pending
+                self._process_shm_quantized_batch(request_id, batch, current)
         except BaseException:
             if pending is not None:
                 self._release_pending_batch(pending)
@@ -515,7 +529,13 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                             )
                             if (
                                 group_slots is not None
-                                and plan.quantized
+                                and (
+                                    plan.quantized
+                                    or (
+                                        plan.group_info is not None
+                                        and plan.group_info.cache_category == "mamba"
+                                    )
+                                )
                                 and isinstance(
                                     engine_driven_context, EngineDrivenContextShm
                                 )
@@ -549,8 +569,8 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                             # copy_'d into ``group_slots`` (this group's real
                             # SHM slots) in Phase 2.5 below, since
                             # ``EngineDrivenContextShm.commit_store`` never
-                            # transmits ``chunks`` -- only non-quantized
-                            # groups use the SHM slot directly here.
+                            # transmits ``chunks``. Raw Mamba was staged
+                            # above; other non-quantized groups use SHM directly.
                             if group_slots is not None and not plan.quantized:
                                 group_out = group_slots
                                 raw_scratch_allocation = None
@@ -571,9 +591,13 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                                 scratch_allocations.append(raw_scratch_allocation)
                             else:
                                 raw_scratch_allocation = None
+                                if plan.raw_layout_desc is None:
+                                    raise ValueError(
+                                        f"Missing raw layout for group {group_index}"
+                                    )
                                 group_out = self._alloc_pinned_staging(
                                     _raw_gather_shape(plan),
-                                    engine_driven_context.layout_desc.dtypes[0],
+                                    plan.raw_layout_desc.dtypes[0],
                                     len(selection.out_indices),
                                 )
                                 staged_chunks.extend(group_out)
@@ -766,8 +790,8 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 finally:
                     # ``staged_chunks`` (not ``used_shm_direct``) is the
                     # source of truth for what needs releasing: in SHM mode,
-                    # non-quantized groups gather straight into SHM views
-                    # (nothing staged), but quantized groups still stage into
+                    # ordinary non-quantized groups gather into SHM views
+                    # (nothing staged), but scratch-staged groups may use
                     # pinned buffers above, so ``used_shm_direct`` alone would
                     # skip releasing them back to the pool.
                     if staged_chunks:

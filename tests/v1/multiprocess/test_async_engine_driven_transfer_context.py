@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Callable
 from unittest.mock import MagicMock
@@ -678,22 +678,115 @@ def test_run_async_bounded_pipeline_frees_next_batch_scratch_on_error(
         ),
     ]
 
-    def _boom(
-        self: AsyncEngineDrivenTransferContext,
-        request_id: str,
-        batch: _BoundedStoreBatch,
-        pending: object,
-    ) -> None:
+    def fail_encode(*args: object, **kwargs: object) -> None:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(
-        AsyncEngineDrivenTransferContext, "_process_shm_quantized_batch", _boom
-    )
+    monkeypatch.setattr(ctx, "_encode_group_chunks_into_slots", fail_encode)
 
     with pytest.raises(RuntimeError, match="boom"):
         ctx._run_async_bounded_pipeline("r1", batches)
 
     # Batch 1's scratch (allocated during its lookahead launch) must have
     # been freed by the except branch even though it was never processed.
-    assert len(fake_context.freed) == 1
+    assert len(fake_context.freed) == 2
     ctx.close()
+
+
+@pytest.mark.parametrize("invalid_slot", ["dtype", "size"])
+def test_raw_mamba_copy_failure_releases_scratch_without_committing(
+    monkeypatch: pytest.MonkeyPatch, invalid_slot: str
+) -> None:
+    """A raw-copy error must not encode, commit or leak scratch."""
+    gate = threading.Event()
+    gate.set()
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gate))
+    monkeypatch.setattr(async_engine_driven, "EngineDrivenContextShm", _FakeShmContext)
+    _install_fake_gather(monkeypatch)
+    commit = MagicMock(return_value=True)
+    slot = (
+        torch.zeros(1, dtype=torch.float16)
+        if invalid_slot == "dtype"
+        else torch.zeros(2)
+    )
+    context = _FakeShmContext(commit_impl=commit, prepare_result=([slot], [0]))
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    ctx._engine_driven_context = context  # type: ignore[assignment]
+    plan = replace(
+        _make_quantized_plan(0),
+        quantized=False,
+        group_info=EngineGroupInfo(engine_group_id=0, cache_category="mamba"),
+    )
+    monkeypatch.setattr(
+        ctx,
+        "iter_transfer_groups",
+        lambda *_a, **_kw: iter([(plan, {"k": torch.zeros(1)}, [1])]),
+    )
+    codec = MagicMock()
+    ctx._kvweave_codec = codec
+    try:
+        future = ctx.submit_store(
+            "raw-copy-failure",
+            object(),
+            1,
+            {"k": torch.zeros(1)},
+            [[1]],
+            _FakeEvent(gate),
+            1,
+        )
+        assert future.result(timeout=1) is False
+        commit.assert_not_called()
+        assert codec.mock_calls == []
+        assert len(context.freed) == 1
+        assert torch.count_nonzero(slot) == 0
+    finally:
+        ctx.close()
+
+
+def test_raw_mamba_waits_for_gather_before_copy_and_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The raw SHM slot stays untouched until its gather event completes."""
+    gate = threading.Event()
+    launched = threading.Event()
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gate))
+    monkeypatch.setattr(async_engine_driven, "EngineDrivenContextShm", _FakeShmContext)
+    slot = torch.zeros(1)
+    commit = MagicMock(return_value=True)
+    context = _FakeShmContext(commit_impl=commit, prepare_result=([slot], [0]))
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    ctx._engine_driven_context = context  # type: ignore[assignment]
+    plan = replace(
+        _make_quantized_plan(0),
+        quantized=False,
+        group_info=EngineGroupInfo(engine_group_id=0, cache_category="mamba"),
+    )
+    monkeypatch.setattr(
+        ctx,
+        "iter_transfer_groups",
+        lambda *_a, **_kw: iter([(plan, {"k": torch.zeros(1)}, [1])]),
+    )
+
+    def gather(*args: object, **kwargs: Any) -> list[torch.Tensor]:
+        output = kwargs["out"]
+        output[0].fill_(7)
+        launched.set()
+        return output
+
+    monkeypatch.setattr(async_engine_driven, "gather_paged_kv_to_cpu", gather)
+    try:
+        future = ctx.submit_store(
+            "raw-wait", object(), 1, {"k": torch.zeros(1)}, [[1]], _FakeEvent(gate), 1
+        )
+        assert launched.wait(timeout=1)
+        assert not future.query()
+        assert slot.item() == 0
+        commit.assert_not_called()
+        assert context.freed == []
+        gate.set()
+        assert future.result(timeout=1) is True
+        assert slot.item() == 7
+        commit.assert_called_once_with([])
+        assert len(context.freed) == 1
+    finally:
+        gate.set()
+        ctx.close()

@@ -177,7 +177,11 @@ def _multi_layer_block_kv_transfer(
     fallback_paged_buffer: list[torch.Tensor] | None = None,
     fallback_objects: list[torch.Tensor] | None = None,
 ) -> None:
-    """Use the native transfer when its layout coverage is available."""
+    """Use native transfer only for supported XPU dtypes and compact layouts.
+
+    Byte-addressed states and strided shared-pool views use tensor-aware
+    copies so both element widths and physical page strides are preserved.
+    """
     from lmcache import device_ops
     from lmcache.v1.platform import torch_ops
 
@@ -186,10 +190,20 @@ def _multi_layer_block_kv_transfer(
     )
     if (
         device.type == "xpu"
-        and engine_kv_format != native_xpu_format
-        and engine_kv_format not in _XPU_NATIVE_VERIFIED_FORMATS
         and fallback_paged_buffer is not None
         and fallback_objects is not None
+        and (
+            (
+                engine_kv_format != native_xpu_format
+                and engine_kv_format not in _XPU_NATIVE_VERIFIED_FORMATS
+            )
+            # The SYCL binding reconstructs only 2/4-byte objects and its
+            # kernels compute tight page offsets, ignoring physical strides.
+            or any(
+                tensor.element_size() not in (2, 4) or not tensor.is_contiguous()
+                for tensor in fallback_paged_buffer
+            )
+        )
     ):
         torch_ops.multi_layer_block_kv_transfer(
             fallback_paged_buffer,
@@ -517,6 +531,37 @@ def compute_kv_layout(
     )
 
 
+def _validate_raw_transfer(
+    buffers: list[torch.Tensor],
+    expected_numel: int,
+    expected_dtype: torch.dtype,
+    block_ids: list[int],
+    num_blocks: int,
+) -> None:
+    """Validate raw-pointer transfer extents before any device work is queued."""
+    for i, buffer in enumerate(buffers):
+        if (
+            buffer.device.type != "cpu"
+            or not buffer.is_contiguous()
+            or buffer.dtype != expected_dtype
+            or buffer.numel() != expected_numel
+        ):
+            raise ValueError(
+                f"Raw transfer buffer {i} must be contiguous CPU storage with "
+                f"{expected_numel} elements of {expected_dtype} "
+                f"({expected_numel * expected_dtype.itemsize} bytes); got "
+                f"shape={tuple(buffer.shape)}, dtype={buffer.dtype}, "
+                f"device={buffer.device}, contiguous={buffer.is_contiguous()}, "
+                f"bytes={buffer.numel() * buffer.element_size()}"
+            )
+    for i, block_id in enumerate(block_ids):
+        if block_id < 0 or block_id >= num_blocks:
+            raise ValueError(
+                f"Raw transfer block ID {block_id} at index {i} is outside "
+                f"[0, {num_blocks})"
+            )
+
+
 def gather_paged_kv_to_cpu(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
@@ -553,8 +598,9 @@ def gather_paged_kv_to_cpu(
         formats ``head_size`` is the packed ``2 * head_size``.
 
     Raises:
-        ValueError: If ``out`` is provided with fewer buffers than the number
-            of gathered chunks.
+        ValueError: If ``out`` has too few buffers, an incompatible dtype,
+            size or memory layout, or selected chunks/block IDs are out of
+            bounds, or ``blocks_per_chunk`` is not positive.
     """
     # First Party
     from lmcache import device_ops
@@ -572,6 +618,8 @@ def gather_paged_kv_to_cpu(
         normalize_kv_and_discover_format,
     )
 
+    if blocks_per_chunk <= 0:
+        raise ValueError("blocks_per_chunk must be positive")
     tensors = list(kv_caches.values())
     fmt, normalized = normalize_kv_and_discover_format(
         tensors, EngineType.VLLM, layout_hints=layout_hints
@@ -608,6 +656,26 @@ def gather_paged_kv_to_cpu(
             f"out length ({len(out)}) must be at least the number of "
             f"gathered chunks ({len(iter_indices)})"
         )
+
+    selected_block_ids: list[int] = []
+    for chunk_idx in iter_indices:
+        if chunk_idx < 0 or chunk_idx >= num_chunks:
+            raise ValueError(
+                f"Gather chunk index {chunk_idx} is outside [0, {num_chunks})"
+            )
+        selected_block_ids.extend(
+            block_ids[chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk]
+        )
+    _validate_raw_transfer(
+        out[: len(iter_indices)] if out is not None else [],
+        get_kv_size(normalized, engine_kv_format)
+        * num_layers
+        * chunk_tokens
+        * content_size,
+        get_dtype(normalized, engine_kv_format),
+        selected_block_ids,
+        num_blocks,
+    )
 
     # Determine if pinned memory is strictly required
     # (only for the compiled C++ path which does not accept tensor)
@@ -693,12 +761,6 @@ def gather_paged_kv_to_cpu(
                 chunks = out
             else:
                 chunks = out[: len(iter_indices)]
-
-    selected_block_ids: list[int] = []
-    for chunk_idx in iter_indices:
-        selected_block_ids.extend(
-            block_ids[chunk_idx * blocks_per_chunk : (chunk_idx + 1) * blocks_per_chunk]
-        )
 
     if selected_block_ids:
         if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
@@ -848,15 +910,21 @@ def scatter_cpu_to_paged_kv(
 
     Raises:
         ValueError: If ``block_ids`` is shorter than
-            ``len(chunks) * blocks_per_chunk``.
+            ``len(chunks) * blocks_per_chunk``, a block ID is out of bounds,
+            a chunk's dtype, size or memory layout is incompatible, or
+            ``blocks_per_chunk`` is not positive.
     """
     # First Party
     from lmcache import device_ops
     from lmcache.v1.gpu_connector.utils import (
         get_block_size,
         get_device,
+        get_dtype,
         get_group_data_ptrs,
+        get_head_size,
+        get_kv_size,
         get_num_blocks,
+        get_num_heads,
         get_num_layers,
         make_page_buffer_shape_desc,
         normalize_kv_and_discover_format,
@@ -864,6 +932,8 @@ def scatter_cpu_to_paged_kv(
 
     if not chunks:
         return
+    if blocks_per_chunk <= 0:
+        raise ValueError("blocks_per_chunk must be positive")
     # Require enough block IDs to cover every chunk. Extra trailing block IDs
     # are ignored by the per-chunk slicing below, mirroring the gather-side
     # ``out`` length check for consistency.
@@ -917,6 +987,18 @@ def scatter_cpu_to_paged_kv(
 
     if not selected_block_ids:
         return
+
+    _validate_raw_transfer(
+        chunks,
+        get_kv_size(normalized, engine_kv_format)
+        * num_layers
+        * chunk_tokens
+        * get_num_heads(normalized, engine_kv_format)
+        * get_head_size(normalized, engine_kv_format),
+        get_dtype(normalized, engine_kv_format),
+        selected_block_ids,
+        num_blocks,
+    )
 
     # Only the ptr-only branch below pins temporaries; the tensor branch
     # hands torch the chunks directly and keeps them alive itself.
