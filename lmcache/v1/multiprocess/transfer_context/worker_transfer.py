@@ -872,7 +872,8 @@ def _decide_group_quantization(
 ) -> tuple[bool, MemoryLayoutDesc | None, MambaCodecOptions | None]:
     """Decide whether to KVWeave-quantize one group's chunks.
 
-    Attention groups are quantized when the codec's conservative size
+    Attention groups are quantized when
+    ``full_attention_quant_enabled`` is set and the codec's conservative size
     estimate is smaller than the raw chunk; MLA is excluded (single-plane
     formats are not supported by the attention codec's fused K/V layout).
     Mamba groups are quantized when the estimate does not exceed
@@ -910,6 +911,8 @@ def _decide_group_quantization(
     raw_size = _raw_chunk_byte_size(chunk_shape, dtype)
 
     if category == "attention":
+        if not kvweave_config.full_attention_quant_enabled:
+            return False, None, None
         try:
             if attention_plane_layout == AttentionPlaneLayout.SPLIT_KV:
                 if not kvweave_config.split_attention_quant_enabled:

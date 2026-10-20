@@ -573,6 +573,8 @@ class TestDecideGroupQuantization:
         [
             (AttentionPlaneLayout.SPLIT_KV, "split_attention_quant_enabled"),
             (AttentionPlaneLayout.FUSED_KV, "fused_attention_quant_enabled"),
+            (AttentionPlaneLayout.SPLIT_KV, "full_attention_quant_enabled"),
+            (AttentionPlaneLayout.FUSED_KV, "full_attention_quant_enabled"),
         ],
     )
     def test_attention_layout_debug_switch_disables_only_selected_layout(
