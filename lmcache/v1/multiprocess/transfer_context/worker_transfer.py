@@ -638,30 +638,34 @@ def _select_live_scatter_chunks(
 def _detect_group_kv_format(
     group_kv_caches: dict[str, torch.Tensor],
     layout_hints: LayoutHints | None,
-) -> Any:
-    """Detect one group's KV format, or return ``None`` if detection fails.
+) -> tuple[Any, torch.dtype | None]:
+    """Detect one group's KV format and raw dtype, or ``(None, None)`` if it fails.
 
-    Hybrid models may mix per-group KV formats, so each group's format is
-    discovered from its own tensor subset rather than reusing the
-    model-wide value.
+    Hybrid models may mix per-group KV formats and dtypes -- e.g. a Mamba
+    group's raw tensor stays the unified cache pool's byte dtype (no
+    per-layer ``spec.dtype`` view is applied for ``MambaSpec``) while an
+    attention group's tensor is viewed as its real float dtype -- so each
+    group's format/dtype is discovered from its own tensor subset rather
+    than reusing the model-wide value.
 
     Args:
         group_kv_caches: This group's KV-cache subset, keyed by layer name.
         layout_hints: Optional engine layout hints.
 
     Returns:
-        The group's ``EngineKVFormat``, or ``None`` when it cannot be
-        detected up front.
+        ``(engine_kv_format, dtype)``, or ``(None, None)`` when detection
+        fails up front.
     """
     # First Party
-    from lmcache.v1.gpu_connector.utils import normalize_kv_and_discover_format
+    from lmcache.v1.gpu_connector.utils import get_dtype, normalize_kv_and_discover_format
 
     if not group_kv_caches:
-        return None
+        return None, None
     try:
-        engine_kv_format, _normalized = normalize_kv_and_discover_format(
+        engine_kv_format, normalized = normalize_kv_and_discover_format(
             list(group_kv_caches.values()), EngineType.VLLM, layout_hints=layout_hints
         )
+        dtype = get_dtype(normalized, engine_kv_format)
     except (ValueError, RuntimeError, TypeError, IndexError):
         logger.warning(
             "Could not pre-detect the KV format for a group of %d layer(s); "
@@ -669,8 +673,8 @@ def _detect_group_kv_format(
             len(group_kv_caches),
             exc_info=True,
         )
-        return None
-    return engine_kv_format
+        return None, None
+    return engine_kv_format, dtype
 
 
 def _attention_plane_layout_for_group(
@@ -1043,14 +1047,18 @@ def _build_group_transfer_plans(
             layout_hints,
         )
         del _group_use_mla_flag
-        engine_kv_format = _detect_group_kv_format(group_kv_caches, layout_hints)
+        engine_kv_format, group_dtype = _detect_group_kv_format(
+            group_kv_caches, layout_hints
+        )
+        if group_dtype is None:
+            group_dtype = layout_desc.dtypes[0]
         attention_plane_layout = _attention_plane_layout_for_group(
             group_info, engine_kv_format
         )
         quantized, quant_layout_desc, mamba_options = _decide_group_quantization(
             group_info,
             chunk_shape,
-            layout_desc.dtypes[0],
+            group_dtype,
             group_info.tokens_per_block if group_info is not None else block_size,
             attention_plane_layout,
             kvweave_config,
@@ -1070,7 +1078,7 @@ def _build_group_transfer_plans(
                 attention_plane_layout=attention_plane_layout,
                 quantized=quantized,
                 raw_layout_desc=MemoryLayoutDesc(
-                    shapes=[chunk_shape], dtypes=[layout_desc.dtypes[0]]
+                    shapes=[chunk_shape], dtypes=[group_dtype]
                 ),
                 quant_layout_desc=quant_layout_desc,
                 mamba_options=mamba_options,
@@ -1986,6 +1994,21 @@ class EngineDrivenTransferContext(TransferContext):
             raise ValueError("mamba_splits must contain one entry per raw chunk")
         if fused_head_splits is not None and len(fused_head_splits) != len(gathered):
             raise ValueError("fused_head_splits must contain one entry per raw chunk")
+        for raw_chunk in gathered:
+            registered_dtype = (
+                plan.raw_layout_desc.dtypes[0] if plan.raw_layout_desc is not None else None
+            )
+            if raw_chunk.dtype != registered_dtype:
+                logger.warning(
+                    "DEBUG encode dtype MISMATCH: engine_group_id=%s "
+                    "category=%s raw_chunk.dtype=%s registered_dtype=%s "
+                    "raw_chunk.shape=%s",
+                    plan.group_info.engine_group_id if plan.group_info is not None else None,
+                    category,
+                    raw_chunk.dtype,
+                    registered_dtype,
+                    tuple(raw_chunk.shape),
+                )
         return [
             torch.frombuffer(
                 bytearray(
@@ -2421,6 +2444,16 @@ class EngineDrivenTransferContext(TransferContext):
         )
         raw_shape = _raw_gather_shape(plan)
         raw_dtype = plan.raw_layout_desc.dtypes[0]
+        logger.warning(
+            "DEBUG decode: engine_group_id=%s category=%s raw_shape=%s "
+            "raw_dtype=%s tokens_per_block=%s mamba_layout=%s",
+            plan.group_info.engine_group_id if plan.group_info is not None else None,
+            category,
+            raw_shape,
+            raw_dtype,
+            tokens_per_block,
+            mamba_layout,
+        )
         if out is not None and len(out) != len(group_chunks):
             raise ValueError("out must contain one tensor per retrieved chunk")
         if out is None:
