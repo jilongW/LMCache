@@ -1994,21 +1994,6 @@ class EngineDrivenTransferContext(TransferContext):
             raise ValueError("mamba_splits must contain one entry per raw chunk")
         if fused_head_splits is not None and len(fused_head_splits) != len(gathered):
             raise ValueError("fused_head_splits must contain one entry per raw chunk")
-        for raw_chunk in gathered:
-            registered_dtype = (
-                plan.raw_layout_desc.dtypes[0] if plan.raw_layout_desc is not None else None
-            )
-            if raw_chunk.dtype != registered_dtype:
-                logger.warning(
-                    "DEBUG encode dtype MISMATCH: engine_group_id=%s "
-                    "category=%s raw_chunk.dtype=%s registered_dtype=%s "
-                    "raw_chunk.shape=%s",
-                    plan.group_info.engine_group_id if plan.group_info is not None else None,
-                    category,
-                    raw_chunk.dtype,
-                    registered_dtype,
-                    tuple(raw_chunk.shape),
-                )
         return [
             torch.frombuffer(
                 bytearray(
@@ -2444,16 +2429,6 @@ class EngineDrivenTransferContext(TransferContext):
         )
         raw_shape = _raw_gather_shape(plan)
         raw_dtype = plan.raw_layout_desc.dtypes[0]
-        logger.warning(
-            "DEBUG decode: engine_group_id=%s category=%s raw_shape=%s "
-            "raw_dtype=%s tokens_per_block=%s mamba_layout=%s",
-            plan.group_info.engine_group_id if plan.group_info is not None else None,
-            category,
-            raw_shape,
-            raw_dtype,
-            tokens_per_block,
-            mamba_layout,
-        )
         if out is not None and len(out) != len(group_chunks):
             raise ValueError("out must contain one tensor per retrieved chunk")
         if out is None:
