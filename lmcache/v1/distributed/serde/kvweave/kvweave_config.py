@@ -125,7 +125,7 @@ def _env_attention_qbit() -> int:
 
 def _env_device(name: str = "LMCACHE_MP_KVWEAVE_QUANT_DEVICE") -> str:
     """Read and validate the KVWeave quant/dequant compute device."""
-    value = os.environ.get(name, "cpu").strip().lower()
+    value = os.environ.get(name, "xpu").strip().lower()
     valid = {"cpu", "xpu"}
     if value not in valid:
         raise ValueError(f"{name}={value!r} is not one of {sorted(valid)}")
