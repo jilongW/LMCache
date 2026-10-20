@@ -17,8 +17,16 @@ import torch
 
 from lmcache import torch_dev, torch_device_type
 from lmcache.lmcache_native import EngineKVFormat
+from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.distributed.serde.kvweave.kvweave_config import KVWeaveRuntimeConfig
+from lmcache.v1.distributed.serde.kvweave.kvweave_serde import KVWeaveCodec
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.transfer_context.base import (
     gather_paged_kv_to_cpu,
+    scatter_cpu_to_paged_kv,
+)
+from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+    _build_group_transfer_plans,
 )
 
 
@@ -89,6 +97,57 @@ def test_compact_block_ids_usm_round_trip() -> None:
         assert torch.equal(output[:, layer_idx], expected)
 
     print(f"steady_state_block_id_transfer_ms={elapsed_ms:.3f}", flush=True)
+
+
+def test_raw_recurrent_page_round_trip_uses_group_layout() -> None:
+    """Native D2H/H2D must use the recurrent page's width, not attention's."""
+    source = {
+        f"layer_{i}": (
+            torch.arange(6 * 2 * 4 * 4 * 32, device="xpu")
+            .reshape(6, 2, 4, 4, 32)
+            .remainder(101)
+            + i
+        ).to(torch.bfloat16)
+        for i in range(2)
+    }
+    group = EngineGroupInfo(
+        engine_group_id=0,
+        layer_indices=(0, 1),
+        tokens_per_block=4,
+        recurrent_state=True,
+        cache_category="mamba",
+    )
+    plan = _build_group_transfer_plans(
+        [group],
+        source,
+        2,
+        4,
+        MemoryLayoutDesc(shapes=[torch.Size([4, 8, 16])], dtypes=[torch.float32]),
+        4,
+        16,
+        {"kv_layout": "NHD"},
+        True,
+        KVWeaveRuntimeConfig(
+            enabled=False, linear_quant_enabled=False, linear_max_size_ratio=1.2
+        ),
+        KVWeaveCodec(),
+    )[0]
+    assert plan.chunk_shape == torch.Size([2, 2, 8, 128])
+    output = torch.empty(plan.chunk_shape, dtype=torch.bfloat16)
+    gathered = gather_paged_kv_to_cpu(
+        source, [0, 1], 2, engine_kv_format=plan.engine_kv_format, out=[output]
+    )
+    torch_dev.synchronize()
+    for i, tensor in enumerate(source.values()):
+        expected = tensor[:2].permute(1, 0, 2, 3, 4).reshape(2, 8, 128).cpu()
+        assert torch.equal(output[:, i], expected)
+    destination = {key: torch.zeros_like(value) for key, value in source.items()}
+    scatter_cpu_to_paged_kv(
+        destination, [3, 4], gathered, 2, engine_kv_format=plan.engine_kv_format
+    )
+    torch_dev.synchronize()
+    for key in source:
+        assert torch.equal(destination[key][[3, 4]], source[key][[0, 1]])
 
 
 if __name__ == "__main__":

@@ -1519,6 +1519,42 @@ def test_server_unregister_engine_driven_context_releases_pending_shm_locks(
     mock_storage.finish_read_prefetched.assert_called_once()
 
 
+@pytest.mark.parametrize("direction", ["gather", "scatter"])
+@pytest.mark.parametrize("invalid", ["size", "dtype", "strides", "block_id"])
+def test_raw_transfer_rejects_invalid_buffers_before_launch(
+    monkeypatch: pytest.MonkeyPatch, direction: str, invalid: str
+) -> None:
+    """Invalid raw buffers/addresses must never reach a pointer-only kernel."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context import base
+
+    source = _make_kv_caches()
+    expected_shape = (2, 2, 8, 16)
+    buffer = torch.zeros(expected_shape)
+    block_ids = [0, 1]
+    if invalid == "size":
+        buffer = torch.zeros(2, 2, 8, 8)
+    elif invalid == "dtype":
+        buffer = torch.zeros(expected_shape, dtype=torch.float16)
+    elif invalid == "strides":
+        buffer = buffer.transpose(-1, -2)
+    else:
+        block_ids = [0, 6]
+    launch = MagicMock()
+    monkeypatch.setattr(base, "_multi_layer_block_kv_transfer", launch)
+    monkeypatch.setattr(base, "_LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR", True)
+    with pytest.raises(ValueError, match="buffer|block ID"):
+        if direction == "gather":
+            base.gather_paged_kv_to_cpu(
+                source, block_ids, 2, layout_hints={"kv_layout": "NHD"}, out=[buffer]
+            )
+        else:
+            base.scatter_cpu_to_paged_kv(
+                source, block_ids, [buffer], 2, layout_hints={"kv_layout": "NHD"}
+            )
+    launch.assert_not_called()
+
+
 def test_gather_paged_kv_with_chunk_indices_subset() -> None:
     """gather_paged_kv_to_cpu with chunk_indices only gathers the specified chunks.
 

@@ -33,6 +33,7 @@ from lmcache.v1.gpu_connector.kv_format.specs.registry import get_spec_class
 from lmcache.v1.gpu_connector.utils import LayoutHints, get_device
 from lmcache.v1.multiprocess.custom_types import (
     RegisterEngineDrivenContextPayload,
+    SerializedMemoryLayoutDesc,
     serialize_memory_layout_desc,
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
@@ -290,7 +291,7 @@ def _group_chunk_shape(
     """Return one chunk's tensor shape and single-plane flag for a group's
     own layer count and hidden dimension.
 
-    Non-recurrent groups also get their own recomputed ``hidden_dim_size``
+    Groups with registered tensors get their own recomputed ``hidden_dim_size``
     and ``kv_size``, since hybrid groups can pack K/V differently and reusing
     the default group's width (or worker-wide single-plane flag) can mis-size
     this group's SHM chunk buffer or wrongly exclude it from quantization --
@@ -299,10 +300,9 @@ def _group_chunk_shape(
     mamba tensors alone. ``chunk_shape``'s rank is rebuilt from this group's
     own ``kv_size`` rather than borrowed from ``default_layout_desc``'s rank,
     since a hybrid worker's whole-model default detection can disagree with
-    an individual group's own plane count. Recurrent groups skip that
-    recompute: their tensor is a synthetic addressing view whose split has no
-    real hidden-dim semantics to recompute from, and ``use_mla_flag`` is
-    unused for mamba groups.
+    an individual group's own plane count. A recurrent group's synthetic
+    addressing view still defines the physical bytes copied by gather, even
+    though its head dimensions have no model-level attention semantics.
 
     Args:
         group_info: The LMCache group, or ``None`` for the single-group
@@ -318,25 +318,24 @@ def _group_chunk_shape(
 
     Returns:
         A ``(chunk_shape, group_use_mla_flag)`` tuple. ``chunk_shape`` has
-        this group's own layer count and (for non-recurrent groups) hidden
+        this group's own layer count and hidden
         dimension substituted in. ``group_use_mla_flag`` is this group's own
-        single-plane flag (``kv_size == 1``) for non-recurrent groups, or
-        ``None`` when it was not recomputed (recurrent groups and the
-        single-group fallback), in which case callers should fall back to
-        the worker-wide flag.
+        single-plane flag (``kv_size == 1``), or ``None`` for the
+        single-group fallback or a recurrent group without registered
+        tensors, in which case callers should fall back to the worker-wide flag.
     """
     default_shape = default_layout_desc.shapes[0]
     if group_info is None or not group_info.layer_indices:
         return default_shape, None
     num_layers = len(group_info.layer_indices)
-    if group_info.recurrent_state:
+    if group_info.recurrent_state and not group_kv_caches:
         if num_layers == default_num_layers:
             return default_shape, None
         layer_dim = 0 if len(default_shape) == 3 else 1
         dims = list(default_shape)
         dims[layer_dim] = num_layers
         return torch.Size(dims), None
-    _, _, hidden_dim_size, _, _, kv_size = compute_kv_layout(
+    group_block_size, _, hidden_dim_size, _, _, kv_size = compute_kv_layout(
         group_kv_caches, layout_hints=layout_hints
     )
     group_use_mla_flag = kv_size == 1
@@ -346,10 +345,13 @@ def _group_chunk_shape(
     # chunk_shape at the wrong rank for that group's real layout (e.g. a
     # single-plane group stuck with the default's dual-plane leading "2").
     tokens = int(default_shape[-2])
+    if group_info.recurrent_state and group_info.tokens_per_block:
+        tokens = tokens // group_info.tokens_per_block * group_block_size
     if (
         num_layers == default_num_layers
         and hidden_dim_size == default_hidden_dim_size
         and (len(default_shape) == 3) == group_use_mla_flag
+        and tokens == default_shape[-2]
     ):
         return default_shape, group_use_mla_flag
     dims = (
@@ -393,7 +395,8 @@ class GroupTransferPlan:
         raw_layout_desc: This group's un-quantized chunk layout (matches
             ``chunk_shape``/the KV cache dtype). Always populated -- used as
             the ``decode_chunk`` target shape/dtype regardless of whether
-            this group is quantized.
+            this group is quantized, and sent to the server to size SHM
+            slots when this group is not quantized.
         quant_layout_desc: This group's quantized wire layout (``uint8``,
             sized by ``estimate_serialized_size``/``estimate_mamba_serialized_size``).
             ``None`` unless ``quantized`` is ``True``. Sent to the server as
@@ -474,10 +477,10 @@ class GroupChunkSelection:
 
 @dataclass(frozen=True)
 class _BoundedStoreBatch:
-    """One quantized-SHM chunk's worth of work, flattened out of its group.
+    """One scratch-staged SHM chunk's work, flattened out of its group.
 
     ``EngineDrivenTransferContext._run_bounded_store_pipeline`` processes a
-    list of these spanning every quantized-SHM group in one ``submit_store``
+    list spanning quantized and raw Mamba SHM groups in one ``submit_store``
     call, so group/kv-cache/block-id/slot fields repeat across every batch
     belonging to the same group (cheap: these are references, not copies).
     """
@@ -493,7 +496,7 @@ class _BoundedStoreBatch:
 
 @dataclass
 class _GroupScratchRing:
-    """Pre-reserved scratch slots for one quantized-SHM group, reused across
+    """Pre-reserved scratch slots for one staged SHM group, reused across
     every chunk of that group within one ``_run_bounded_store_pipeline`` run.
 
     Built once per group (on its first batch) instead of allocating/freeing
@@ -638,30 +641,34 @@ def _select_live_scatter_chunks(
 def _detect_group_kv_format(
     group_kv_caches: dict[str, torch.Tensor],
     layout_hints: LayoutHints | None,
-) -> Any:
-    """Detect one group's KV format, or return ``None`` if detection fails.
+) -> tuple[Any, torch.dtype | None]:
+    """Detect one group's KV format and raw dtype, or ``(None, None)`` if it fails.
 
-    Hybrid models may mix per-group KV formats, so each group's format is
-    discovered from its own tensor subset rather than reusing the
-    model-wide value.
+    Hybrid models may mix per-group KV formats and dtypes -- e.g. a Mamba
+    group's raw tensor stays the unified cache pool's byte dtype (no
+    per-layer ``spec.dtype`` view is applied for ``MambaSpec``) while an
+    attention group's tensor is viewed as its real float dtype -- so each
+    group's format/dtype is discovered from its own tensor subset rather
+    than reusing the model-wide value.
 
     Args:
         group_kv_caches: This group's KV-cache subset, keyed by layer name.
         layout_hints: Optional engine layout hints.
 
     Returns:
-        The group's ``EngineKVFormat``, or ``None`` when it cannot be
-        detected up front.
+        ``(engine_kv_format, dtype)``, or ``(None, None)`` when detection
+        fails up front.
     """
     # First Party
-    from lmcache.v1.gpu_connector.utils import normalize_kv_and_discover_format
+    from lmcache.v1.gpu_connector.utils import get_dtype, normalize_kv_and_discover_format
 
     if not group_kv_caches:
-        return None
+        return None, None
     try:
-        engine_kv_format, _normalized = normalize_kv_and_discover_format(
+        engine_kv_format, normalized = normalize_kv_and_discover_format(
             list(group_kv_caches.values()), EngineType.VLLM, layout_hints=layout_hints
         )
+        dtype = get_dtype(normalized, engine_kv_format)
     except (ValueError, RuntimeError, TypeError, IndexError):
         logger.warning(
             "Could not pre-detect the KV format for a group of %d layer(s); "
@@ -669,8 +676,8 @@ def _detect_group_kv_format(
             len(group_kv_caches),
             exc_info=True,
         )
-        return None
-    return engine_kv_format
+        return None, None
+    return engine_kv_format, dtype
 
 
 def _attention_plane_layout_for_group(
@@ -1043,14 +1050,18 @@ def _build_group_transfer_plans(
             layout_hints,
         )
         del _group_use_mla_flag
-        engine_kv_format = _detect_group_kv_format(group_kv_caches, layout_hints)
+        engine_kv_format, group_dtype = _detect_group_kv_format(
+            group_kv_caches, layout_hints
+        )
+        if group_dtype is None:
+            group_dtype = layout_desc.dtypes[0]
         attention_plane_layout = _attention_plane_layout_for_group(
             group_info, engine_kv_format
         )
         quantized, quant_layout_desc, mamba_options = _decide_group_quantization(
             group_info,
             chunk_shape,
-            layout_desc.dtypes[0],
+            group_dtype,
             group_info.tokens_per_block if group_info is not None else block_size,
             attention_plane_layout,
             kvweave_config,
@@ -1070,7 +1081,7 @@ def _build_group_transfer_plans(
                 attention_plane_layout=attention_plane_layout,
                 quantized=quantized,
                 raw_layout_desc=MemoryLayoutDesc(
-                    shapes=[chunk_shape], dtypes=[layout_desc.dtypes[0]]
+                    shapes=[chunk_shape], dtypes=[group_dtype]
                 ),
                 quant_layout_desc=quant_layout_desc,
                 mamba_options=mamba_options,
@@ -1646,6 +1657,7 @@ class EngineDrivenTransferContext(TransferContext):
                     blocks_per_chunk=blocks_in_chunk,
                     chunk_shape=self.engine_driven_context.layout_desc.shapes[0],
                     engine_kv_format=self._engine_kv_format,
+                    raw_layout_desc=self.engine_driven_context.layout_desc,
                 ),
                 kv_caches,
                 _single_group_block_ids(block_ids),
@@ -1790,19 +1802,20 @@ class EngineDrivenTransferContext(TransferContext):
             if engine_group_infos
             else None
         )
-        # Only quantized groups carry a layout override; every other
-        # position is None so the server derives that group's layout as
-        # before (see register_kv_cache_engine_driven_context()).
-        group_layout_descs = (
-            [
-                serialize_memory_layout_desc(plan.quant_layout_desc)
-                if plan.quantized and plan.quant_layout_desc is not None
-                else None
-                for plan in self._group_plans
-            ]
-            if engine_group_infos
-            else None
-        )
+        # Raw state layouts must also override the server's attention-shaped
+        # fallback, including their own dtype and K/V plane count.
+        group_layout_descs: list[SerializedMemoryLayoutDesc | None] | None = None
+        if engine_group_infos:
+            group_layout_descs = []
+            for i, plan in enumerate(self._group_plans):
+                group_layout_desc = (
+                    plan.quant_layout_desc if plan.quantized else plan.raw_layout_desc
+                )
+                if group_layout_desc is None:
+                    raise ValueError(f"Missing transfer layout for group {i}")
+                group_layout_descs.append(
+                    serialize_memory_layout_desc(group_layout_desc)
+                )
         enable_l1_kvweave_quant = any(plan.quantized for plan in self._group_plans)
         future = req_client.register_kv_cache_engine_driven_context(
             RegisterEngineDrivenContextPayload(
@@ -2063,6 +2076,28 @@ class EngineDrivenTransferContext(TransferContext):
                 payload_tensor = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
                 slot.view(-1)[: payload_tensor.numel()].copy_(payload_tensor)
 
+    def _copy_raw_group_chunks_into_slots(
+        self,
+        gathered: list[torch.Tensor],
+        slots: list[torch.Tensor],
+    ) -> None:
+        """Copy completed raw gathers into SHM without encoding or conversion."""
+        if len(gathered) != len(slots):
+            raise ValueError("gathered chunks and raw slots must have equal length")
+        for raw_chunk, slot in zip(gathered, slots, strict=True):
+            if (
+                raw_chunk.dtype != slot.dtype
+                or raw_chunk.numel() != slot.numel()
+                or not raw_chunk.is_contiguous()
+                or not slot.is_contiguous()
+            ):
+                raise ValueError(
+                    "Raw SHM slot does not match gathered chunk: "
+                    f"slot shape={tuple(slot.shape)}, dtype={slot.dtype}; "
+                    f"gather shape={tuple(raw_chunk.shape)}, dtype={raw_chunk.dtype}"
+                )
+            slot.view(-1).copy_(raw_chunk.view(-1))
+
     def _mamba_encode_uses_direct(
         self, plan: GroupTransferPlan, raw_chunk: torch.Tensor
     ) -> bool:
@@ -2174,7 +2209,8 @@ class EngineDrivenTransferContext(TransferContext):
             fused_head_split: torch.Tensor | None = None
             split_allocation: ScratchAllocation | None = None
             if (
-                plan.group_info is not None
+                plan.quantized
+                and plan.group_info is not None
                 and plan.group_info.cache_category == "mamba"
                 and not self._mamba_encode_uses_direct(plan, raw_slots[0])
             ):
@@ -2182,7 +2218,10 @@ class EngineDrivenTransferContext(TransferContext):
                 if split is not None:
                     splits, split_allocation = split
                     mamba_split = splits[0]
-            elif plan.attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
+            elif (
+                plan.quantized
+                and plan.attention_plane_layout == AttentionPlaneLayout.FUSED_KV
+            ):
                 split = self._allocate_fused_head_split_scratch(
                     plan, 1, context, wait=False
                 )
@@ -2203,7 +2242,7 @@ class EngineDrivenTransferContext(TransferContext):
     def _bounded_gather_stage(
         self, request_id: str, batch: _BoundedStoreBatch, ring: _GroupScratchRing
     ) -> list[torch.Tensor]:
-        """Gather one quantized-SHM chunk into its ring's raw scratch slot
+        """Gather one SHM chunk into its ring's raw scratch slot
         (pipeline stage 1).
 
         Runs on the pipeline's dedicated gather executor thread (see
@@ -2232,7 +2271,7 @@ class EngineDrivenTransferContext(TransferContext):
         gathered: list[torch.Tensor],
         ring: _GroupScratchRing,
     ) -> None:
-        """Split + encode one already-gathered quantized-SHM chunk (stage 2).
+        """Encode or raw-copy one already-gathered SHM chunk (stage 2).
 
         Runs on the calling thread, concurrently with the gather executor
         thread's blocking gather of the *next* batch (see
@@ -2240,6 +2279,11 @@ class EngineDrivenTransferContext(TransferContext):
         scratch slot -- safe because encode stages for one group never
         overlap each other.
         """
+        if not batch.plan.quantized:
+            self._copy_raw_group_chunks_into_slots(
+                gathered, batch.group_slots[batch.start : batch.start + len(gathered)]
+            )
+            return
         mamba_splits: list[MambaChunkSplit] | None = None
         fused_head_splits: list[torch.Tensor] | None = None
         if ring.mamba_split is not None:
@@ -2269,7 +2313,7 @@ class EngineDrivenTransferContext(TransferContext):
     def _run_bounded_store_pipeline(
         self, request_id: str, batches: list[_BoundedStoreBatch]
     ) -> None:
-        """Process every quantized-SHM chunk in one store call.
+        """Process quantized and raw Mamba SHM chunks in one store call.
 
         Normally runs a depth-2 pipeline: batch i+1's gather (on the
         instance's resident background thread, including its
@@ -2546,19 +2590,18 @@ class EngineDrivenTransferContext(TransferContext):
                     if out_buffers is not None
                     else None
                 )
-            # A quantized group's SHM slot is sized for the *quantized*
-            # (uint8) payload, not this group's raw KV tensor shape/dtype --
-            # gathering the raw tensor straight into that slot would
-            # overflow it (see async_engine_driven.py's identical guard).
-            # Quantized groups always gather into a freshly allocated CPU
-            # buffer at the raw shape; the encoded bytes are copy_'d into
-            # ``group_slots`` (this group's real SHM slots) after encoding
-            # below, since ``EngineDrivenContextShm.commit_store`` never
-            # transmits ``chunks`` -- SHM mode only releases the write lock,
-            # so data must already be in the slot by the time it's called.
+            # Quantized groups need raw scratch before encoding; raw Mamba
+            # uses the same single-chunk gather but copies without encoding.
+            # Both populate SHM before commit_store releases write locks.
             if (
                 group_slots is not None
-                and plan.quantized
+                and (
+                    plan.quantized
+                    or (
+                        plan.group_info is not None
+                        and plan.group_info.cache_category == "mamba"
+                    )
+                )
                 and isinstance(self._engine_driven_context, EngineDrivenContextShm)
             ):
                 group_id = (
@@ -2614,7 +2657,7 @@ class EngineDrivenTransferContext(TransferContext):
                     scratch_allocation,
                 )
             )
-        # Process every quantized-SHM group's chunks, flattened across group
+        # Process staged SHM groups' chunks, flattened across group
         # boundaries, through the depth-2 gather/encode pipeline. This must
         # complete (every batch's encode landed in its SHM slot) before
         # commit_store below, same as the non-bounded path's synchronize --
@@ -2738,6 +2781,86 @@ class EngineDrivenTransferContext(TransferContext):
         future = MessagingFuture()
         future.set_result(ok)
         return future
+
+    def _scatter_raw_mamba_group(
+        self,
+        plan: GroupTransferPlan,
+        group_kv_caches: dict[str, torch.Tensor],
+        scatter_block_ids: list[int],
+        group_chunks: list[torch.Tensor],
+        skip_first_n_tokens: int,
+        chunk_positions: list[int],
+    ) -> None:
+        """Stage raw Mamba SHM chunks one at a time until H2D completes.
+
+        The caller keeps the source SHM read locks until this method returns.
+        Scratch is reused only after each chunk's scatter has synchronized.
+        """
+        if not group_chunks:
+            return
+        context = self._engine_driven_context
+        if not isinstance(context, EngineDrivenContextShm):
+            raise RuntimeError("Raw Mamba scratch retrieve requires SHM context")
+        if plan.raw_layout_desc is None:
+            raise ValueError("Raw Mamba retrieve is missing raw_layout_desc")
+        if len(scatter_block_ids) != len(group_chunks) * plan.blocks_per_chunk:
+            raise ValueError("Raw Mamba retrieve requires one block list per chunk")
+        if len(chunk_positions) != len(group_chunks):
+            raise ValueError("Raw Mamba retrieve requires one position per chunk")
+        raw_shape = _raw_gather_shape(plan)
+        scratch = context.allocate_scratch_tensors(
+            raw_shape, plan.raw_layout_desc.dtypes[0], 1, wait=False
+        )
+        if scratch is None:
+            raise RuntimeError("Raw Mamba retrieve scratch is unavailable")
+        targets, allocation = scratch
+        try:
+            for i, chunk in enumerate(group_chunks):
+                chunk_skip = max(
+                    0, skip_first_n_tokens - chunk_positions[i] * raw_shape[-2]
+                )
+                if chunk_skip >= raw_shape[-2]:
+                    continue
+                self._copy_raw_group_chunks_into_slots([chunk], targets)
+                start = i * plan.blocks_per_chunk
+                block_ids = scatter_block_ids[start : start + plan.blocks_per_chunk]
+                scatter_targets = targets
+                if chunk_skip:
+                    physical_block_size = raw_shape[-2] // plan.blocks_per_chunk
+                    skipped_blocks = chunk_skip // physical_block_size
+                    aligned_skip = skipped_blocks * physical_block_size
+                    if aligned_skip != chunk_skip:
+                        logger.error(
+                            "skip_first_n_tokens (%d) is not block-aligned "
+                            "(block_size=%d); rounding down to %d blocks",
+                            chunk_skip,
+                            physical_block_size,
+                            skipped_blocks,
+                        )
+                    if aligned_skip:
+                        compact_shape = list(raw_shape)
+                        compact_shape[-2] -= aligned_skip
+                        numel = targets[0].numel() // raw_shape[-2] * compact_shape[-2]
+                        compact = targets[0].view(-1)[:numel].view(compact_shape)
+                        compact.copy_(chunk.reshape(raw_shape)[..., aligned_skip:, :])
+                        scatter_targets = [compact]
+                        block_ids = block_ids[skipped_blocks:]
+                try:
+                    scatter_cpu_to_paged_kv(
+                        group_kv_caches,
+                        block_ids,
+                        scatter_targets,
+                        len(block_ids),
+                        skip_first_n_tokens=0,
+                        layout_hints=self._layout_hints,
+                        engine_kv_format=plan.engine_kv_format,
+                    )
+                finally:
+                    # Native H2D consumes scratch through raw pointers, including
+                    # any work submitted before a scatter exception.
+                    torch_dev.synchronize()
+        finally:
+            context.free_scratch(allocation)
 
     def _decode_and_scatter_group(
         self,
@@ -2883,8 +3006,8 @@ class EngineDrivenTransferContext(TransferContext):
                 logger.exception("Failed to decode retrieved CPU context chunks")
                 ok = False
 
-            # Raw groups scatter directly from SHM, so their read locks must
-            # stay held until the device finishes consuming the source slots.
+            # Raw groups retain SHM read locks through scatter, including
+            # single-chunk scratch staging for Mamba.
             if ok and all(plan.quantized for plan, _, _, _ in decoded_groups):
                 self._engine_driven_context.commit_retrieve(key, instance_id)
                 retrieve_committed = True
@@ -2892,12 +3015,37 @@ class EngineDrivenTransferContext(TransferContext):
             try:
                 if not ok:
                     raise RuntimeError("Skipping scatter after retrieve decode failure")
-                for (
+                for group_id, (
                     plan,
                     group_kv_caches,
                     scatter_block_ids,
                     group_chunks,
-                ) in decoded_groups:
+                ) in enumerate(decoded_groups):
+                    if (
+                        not plan.quantized
+                        and plan.group_info is not None
+                        and plan.group_info.cache_category == "mamba"
+                        and isinstance(
+                            self._engine_driven_context, EngineDrivenContextShm
+                        )
+                    ):
+                        self._scatter_raw_mamba_group(
+                            plan,
+                            group_kv_caches,
+                            scatter_block_ids,
+                            group_chunks,
+                            skip_first_n_tokens,
+                            [
+                                i
+                                for i in range(
+                                    len(transfer_groups[group_id][2])
+                                    // plan.blocks_per_chunk
+                                )
+                                if null_chunk_mask is None
+                                or not null_chunk_mask[group_id][i]
+                            ],
+                        )
+                        continue
                     scatter_cpu_to_paged_kv(
                         group_kv_caches,
                         scatter_block_ids,

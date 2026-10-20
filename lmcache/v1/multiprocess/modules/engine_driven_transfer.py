@@ -24,6 +24,7 @@ from lmcache.v1.distributed.api import (
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     RegisterEngineDrivenContextPayload,
+    SerializedMemoryLayoutDesc,
     deserialize_memory_layout_desc,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
@@ -47,7 +48,7 @@ logger = init_logger(__name__)
 
 def _linear_attention_quant_status(
     group_infos: Sequence[EngineGroupInfo],
-    group_layout_descs: Sequence[object | None] | None,
+    group_layout_descs: Sequence[SerializedMemoryLayoutDesc | None] | None,
 ) -> str:
     """Report whether this registration actually quantizes a linear group."""
     linear_group_indices = [
@@ -58,10 +59,16 @@ def _linear_attention_quant_status(
     if not linear_group_indices:
         return "n/a"
     layouts = group_layout_descs or ()
+    # Encoded payloads are flat uint8 buffers; raw Mamba addressing
+    # views can also use uint8 but retain their multidimensional shape.
     return (
         "1"
         if any(
-            idx < len(layouts) and layouts[idx] is not None
+            idx < len(layouts)
+            and (layout := layouts[idx]) is not None
+            and layout.dtypes == ["torch.uint8"]
+            and len(layout.shapes) == 1
+            and len(layout.shapes[0]) == 1
             for idx in linear_group_indices
         )
         else "0"
@@ -655,12 +662,9 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         # group's per-token width can differ from the shared hidden_dim_size.
         # Missing entries fall back to it.
         group_hidden_dim_sizes = payload.group_hidden_dim_sizes or []
-        # A quantized group's worker-supplied layout takes precedence over
-        # the server's own derivation: the quantized wire payload is
-        # variable-size uint8 bytes, not the group's raw KV dtype/shape, so
-        # SHM slots for that group must be sized off this layout (see
-        # MIGRATION_PLAN.md Phase D / docs/design/v1/multiprocess/
-        # engine_driven_transfer_design.md "KVWeave Quantization").
+        # Worker layouts are authoritative for both raw and quantized groups.
+        # Only legacy clients without an override use attention-shaped
+        # derivation, which cannot describe raw Mamba state or mixed dtypes.
         group_layout_overrides: dict[int, MemoryLayoutDesc] = {
             idx: deserialize_memory_layout_desc(serialized)
             for idx, serialized in enumerate(payload.group_layout_descs or [])

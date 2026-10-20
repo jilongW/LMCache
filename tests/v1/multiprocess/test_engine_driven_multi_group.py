@@ -21,7 +21,10 @@ from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
     KVWeaveRuntimeConfig,
 )
 from lmcache.v1.distributed.serde.kvweave.kvweave_serde import KVWeaveCodec
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.custom_types import (
+    IPCCacheServerKey,
+    deserialize_memory_layout_desc,
+)
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocols.engine import (
     RegisterEngineDrivenContextResponse,
@@ -148,6 +151,81 @@ class TestSelectGroupChunks:
 
 
 class TestGroupChunkShape:
+    @pytest.mark.parametrize("default_single_plane", [False, True])
+    @pytest.mark.parametrize("logical_block_size", [4, 8])
+    def test_recurrent_group_uses_its_own_page_geometry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        default_single_plane: bool,
+        logical_block_size: int,
+    ) -> None:
+        """Raw page geometry must match the actual gather/scatter payload."""
+        # First Party
+        from lmcache.v1.multiprocess.transfer_context import base
+        from lmcache.v1.platform import torch_ops
+
+        monkeypatch.setattr(base, "_LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR", True)
+        monkeypatch.setattr(
+            base,
+            "_multi_layer_block_kv_transfer",
+            lambda *args, **kwargs: torch_ops.multi_layer_block_kv_transfer(*args),
+        )
+        caches = {
+            f"layer_{i}": (
+                torch.arange(6 * 2 * 4 * 4 * 32).reshape(6, 2, 4, 4, 32) + i
+            ).to(torch.bfloat16)
+            for i in range(2)
+        }
+        default_shape = [4, 8, 16] if default_single_plane else [2, 4, 8, 16]
+        group = EngineGroupInfo(
+            engine_group_id=1,
+            layer_indices=(0, 1),
+            tokens_per_block=logical_block_size,
+            recurrent_state=True,
+            cache_category="mamba",
+        )
+        plans = worker_transfer._build_group_transfer_plans(
+            [group],
+            caches,
+            2,
+            4,
+            MemoryLayoutDesc(
+                shapes=[torch.Size(default_shape)], dtypes=[torch.float32]
+            ),
+            4,
+            16,
+            {"kv_layout": "NHD"},
+            default_single_plane,
+            _disabled_kvweave_config(),
+            KVWeaveCodec(),
+        )
+        plan = plans[0]
+        assert plan.raw_layout_desc is not None
+        assert plan.raw_layout_desc.shapes == [
+            torch.Size([2, 2, 8 // logical_block_size * 4, 128])
+        ]
+        assert plan.raw_layout_desc.dtypes == [torch.bfloat16]
+        output = torch.empty(plan.chunk_shape, dtype=torch.bfloat16)
+        block_ids = list(range(plan.blocks_per_chunk))
+        gathered = base.gather_paged_kv_to_cpu(
+            caches,
+            block_ids,
+            plan.blocks_per_chunk,
+            layout_hints={"kv_layout": "NHD"},
+            out=[output],
+        )
+        destination = {key: torch.zeros_like(value) for key, value in caches.items()}
+        target_ids = [block + 3 for block in block_ids]
+        base.scatter_cpu_to_paged_kv(
+            destination,
+            target_ids,
+            gathered,
+            plan.blocks_per_chunk,
+            layout_hints={"kv_layout": "NHD"},
+        )
+        for key in caches:
+            assert torch.equal(destination[key][target_ids], caches[key][block_ids])
+
     def test_none_group_returns_default_shape(self) -> None:
         layout_desc = MemoryLayoutDesc(
             shapes=[torch.Size([2, 4, 64, 16])], dtypes=[torch.float16]
@@ -806,6 +884,85 @@ def test_register_without_groups_sends_empty_group_infos(
 
     payload = req_client.register_kv_cache_engine_driven_context.call_args.args[0]
     assert payload.engine_group_infos == []
+    assert payload.group_layout_descs is None
+
+
+@pytest.mark.parametrize("quantize_attention", [False, True])
+def test_register_sends_raw_mamba_layout_with_linear_quant_disabled(
+    monkeypatch: pytest.MonkeyPatch, quantize_attention: bool
+) -> None:
+    """Registration preserves raw state shape/dtype alongside quantized KV."""
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED", "0")
+    groups = [
+        _two_groups()[0],
+        EngineGroupInfo(
+            engine_group_id=1,
+            layer_indices=(2, 3),
+            tokens_per_block=1,
+            cache_category="mamba",
+            recurrent_state=True,
+        ),
+    ]
+    raw_layouts = [
+        MemoryLayoutDesc(shapes=[torch.Size([2, 2, 8, 16])], dtypes=[torch.float32]),
+        MemoryLayoutDesc(shapes=[torch.Size([2, 8, 4096])], dtypes=[torch.uint8]),
+    ]
+    quant_layout = MemoryLayoutDesc(shapes=[torch.Size([123])], dtypes=[torch.uint8])
+    plans = [
+        worker_transfer.GroupTransferPlan(
+            group_info=group,
+            layer_indices=frozenset(group.layer_indices),
+            blocks_per_chunk=8 // group.tokens_per_block,
+            chunk_shape=raw_layout.shapes[0],
+            engine_kv_format=None,
+            raw_layout_desc=raw_layout,
+            quantized=quantize_attention and i == 0,
+            quant_layout_desc=quant_layout if quantize_attention and i == 0 else None,
+        )
+        for i, (group, raw_layout) in enumerate(zip(groups, raw_layouts, strict=True))
+    ]
+
+    def build_plans(*args: object) -> list[worker_transfer.GroupTransferPlan]:
+        config = args[-2]
+        assert isinstance(config, KVWeaveRuntimeConfig)
+        assert not config.linear_quant_enabled
+        return plans
+
+    monkeypatch.setattr(worker_transfer, "_build_group_transfer_plans", build_plans)
+    monkeypatch.setattr(
+        worker_transfer, "create_engine_driven_context", lambda *a, **k: MagicMock()
+    )
+    monkeypatch.setattr(
+        EngineDrivenTransferContext, "_warmup_kvweave_quant", lambda _: None
+    )
+    future = MagicMock()
+    future.result.return_value = RegisterEngineDrivenContextResponse()
+    req_client = MagicMock()
+    req_client.register_kv_cache_engine_driven_context.return_value = future
+    EngineDrivenTransferContext().register(
+        instance_id=1,
+        kv_caches=_make_kv_caches(4, num_blocks=8),
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        req_client=req_client,
+        mq_timeout=1.0,
+        engine_group_infos=groups,
+    )
+    payload = req_client.register_kv_cache_engine_driven_context.call_args.args[0]
+    assert payload.enable_l1_kvweave_quant == quantize_attention
+    assert payload.group_layout_descs is not None
+    expected_layouts = [
+        quant_layout if quantize_attention else raw_layouts[0],
+        raw_layouts[1],
+    ]
+    for serialized, expected in zip(
+        payload.group_layout_descs, expected_layouts, strict=True
+    ):
+        assert serialized is not None
+        actual = deserialize_memory_layout_desc(serialized)
+        assert actual.shapes == expected.shapes
+        assert actual.dtypes == expected.dtypes
 
 
 def test_submit_store_concatenates_chunks_group_major(
