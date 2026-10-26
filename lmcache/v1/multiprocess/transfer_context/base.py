@@ -631,6 +631,9 @@ def prepare_paged_fused_source(
             tensors, EngineType.VLLM, layout_hints=layout_hints
         )
         if engine_kv_format == lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS:
+            # vLLM may hand over a permuted view of NHD pages; only the
+            # normalized view has the (block, token, head, cs) shape/strides.
+            tensors = list(normalized)
             first = tensors[0]
             num_blocks, block_size, num_heads, cs = (int(d) for d in first.shape)
             expected_stride = (block_size * num_heads * cs, num_heads * cs, cs, 1)
@@ -687,13 +690,15 @@ def paged_fused_rejection_reason(
     if first.device.type != "xpu":
         return f"KV tensors are on {first.device.type}, not xpu"
     try:
-        engine_kv_format, _ = normalize_kv_and_discover_format(
+        engine_kv_format, normalized = normalize_kv_and_discover_format(
             tensors, EngineType.VLLM, layout_hints=layout_hints
         )
     except (ValueError, RuntimeError, TypeError, IndexError) as exc:
         return f"KV format discovery failed: {exc!r}"
     if engine_kv_format != lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS:
         return f"KV format is {engine_kv_format}, need NL_X_NB_BS_NH_CS"
+    tensors = list(normalized)
+    first = tensors[0]
     if first.dim() != 4:
         return f"per-layer KV has {first.dim()} dims, need 4"
     num_blocks, block_size, num_heads, cs = (int(d) for d in first.shape)
