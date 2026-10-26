@@ -179,6 +179,7 @@ def _force_quantized_split_kv(
         ),
     )
     ctx._group_plans[group_index] = forced  # noqa: SLF001
+    ctx._kvweave_enabled = True  # noqa: SLF001  (a forced quantized plan implies master on)
     return forced
 
 
@@ -196,7 +197,11 @@ def test_raw_mamba_uses_single_chunk_scratch_without_encoding(
     context_type: type[EngineDrivenTransferContext],
     global_quant: str,
 ) -> None:
-    """Selected raw pages reach SHM byte-for-byte through scratch, not a codec."""
+    """Selected raw pages reach SHM byte-for-byte, never through a codec.
+
+    Master switch on: staged one chunk at a time through scratch. Master switch
+    off: the baseline direct gather writes straight into the selected SHM slots.
+    """
     monkeypatch.setenv("LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED", "0")
     monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", global_quant)
     source = {
@@ -236,8 +241,15 @@ def test_raw_mamba_uses_single_chunk_scratch_without_encoding(
     selections: list[list[int]] = []
 
     def gather(*args, **kwargs) -> list[torch.Tensor]:
-        assert len(kwargs["out"]) == 1
-        assert kwargs["out"][0].data_ptr() not in {slot.data_ptr() for slot in slots}
+        if global_quant == "1":
+            assert len(kwargs["out"]) == 1
+            assert kwargs["out"][0].data_ptr() not in {
+                slot.data_ptr() for slot in slots
+            }
+        else:
+            assert [t.data_ptr() for t in kwargs["out"]] == [
+                slot.data_ptr() for slot in slots
+            ]
         selections.append(kwargs["chunk_indices"])
         return gather_paged_kv_to_cpu(*args, **kwargs)
 
@@ -256,7 +268,7 @@ def test_raw_mamba_uses_single_chunk_scratch_without_encoding(
             2,
         )
         assert result.result(timeout=10) is True
-        assert selections == [[0], [2]]
+        assert selections == ([[0], [2]] if global_quant == "1" else [[0, 2]])
         for slot, blocks in zip(slots, ([1, 2], [5, 6]), strict=True):
             for i, tensor in enumerate(source.values()):
                 expected = tensor[blocks].permute(1, 0, 2, 3, 4).reshape(2, 8, 128)
@@ -638,3 +650,105 @@ def test_ring_closed_after_encode_failure(shm_context_factory) -> None:
     )
     assert future.result() is True
     assert _free_ranges(context) == baseline_free_ranges
+
+
+@pytest.mark.parametrize(
+    "context_type", [EngineDrivenTransferContext, AsyncEngineDrivenTransferContext]
+)
+@pytest.mark.parametrize("skip_tokens", [0, 4, 8])
+@pytest.mark.parametrize("masked_prefix", [False, True])
+def test_raw_mamba_retrieve_master_switch_off_uses_baseline_scatter(
+    shm_context_factory,
+    monkeypatch: pytest.MonkeyPatch,
+    context_type: type[EngineDrivenTransferContext],
+    skip_tokens: int,
+    masked_prefix: bool,
+) -> None:
+    """Master switch off: raw Mamba retrieve is the baseline single scatter.
+
+    All live chunks go through one ``scatter_cpu_to_paged_kv`` call with the
+    caller's ``skip_first_n_tokens`` passed straight through, as before KVWeave.
+    Placement is only asserted for ``skip == 0``: the native scatter's own prefix
+    skip is the baseline behaviour here and is deliberately not re-implemented.
+    """
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED", "0")
+    monkeypatch.setenv("LMCACHE_MP_L1_KVWEAVE_QUANT", "0")
+    cpu_source = (
+        torch.arange(8 * 2 * 4 * 4 * 32)
+        .reshape(8, 2, 4, 4, 32)
+        .remainder(101)
+        .to(torch.bfloat16)
+    )
+    destination = {
+        f"layer_{i}": torch.zeros_like(cpu_source, device=torch_device_type)
+        for i in range(2)
+    }
+    group = EngineGroupInfo(
+        engine_group_id=0,
+        layer_indices=(0, 1),
+        tokens_per_block=4,
+        cache_category="mamba",
+        recurrent_state=True,
+    )
+    ctx, req_client, context = _register(
+        shm_context_factory,
+        destination,
+        [group],
+        2,
+        pool_size=64,
+        scratch_size=65536,
+        context_type=context_type,
+    )
+    slots = [
+        torch.stack(
+            [
+                (cpu_source[blocks] + i).permute(1, 0, 2, 3, 4).reshape(2, 8, 128)
+                for i in range(2)
+            ],
+            dim=1,
+        ).contiguous()
+        for blocks in ([1, 2], [5, 6])
+    ]
+    if masked_prefix:
+        slots = slots[1:]
+    context._build_slot_tensors = lambda _slots: slots  # noqa: SLF001
+    req_client.prepare_retrieve.return_value = _CompletedFuture(
+        PrepareRetrieveResponse(
+            success=True, data=b"", context={"slots": [{}] * len(slots)}
+        )
+    )
+    ctx._kvweave_codec = MagicMock()  # noqa: SLF001
+    scatter_calls: list[int] = []
+    skips_seen: list[int] = []
+
+    def scatter(caches, block_ids, chunks, *args, **kwargs) -> None:
+        scatter_calls.append(len(chunks))
+        skips_seen.append(kwargs.get("skip_first_n_tokens", 0))
+        assert all(chunk.data_ptr() in {s.data_ptr() for s in slots} for chunk in chunks)
+        scatter_cpu_to_paged_kv(caches, block_ids, chunks, *args, **kwargs)
+
+    monkeypatch.setattr(worker_transfer, "scatter_cpu_to_paged_kv", scatter)
+    try:
+        result = ctx.submit_retrieve(
+            "raw-retrieve-off",
+            IPCCacheServerKey.from_token_ids("m", 1, 0, list(range(16))),
+            1,
+            destination,
+            [[0, 0, 5, 6]] if masked_prefix else [[3, 4, 5, 6]],
+            None,
+            2,
+            skip_first_n_tokens=skip_tokens,
+        )
+        assert result.result(timeout=10) is True
+        assert scatter_calls == [len(slots)]
+        assert skips_seen == [skip_tokens]
+        if skip_tokens == 0:
+            for i, tensor in enumerate(destination.values()):
+                expected = torch.zeros_like(cpu_source)
+                if not masked_prefix:
+                    expected[3] = cpu_source[1] + i
+                    expected[4] = cpu_source[2] + i
+                expected[5:7] = cpu_source[5:7] + i
+                assert torch.equal(tensor.cpu(), expected)
+    finally:
+        ctx.close()

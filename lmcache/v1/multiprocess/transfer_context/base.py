@@ -18,7 +18,7 @@ from __future__ import annotations
 # Standard
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 import inspect
 import ctypes
 import threading
@@ -548,6 +548,375 @@ def _validate_raw_transfer(
             )
 
 
+@dataclass(frozen=True)
+class PagedFusedSource:
+    """Paged fused-K/V KV tensors described for in-place quantization.
+
+    Attributes:
+        layer_ptrs: int64 vector on the accelerator, one base pointer per layer.
+        block_size: Tokens per paged block.
+        block_stride_elems: Elements between consecutive blocks.
+        num_blocks: Blocks per paged tensor (valid id range ``[0, num_blocks)``).
+        dtype: Paged KV dtype.
+        hidden: Fused content width (``num_heads * packed_head_size``).
+        device: Accelerator holding the paged KV.
+    """
+
+    layer_ptrs: torch.Tensor
+    block_size: int
+    block_stride_elems: int
+    num_blocks: int
+    dtype: torch.dtype
+    hidden: int
+    device: torch.device
+
+
+@dataclass(frozen=True)
+class PagedMambaSource:
+    """Paged Mamba state pages described for in-place quantization.
+
+    Attributes:
+        layer_ptrs: int64 vector on the accelerator, one base pointer per layer.
+        page_stride_bytes: Bytes between consecutive pages (blocks).
+        page_bytes: Bytes of one page's payload (both planes).
+        num_blocks: Pages per layer tensor (valid id range ``[0, num_blocks)``).
+        block_size: Tokens per page (the physical block size).
+        device: Accelerator holding the paged state.
+    """
+
+    layer_ptrs: torch.Tensor
+    page_stride_bytes: int
+    page_bytes: int
+    num_blocks: int
+    block_size: int
+    device: torch.device
+
+
+_PAGED_FUSED_SOURCE_CACHE_LOCK = threading.Lock()
+_PAGED_FUSED_SOURCE_CACHE: dict[tuple[int, ...], PagedFusedSource | None] = {}
+
+
+def prepare_paged_fused_source(
+    kv_caches: dict[str, torch.Tensor],
+    layout_hints: LayoutHints | None = None,
+) -> PagedFusedSource | None:
+    """Describe a group's paged fused-K/V KV tensors, or ``None`` if ineligible.
+
+    Eligible only for XPU tensors in the blocks-first fused NHD format
+    (``NL_X_NB_BS_NH_CS``), contiguous per layer with identical shape/dtype.
+    Results are cached by layer pointers, which are fixed for a registered group.
+    """
+    # First Party
+    from lmcache.v1.gpu_connector.utils import (
+        get_group_data_ptrs,
+        normalize_kv_and_discover_format,
+    )
+
+    tensors = list(kv_caches.values())
+    if not tensors or tensors[0].device.type != "xpu":
+        return None
+    # Pointers alone can be reused by a later allocation with a different
+    # geometry, so the key also pins shape, strides and dtype.
+    first = tensors[0]
+    key = (
+        *(int(t.data_ptr()) for t in tensors),
+        hash((tuple(first.shape), tuple(first.stride()), first.dtype)),
+    )
+    with _PAGED_FUSED_SOURCE_CACHE_LOCK:
+        if key in _PAGED_FUSED_SOURCE_CACHE:
+            return _PAGED_FUSED_SOURCE_CACHE[key]
+    result: PagedFusedSource | None = None
+    try:
+        engine_kv_format, normalized = normalize_kv_and_discover_format(
+            tensors, EngineType.VLLM, layout_hints=layout_hints
+        )
+        if engine_kv_format == lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS:
+            first = tensors[0]
+            num_blocks, block_size, num_heads, cs = (int(d) for d in first.shape)
+            expected_stride = (block_size * num_heads * cs, num_heads * cs, cs, 1)
+            if all(
+                t.dim() == 4
+                and t.shape == first.shape
+                and t.dtype == first.dtype
+                and tuple(t.stride()) == expected_stride
+                for t in tensors
+            ):
+                layer_ptrs = _cached_xpu_long_tensor(
+                    get_group_data_ptrs(
+                        normalized, engine_kv_format, list(range(len(tensors)))
+                    ),
+                    first.device,
+                    "layer_ptrs",
+                )
+                result = PagedFusedSource(
+                    layer_ptrs=layer_ptrs,
+                    block_size=block_size,
+                    block_stride_elems=expected_stride[0],
+                    num_blocks=num_blocks,
+                    dtype=first.dtype,
+                    hidden=num_heads * cs,
+                    device=first.device,
+                )
+    except (ValueError, RuntimeError, TypeError, IndexError):
+        logger.warning(
+            "Could not describe paged fused KV for in-place quantization; "
+            "falling back to gather.",
+            exc_info=True,
+        )
+    with _PAGED_FUSED_SOURCE_CACHE_LOCK:
+        _PAGED_FUSED_SOURCE_CACHE[key] = result
+    return result
+
+
+def paged_fused_rejection_reason(
+    kv_caches: dict[str, torch.Tensor],
+    layout_hints: LayoutHints | None = None,
+) -> str:
+    """Explain why :func:`prepare_paged_fused_source` rejects a group's KV.
+
+    Returns a short human-readable reason, or ``"layout is eligible"`` when the
+    tensors themselves pass (so any rejection comes from the codec's geometry).
+    """
+    # First Party
+    from lmcache.v1.gpu_connector.utils import normalize_kv_and_discover_format
+
+    tensors = list(kv_caches.values())
+    if not tensors:
+        return "no KV tensors"
+    first = tensors[0]
+    if first.device.type != "xpu":
+        return f"KV tensors are on {first.device.type}, not xpu"
+    try:
+        engine_kv_format, _ = normalize_kv_and_discover_format(
+            tensors, EngineType.VLLM, layout_hints=layout_hints
+        )
+    except (ValueError, RuntimeError, TypeError, IndexError) as exc:
+        return f"KV format discovery failed: {exc!r}"
+    if engine_kv_format != lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS:
+        return f"KV format is {engine_kv_format}, need NL_X_NB_BS_NH_CS"
+    if first.dim() != 4:
+        return f"per-layer KV has {first.dim()} dims, need 4"
+    num_blocks, block_size, num_heads, cs = (int(d) for d in first.shape)
+    expected = (block_size * num_heads * cs, num_heads * cs, cs, 1)
+    for t in tensors:
+        if t.shape != first.shape or t.dtype != first.dtype:
+            return "layers differ in shape or dtype"
+        if tuple(t.stride()) != expected:
+            return (
+                f"per-layer KV stride {tuple(t.stride())} != contiguous {expected} "
+                f"(shape {tuple(t.shape)}, e.g. blocks padded to a shared page size)"
+            )
+    return "layout is eligible"
+
+
+_PAGED_MAMBA_SOURCE_CACHE: dict[tuple[int, ...], PagedMambaSource | None] = {}
+
+
+def prepare_paged_mamba_source(
+    kv_caches: dict[str, torch.Tensor],
+    layout_hints: LayoutHints | None = None,
+) -> PagedMambaSource | None:
+    """Describe a Mamba group's paged state pages, or ``None`` if ineligible.
+
+    Eligible only for XPU tensors in the two-plane page format
+    (``NL_X_NB_TWO_BS_NH_HS``) whose pages are contiguous with identical
+    geometry on every layer. Results are cached by layer pointers and geometry.
+    """
+    # First Party
+    from lmcache.v1.gpu_connector.utils import (
+        get_group_data_ptrs,
+        normalize_kv_and_discover_format,
+    )
+
+    tensors = list(kv_caches.values())
+    if not tensors or tensors[0].device.type != "xpu":
+        return None
+    first = tensors[0]
+    key = (
+        *(int(t.data_ptr()) for t in tensors),
+        hash((tuple(first.shape), tuple(first.stride()), first.dtype)),
+    )
+    with _PAGED_FUSED_SOURCE_CACHE_LOCK:
+        if key in _PAGED_MAMBA_SOURCE_CACHE:
+            return _PAGED_MAMBA_SOURCE_CACHE[key]
+    result: PagedMambaSource | None = None
+    try:
+        engine_kv_format, normalized = normalize_kv_and_discover_format(
+            tensors, EngineType.VLLM, layout_hints=layout_hints
+        )
+        if engine_kv_format == lmcache_native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS:
+            num_blocks, planes, block_size, num_heads, head_size = (
+                int(d) for d in first.shape
+            )
+            row = num_heads * head_size
+            inner = (block_size * row, row, head_size, 1)
+            if (
+                planes == 2
+                and all(
+                    t.dim() == 5
+                    and t.shape == first.shape
+                    and t.dtype == first.dtype
+                    and tuple(t.stride()[1:]) == inner
+                    and t.stride(0) == first.stride(0)
+                    and t.stride(0) >= 2 * block_size * row
+                    for t in tensors
+                )
+            ):
+                itemsize = first.element_size()
+                result = PagedMambaSource(
+                    layer_ptrs=_cached_xpu_long_tensor(
+                        get_group_data_ptrs(
+                            normalized, engine_kv_format, list(range(len(tensors)))
+                        ),
+                        first.device,
+                        "layer_ptrs",
+                    ),
+                    page_stride_bytes=int(first.stride(0)) * itemsize,
+                    page_bytes=2 * block_size * row * itemsize,
+                    num_blocks=num_blocks,
+                    block_size=block_size,
+                    device=first.device,
+                )
+    except (ValueError, RuntimeError, TypeError, IndexError):
+        logger.warning(
+            "Could not describe paged Mamba state for in-place quantization; "
+            "falling back to gather.",
+            exc_info=True,
+        )
+    with _PAGED_FUSED_SOURCE_CACHE_LOCK:
+        _PAGED_MAMBA_SOURCE_CACHE[key] = result
+    return result
+
+
+def paged_block_ids_tensor(block_ids: list[int], device: torch.device) -> torch.Tensor:
+    """Upload one chunk's block ids to the accelerator (cached by value)."""
+    return _cached_xpu_long_tensor(block_ids, device, "block_ids")
+
+
+@dataclass(frozen=True)
+class _BlockGeometry:
+    """Paged-KV geometry shared by gather and scatter."""
+
+    engine_kv_format: "lmcache_native.EngineKVFormat"
+    normalized: Any
+    block_size: int
+    num_layers: int
+    num_blocks: int
+    content_size: int
+    kv_size: int
+    dtype: torch.dtype
+    shape_desc: Any
+    device: torch.device
+
+
+def _block_geometry(
+    kv_caches: dict[str, torch.Tensor],
+    layout_hints: LayoutHints | None,
+    engine_kv_format: "lmcache_native.EngineKVFormat" | None,
+) -> _BlockGeometry:
+    """Detect a group's KV format and derive the geometry block transfers need."""
+    # First Party
+    from lmcache.v1.gpu_connector.utils import (
+        get_block_size,
+        get_device,
+        get_dtype,
+        get_head_size,
+        get_kv_size,
+        get_num_blocks,
+        get_num_heads,
+        get_num_layers,
+        make_page_buffer_shape_desc,
+        normalize_kv_and_discover_format,
+    )
+
+    fmt, normalized = normalize_kv_and_discover_format(
+        list(kv_caches.values()), EngineType.VLLM, layout_hints=layout_hints
+    )
+    if engine_kv_format is None:
+        engine_kv_format = fmt
+    block_size = get_block_size(normalized, engine_kv_format)
+    num_layers = get_num_layers(normalized, engine_kv_format)
+    num_blocks = get_num_blocks(normalized, engine_kv_format)
+    return _BlockGeometry(
+        engine_kv_format=engine_kv_format,
+        normalized=normalized,
+        block_size=block_size,
+        num_layers=num_layers,
+        num_blocks=num_blocks,
+        content_size=get_num_heads(normalized, engine_kv_format)
+        * get_head_size(normalized, engine_kv_format),
+        kv_size=get_kv_size(normalized, engine_kv_format),
+        dtype=get_dtype(normalized, engine_kv_format),
+        shape_desc=make_page_buffer_shape_desc(
+            normalized,
+            engine_kv_format,
+            layer_idx=0,
+            num_layers_in_group=num_layers,
+            num_blocks=num_blocks,
+            block_size=block_size,
+        ),
+        device=get_device(normalized),
+    )
+
+
+def _run_ptr_block_transfer(
+    geometry: _BlockGeometry,
+    direction: "lmcache_native.TransferDirection",
+    chunks: list[torch.Tensor],
+    selected_block_ids: list[int],
+    blocks_per_chunk: int,
+    skip_prefix_n_blocks: int = 0,
+) -> None:
+    """Run a block transfer through the compiled pointer interface.
+
+    Chunks go through in batches of at most four objects (the CUDA kernel's
+    limit); each batch gets its own slice of the block ids and chunks. A block
+    prefix to skip applies to the first batch only.
+    """
+    # First Party
+    from lmcache.v1.gpu_connector.utils import get_group_data_ptrs
+
+    device = geometry.device
+    layer_ptrs = get_group_data_ptrs(
+        geometry.normalized,
+        geometry.engine_kv_format,
+        list(range(geometry.num_layers)),
+    )
+    if device.type == "xpu":
+        paged_arg = _cached_xpu_long_tensor(layer_ptrs, device, "layer_ptrs")
+        # The XPU native binding consumes block IDs on the host and expands them
+        # into device slot mappings; uploading them here would only add a
+        # device-to-host round trip inside the binding.
+        block_ids_arg = torch.as_tensor(selected_block_ids, dtype=torch.int64)
+    else:
+        ptrs = np.array(layer_ptrs, dtype=np.uint64).view(np.int64)
+        paged_arg = torch.from_numpy(ptrs).to(device=device)
+        block_ids_arg = torch.tensor(
+            selected_block_ids, dtype=torch.int64, device=device
+        )
+    objs_arg = _tensors_to_ptrs(chunks)
+    chunk_tokens = blocks_per_chunk * geometry.block_size
+    max_objects = 4
+    for i in range(0, len(chunks), max_objects):
+        _multi_layer_block_kv_transfer(
+            paged_arg,
+            objs_arg[i : i + max_objects],
+            block_ids_arg[
+                i * blocks_per_chunk : min(
+                    (i + max_objects) * blocks_per_chunk, len(selected_block_ids)
+                )
+            ],
+            device,
+            direction,
+            geometry.shape_desc,
+            chunk_tokens,
+            geometry.engine_kv_format,
+            skip_prefix_n_blocks if i == 0 else 0,
+            fallback_paged_buffer=geometry.normalized,
+            fallback_objects=chunks[i : i + max_objects],
+        )
+
+
 def gather_paged_kv_to_cpu(
     kv_caches: dict[str, torch.Tensor],
     block_ids: list[int],
@@ -590,46 +959,18 @@ def gather_paged_kv_to_cpu(
     """
     # First Party
     from lmcache import device_ops
-    from lmcache.v1.gpu_connector.utils import (
-        get_block_size,
-        get_device,
-        get_dtype,
-        get_group_data_ptrs,
-        get_head_size,
-        get_kv_size,
-        get_num_blocks,
-        get_num_heads,
-        get_num_layers,
-        make_page_buffer_shape_desc,
-        normalize_kv_and_discover_format,
-    )
 
     if blocks_per_chunk <= 0:
         raise ValueError("blocks_per_chunk must be positive")
-    tensors = list(kv_caches.values())
-    fmt, normalized = normalize_kv_and_discover_format(
-        tensors, EngineType.VLLM, layout_hints=layout_hints
-    )
-    if engine_kv_format is None:
-        engine_kv_format = fmt
-
-    block_size = get_block_size(normalized, engine_kv_format)
-    num_layers = get_num_layers(normalized, engine_kv_format)
-    content_size = get_num_heads(normalized, engine_kv_format) * get_head_size(
-        normalized, engine_kv_format
-    )
-    num_blocks = get_num_blocks(normalized, engine_kv_format)
+    geometry = _block_geometry(kv_caches, layout_hints, engine_kv_format)
+    normalized = geometry.normalized
+    engine_kv_format = geometry.engine_kv_format
+    num_layers = geometry.num_layers
+    content_size = geometry.content_size
+    num_blocks = geometry.num_blocks
     num_chunks = len(block_ids) // blocks_per_chunk
-    chunk_tokens = blocks_per_chunk * block_size
-
-    shape_desc = make_page_buffer_shape_desc(
-        normalized,
-        engine_kv_format,
-        layer_idx=0,
-        num_layers_in_group=num_layers,
-        num_blocks=num_blocks,
-        block_size=block_size,
-    )
+    chunk_tokens = blocks_per_chunk * geometry.block_size
+    shape_desc = geometry.shape_desc
 
     iter_indices = (
         list(chunk_indices) if chunk_indices is not None else list(range(num_chunks))
@@ -654,11 +995,8 @@ def gather_paged_kv_to_cpu(
         )
     _validate_raw_transfer(
         out[: len(iter_indices)] if out is not None else [],
-        get_kv_size(normalized, engine_kv_format)
-        * num_layers
-        * chunk_tokens
-        * content_size,
-        get_dtype(normalized, engine_kv_format),
+        geometry.kv_size * num_layers * chunk_tokens * content_size,
+        geometry.dtype,
         selected_block_ids,
         num_blocks,
     )
@@ -675,11 +1013,11 @@ def gather_paged_kv_to_cpu(
     if out is None:
         # One object plane per K/V entry: MLA and fused-K/V formats
         # (kv_size == 1) store a single plane, split formats store K and V.
-        if get_kv_size(normalized, engine_kv_format) == 1:
+        if geometry.kv_size == 1:
             chunks = [
                 torch.empty(
                     (num_layers, chunk_tokens, content_size),
-                    dtype=get_dtype(normalized, engine_kv_format),
+                    dtype=geometry.dtype,
                     device=torch.device("cpu"),
                     pin_memory=requires_pinned,
                 )
@@ -689,7 +1027,7 @@ def gather_paged_kv_to_cpu(
             chunks = [
                 torch.empty(
                     (2, num_layers, chunk_tokens, content_size),
-                    dtype=get_dtype(normalized, engine_kv_format),
+                    dtype=geometry.dtype,
                     device=torch.device("cpu"),
                     pin_memory=requires_pinned,
                 )
@@ -751,16 +1089,11 @@ def gather_paged_kv_to_cpu(
     if selected_block_ids:
         if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
             # Python fallback: accepts tensor list directly for all params.
-            paged_arg = normalized
-            objs_arg = chunks
-            block_ids_arg = selected_block_ids
-
-            # call kernel in one shot
             _multi_layer_block_kv_transfer(
-                paged_arg,
-                objs_arg,
-                block_ids_arg,
-                get_device(normalized),
+                normalized,
+                chunks,
+                selected_block_ids,
+                geometry.device,
                 lmcache_native.TransferDirection.D2H,
                 shape_desc,
                 chunk_tokens,
@@ -769,68 +1102,16 @@ def gather_paged_kv_to_cpu(
                 fallback_paged_buffer=normalized,
                 fallback_objects=chunks,
             )
-
         else:
-            # Compiled C++/CUDA/XPU: requires int64 pointer tensor and list[int].
-            transfer_device = get_device(normalized)
-            layer_ptrs = get_group_data_ptrs(
-                normalized, engine_kv_format, list(range(num_layers))
+            # Compiled C++/CUDA/XPU: pointer interface; chunks are either the
+            # caller's pinned buffers or the staged copies above.
+            _run_ptr_block_transfer(
+                geometry,
+                lmcache_native.TransferDirection.D2H,
+                chunks,
+                selected_block_ids,
+                blocks_per_chunk,
             )
-            if transfer_device.type == "xpu":
-                paged_arg = _cached_xpu_long_tensor(
-                    layer_ptrs, transfer_device, "layer_ptrs"
-                )
-            else:
-                _ptrs_np = np.array(layer_ptrs, dtype=np.uint64).view(np.int64)
-                paged_arg = torch.from_numpy(_ptrs_np).to(device=transfer_device)
-
-            # This safely points to either the pre-pinned chunks
-            # OR the temporary staged_chunks
-            objs_arg = _tensors_to_ptrs(chunks)
-
-            if transfer_device.type == "xpu":
-                # The XPU native binding consumes block IDs on the host and
-                # expands them into device slot mappings. Uploading them to
-                # XPU here only creates an unnecessary device-to-host round
-                # trip inside the binding.
-                block_ids_arg = torch.as_tensor(
-                    selected_block_ids, dtype=torch.int64
-                )
-            else:
-                block_ids_arg = torch.tensor(
-                    selected_block_ids, dtype=torch.int64, device=transfer_device
-                )
-
-            # Split transfer to respect CUDA kernel's object count limitation
-            MAX_OBJECTS = 4
-            req_blocks_per_obj = blocks_per_chunk
-            total_objects = len(objs_arg)
-
-            for i in range(0, total_objects, MAX_OBJECTS):
-                # Slice object pointers and corresponding block IDs
-                batch_objs_ptrs = objs_arg[i : i + MAX_OBJECTS]
-
-                start_block = i * req_blocks_per_obj
-                end_block = min(
-                    (i + MAX_OBJECTS) * req_blocks_per_obj, len(selected_block_ids)
-                )
-                batch_blocks = block_ids_arg[start_block:end_block]
-
-                # Execute batched transfer
-                _multi_layer_block_kv_transfer(
-                    paged_arg,
-                    batch_objs_ptrs,
-                    batch_blocks,
-                    get_device(normalized),
-                    lmcache_native.TransferDirection.D2H,
-                    shape_desc,
-                    chunk_tokens,
-                    engine_kv_format,
-                    0,
-                    fallback_paged_buffer=normalized,
-                    fallback_objects=chunks,
-                )
-
 
     # --- Final reconciliation ---
     # If we used a staging buffer to protect unpinned shared memory,
@@ -900,22 +1181,6 @@ def scatter_cpu_to_paged_kv(
             a chunk's dtype, size or memory layout is incompatible, or
             ``blocks_per_chunk`` is not positive.
     """
-    # First Party
-    from lmcache import device_ops
-    from lmcache.v1.gpu_connector.utils import (
-        get_block_size,
-        get_device,
-        get_dtype,
-        get_group_data_ptrs,
-        get_head_size,
-        get_kv_size,
-        get_num_blocks,
-        get_num_heads,
-        get_num_layers,
-        make_page_buffer_shape_desc,
-        normalize_kv_and_discover_format,
-    )
-
     if not chunks:
         return
     if blocks_per_chunk <= 0:
@@ -930,16 +1195,12 @@ def scatter_cpu_to_paged_kv(
             f"({blocks_per_chunk})"
         )
 
-    tensors = list(kv_caches.values())
-    fmt, normalized = normalize_kv_and_discover_format(
-        tensors, EngineType.VLLM, layout_hints=layout_hints
-    )
-    if engine_kv_format is None:
-        engine_kv_format = fmt
-
-    block_size = get_block_size(normalized, engine_kv_format)
-    num_layers = get_num_layers(normalized, engine_kv_format)
-    num_blocks = get_num_blocks(normalized, engine_kv_format)
+    geometry = _block_geometry(kv_caches, layout_hints, engine_kv_format)
+    normalized = geometry.normalized
+    engine_kv_format = geometry.engine_kv_format
+    block_size = geometry.block_size
+    num_layers = geometry.num_layers
+    num_blocks = geometry.num_blocks
     chunk_tokens = blocks_per_chunk * block_size
 
     # Block-level transfer can only skip whole blocks. A non-aligned prefix is
@@ -956,14 +1217,7 @@ def scatter_cpu_to_paged_kv(
         )
     skip_prefix_n_blocks = skip_first_n_tokens // block_size
 
-    shape_desc = make_page_buffer_shape_desc(
-        normalized,
-        engine_kv_format,
-        layer_idx=0,
-        num_layers_in_group=num_layers,
-        num_blocks=num_blocks,
-        block_size=block_size,
-    )
+    shape_desc = geometry.shape_desc
 
     selected_block_ids: list[int] = []
     for chunk_idx in range(len(chunks)):
@@ -976,12 +1230,8 @@ def scatter_cpu_to_paged_kv(
 
     _validate_raw_transfer(
         chunks,
-        get_kv_size(normalized, engine_kv_format)
-        * num_layers
-        * chunk_tokens
-        * get_num_heads(normalized, engine_kv_format)
-        * get_head_size(normalized, engine_kv_format),
-        get_dtype(normalized, engine_kv_format),
+        geometry.kv_size * num_layers * chunk_tokens * geometry.content_size,
+        geometry.dtype,
         selected_block_ids,
         num_blocks,
     )
@@ -991,15 +1241,11 @@ def scatter_cpu_to_paged_kv(
     dynamically_pinned = False
     if _LMC_OPS_BLOCK_TRANSFER_ACCEPTS_TENSOR:
         # Python fallback: accepts tensor list directly for all params.
-        paged_arg = normalized
-        objs_arg = chunks
-        block_ids_arg = selected_block_ids
-
         _multi_layer_block_kv_transfer(
-            paged_arg,
-            objs_arg,
-            block_ids_arg,
-            get_device(normalized),
+            normalized,
+            chunks,
+            selected_block_ids,
+            geometry.device,
             lmcache_native.TransferDirection.H2D,
             shape_desc,
             chunk_tokens,
@@ -1026,54 +1272,14 @@ def scatter_cpu_to_paged_kv(
                 for chunk in chunks
             ]
 
-        # Compiled C++/CUDA/XPU: requires int64 pointer tensor and list[int].
-        _ptrs_np = np.array(
-            get_group_data_ptrs(normalized, engine_kv_format, list(range(num_layers))),
-            dtype=np.uint64,
-        ).view(np.int64)
-        paged_arg = torch.from_numpy(_ptrs_np).to(device=get_device(normalized))
-        objs_arg = _tensors_to_ptrs(chunks)
-        transfer_device = get_device(normalized)
-        if transfer_device.type == "xpu":
-            # xpu_ops reads block IDs on the host and performs the required
-            # slot-mapping upload itself; keep this tensor on CPU.
-            block_ids_arg = torch.as_tensor(selected_block_ids, dtype=torch.int64)
-        else:
-            block_ids_arg = torch.tensor(
-                selected_block_ids, dtype=torch.int64, device=transfer_device
-            )
-
-        # Batched transfer to satisfy cuda's limitation (max 4 objects)
-        MAX_OBJECTS = 4
-        req_blocks_per_obj = (
-            blocks_per_chunk  # Each chunk corresponds to one object's blocks
+        _run_ptr_block_transfer(
+            geometry,
+            lmcache_native.TransferDirection.H2D,
+            chunks,
+            selected_block_ids,
+            blocks_per_chunk,
+            skip_prefix_n_blocks,
         )
-        total_chunks = len(chunks)
-
-        for i in range(0, total_chunks, MAX_OBJECTS):
-            # Slice objects and block IDs for this batch
-            batch_objs_ptrs = objs_arg[i : i + MAX_OBJECTS]
-
-            start_block = i * req_blocks_per_obj
-            end_block = min(
-                (i + MAX_OBJECTS) * req_blocks_per_obj, len(selected_block_ids)
-            )
-            batch_blocks = block_ids_arg[start_block:end_block]
-
-            # Execute transfer for this batch
-            _multi_layer_block_kv_transfer(
-                paged_arg,
-                batch_objs_ptrs,
-                batch_blocks,
-                get_device(normalized),
-                lmcache_native.TransferDirection.H2D,
-                shape_desc,
-                chunk_tokens,
-                engine_kv_format,
-                skip_prefix_n_blocks if i == 0 else 0,
-                fallback_paged_buffer=normalized,
-                fallback_objects=chunks[i : i + MAX_OBJECTS],
-            )
 
     # Fast path: The async GPU copy might still be in progress.
     # We intentionally omit synchronization here for performance.

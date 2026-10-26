@@ -478,11 +478,33 @@ def alloc_shm_pinned_ptr(size: int, shm_name: str = "") -> int:
     _buf_registry[ptr] = buf
     _shm_registry[ptr] = shm
 
-    # Try to pin the SHM buffer for async D2H copies
-    if current_device_spec().pin_memory(ptr, size):
-        _pinned_ptr_registry[ptr] = size
+    # Try to pin the SHM buffer for async D2H copies, unless this platform only
+    # pins it in the workers (see DeviceSpec.pins_shm_pool_in_server).
+    spec = current_device_spec()
+    if spec.pins_shm_pool_in_server:
+        if spec.pin_memory(ptr, size):
+            _pinned_ptr_registry[ptr] = size
+    else:
+        _precommit_pages(ptr, min(size, spec.shm_pool_precommit_bytes))
 
     return ptr
+
+
+_MADV_POPULATE_WRITE = 23  # Linux >= 5.14
+
+
+def _precommit_pages(ptr: int, nbytes: int) -> None:
+    """Make the first ``nbytes`` of a freshly mapped segment resident (page-aligned)."""
+    nbytes = nbytes // _PAGE_SIZE * _PAGE_SIZE
+    if nbytes <= 0:
+        return
+    libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+    if libc.madvise(ctypes.c_void_p(ptr), ctypes.c_size_t(nbytes), _MADV_POPULATE_WRITE) == 0:
+        return
+    # Older kernels: touch every page instead.
+    chunk = 64 << 20
+    for offset in range(0, nbytes, chunk):
+        ctypes.memset(ptr + offset, 0, min(chunk, nbytes - offset))
 
 
 def free_shm_pinned_ptr(ptr: int, size: int = 0, shm_name: str = "") -> None:

@@ -363,6 +363,12 @@ class KVWeaveRuntimeConfig:
                 "fused_direct_dequant": _env_flag(
                     "LMCACHE_MP_KVWEAVE_FUSED_DIRECT_DEQUANT", True
                 ),
+                "paged_direct_encode": _env_flag(
+                    "LMCACHE_MP_KVWEAVE_PAGED_DIRECT_ENCODE", True
+                ),
+                "paged_direct_decode": _env_flag(
+                    "LMCACHE_MP_KVWEAVE_PAGED_DIRECT_DECODE", True
+                ),
             },
             mamba_options=MambaCodecOptions.from_env(),
         )

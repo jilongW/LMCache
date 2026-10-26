@@ -30,6 +30,10 @@ from lmcache.v1.platform import current_device_spec
 logger = init_logger(__name__)
 
 
+_MAX_PIN_SEGMENT_BYTES = 5 << 30  # lazy host-registration granularity (upper bound)
+_PAGE_BYTES = 4096
+
+
 @dataclass(frozen=True)
 class ShmSlotDescriptor:
     """Describe one tensor slot in the shared-memory pool.
@@ -107,6 +111,17 @@ class EngineDrivenContextShm(EngineDrivenContext):
         self._pinned = False
         self._pinned_ptr = 0
         self._pinned_size = 0
+        # Platforms whose server leaves the pool unpinned register only the
+        # segments a slot actually touches (see ``_ensure_slot_pinned``).
+        self._pin_lazily = not current_device_spec.pins_shm_pool_in_server
+        self._pinned_segments: dict[int, int] = {}
+        # One segment is at most 5 GiB, and never larger than the L1 region
+        # (the pool minus the trailing scratch region).
+        l1_bytes = scratch_offset if scratch_size else pool_size
+        self._pin_segment_bytes = max(
+            _PAGE_BYTES,
+            min(_MAX_PIN_SEGMENT_BYTES, l1_bytes) // _PAGE_BYTES * _PAGE_BYTES,
+        )
         self._scratch_allocator = ScratchAllocator(scratch_offset, scratch_size)
         self._scratch_offset = scratch_offset
         self._scratch_pool = (
@@ -127,7 +142,16 @@ class EngineDrivenContextShm(EngineDrivenContext):
             # the shm might be pinned on lmcache server side already
             # pin memory here is for worker side for fast DMA copy
             self._pin_shm_buffer()
-            logger.info("SHM pinned=%s for shm_name=%s", self._pinned, self._shm_name)
+            if self._pin_lazily:
+                logger.info(
+                    "SHM pinned lazily (%d MiB segments, on first use) for shm_name=%s",
+                    self._pin_segment_bytes >> 20,
+                    self._shm_name,
+                )
+            else:
+                logger.info(
+                    "SHM pinned=%s for shm_name=%s", self._pinned, self._shm_name
+                )
         except Exception:
             self._shm = None
             self._shm_buffer = None
@@ -152,6 +176,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
             raise RuntimeError(
                 f"Shared memory buffer not initialized for shm_name={self._shm_name}"
             )
+        self._ensure_slot_pinned(offset, length)
         tensor_1d = torch.frombuffer(
             self._shm_buffer, dtype=dtype, count=count, offset=offset
         )
@@ -335,6 +360,9 @@ class EngineDrivenContextShm(EngineDrivenContext):
         """
         if self._shm_buffer is None or not torch_dev.is_available():
             return
+        if self._pin_lazily:
+            # Registering commits every page, so defer to first use per segment.
+            return
         try:
             ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._shm_buffer))
         except Exception as exc:
@@ -358,8 +386,52 @@ class EngineDrivenContextShm(EngineDrivenContext):
                 self._pool_size,
             )
 
+    def prewarm_first_segment(self) -> None:
+        """Register the pool's first segment now (lazy-pin platforms only).
+
+        Slots are handed out from the start of the pool, so this moves the one-off
+        registration cost of the segment the first request will touch off that
+        request's critical path.
+        """
+        self._ensure_slot_pinned(0, 1)
+
+    def _ensure_slot_pinned(self, offset: int, length: int) -> None:
+        """Register the pool segments overlapping a slot (lazy-pin platforms only).
+
+        Segments are ``_pin_segment_bytes`` wide (<= 5 GiB, <= L1 size) and are
+        registered the first time a slot touches them, so only the part of the pool actually used is
+        committed. A failed registration is logged and that segment is left
+        unpinned (slower, still correct).
+        """
+        if not self._pin_lazily or self._shm_buffer is None or length <= 0:
+            return
+        first = offset // self._pin_segment_bytes
+        last = (offset + length - 1) // self._pin_segment_bytes
+        for segment in range(first, last + 1):
+            if segment in self._pinned_segments:
+                continue
+            start = segment * self._pin_segment_bytes
+            size = min(self._pin_segment_bytes, self._pool_size - start)
+            base = ctypes.addressof(ctypes.c_char.from_buffer(self._shm_buffer))
+            ptr = base + start
+            if current_device_spec.pin_memory(ptr, size):
+                self._pinned_segments[segment] = ptr
+                self._pinned = True
+            else:
+                self._pinned_segments[segment] = 0
+                logger.warning(
+                    "pin_memory failed for SHM segment %d of %s; copies touching "
+                    "it will be synchronous",
+                    segment,
+                    self._shm_name,
+                )
+
     def _unpin_shm_buffer(self) -> None:
         """Unpin the SHM buffer if it was previously pinned via cudaHostRegister."""
+        for ptr in self._pinned_segments.values():
+            if ptr:
+                current_device_spec.unpin_memory(ptr)
+        self._pinned_segments.clear()
         if not self._pinned or self._pinned_ptr == 0:
             return
         current_device_spec.unpin_memory(self._pinned_ptr)

@@ -115,6 +115,8 @@ class _KVWeaveCodec:
         self.native = _resolve_native(self.device)
         self.fused_direct_quant = bool(kwargs.get("fused_direct_quant", True))
         self.fused_direct_dequant = bool(kwargs.get("fused_direct_dequant", True))
+        self.paged_direct_encode = bool(kwargs.get("paged_direct_encode", True))
+        self.paged_direct_decode = bool(kwargs.get("paged_direct_decode", True))
 
     def supports_fused_direct_quant(self) -> bool:
         """Whether fused-K/V attention quantizes without a separate head split."""
@@ -127,10 +129,413 @@ class _KVWeaveCodec:
 
     def fused_quant_uses_direct(self, hidden: int, scaling_method: str | None = None) -> bool:
         """Whether ``serialize_fused_tensor`` takes the direct kernel for this
-        hidden size, in which case a pre-split ``head_split`` is never read."""
+        hidden size, in which case the heads are never split on the host."""
         method = scaling_method or self.scaling_method
         per_head_scales = method != "per_tensor" and self._fused_head_num(hidden) > 1
         return per_head_scales and self.supports_fused_direct_quant()
+
+    def _paged_fused_geometry_ok(self, hidden: int) -> bool:
+        """Whether paged in-place quant/dequant handles this fused width.
+
+        XPU, per_token scaling, per-K/V-plane heads, an RH-compatible head width,
+        and a native kernel whose SLM path fits one head row.
+        """
+        if self.device != "xpu" or self.scaling_method != "per_token":
+            return False
+        head_num = self._fused_head_num(hidden)
+        head_dim = self._fused_head_dim(hidden)
+        if head_num <= 1 or (self.rh and head_dim & (head_dim - 1)):
+            return False
+        return bool(self.native.kvweave_fused_paged_supported(head_dim))
+
+    def supports_paged_fused_encode(self, hidden: int) -> bool:
+        """Whether a fused-K/V chunk can be quantized straight from paged KV.
+
+        The caller can then skip the gather: only the quantized payload is copied
+        to host. Output bytes match :meth:`serialize_fused_tensor` on the gathered
+        chunk.
+        """
+        return (
+            self.paged_direct_encode
+            and self.quantize
+            and hasattr(self.native, "kvweave_serialize_fused_paged_direct")
+            and self._paged_fused_geometry_ok(hidden)
+        )
+
+    def supports_paged_fused_decode(self, hidden: int) -> bool:
+        """Whether a fused-K/V payload can be dequantized straight into paged KV.
+
+        The caller can then skip the dense raw decode and the scatter.
+        """
+        return (
+            self.paged_direct_decode
+            and hasattr(self.native, "kvweave_dequantize_fused_paged_direct")
+            and self._paged_fused_geometry_ok(hidden)
+        )
+
+    def serialize_fused_paged(
+        self,
+        layer_ptrs: torch.Tensor,
+        block_ids: torch.Tensor,
+        block_size: int,
+        block_stride_elems: int,
+        num_blocks: int,
+        dtype: torch.dtype,
+        hidden: int,
+        out: torch.Tensor,
+    ) -> int:
+        """Quantize one fused-K/V chunk straight from paged KV into ``out``.
+
+        Args:
+            layer_ptrs: int64 XPU vector, one paged-KV base pointer per layer.
+            block_ids: int64 XPU vector of this chunk's block ids.
+            block_size: Tokens per paged block.
+            block_stride_elems: Elements between consecutive blocks.
+            num_blocks: Number of blocks in each paged tensor (id bound).
+            dtype: Paged KV dtype.
+            hidden: Fused content width (``num_heads * 2 * head_size``).
+            out: Contiguous uint8 CPU tensor receiving the payload.
+
+        Returns:
+            Number of payload bytes written to ``out``.
+
+        Raises:
+            ValueError: If the codec cannot encode paged KV for this ``hidden``.
+        """
+        if not self.supports_paged_fused_encode(hidden):
+            raise ValueError("paged fused encode is not supported for this codec/shape")
+        shape = (int(layer_ptrs.numel()), int(block_ids.numel()) * block_size, hidden)
+        header, rh, asym, signs, perm = self._fused_quant_params(
+            dtype, shape, "per_token", per_head_scales=True
+        )
+        head_num = self._fused_head_num(hidden)
+        head_dim = self._fused_head_dim(hidden)
+        return int(
+            self.native.kvweave_serialize_fused_paged_direct(
+                layer_ptrs, block_ids, block_size, block_stride_elems, num_blocks,
+                dtype, header, self.qbit, head_num, head_dim,
+                rh=rh, asym=asym, signs=signs, perm=perm, out=out,
+            )
+        )
+
+    def deserialize_fused_paged(
+        self,
+        src: torch.Tensor,
+        layer_ptrs: torch.Tensor,
+        block_ids: torch.Tensor,
+        block_size: int,
+        block_stride_elems: int,
+        num_blocks: int,
+        skip_blocks: int,
+        dtype: torch.dtype,
+        hidden: int,
+    ) -> None:
+        """Decode a fused-K/V payload straight into paged KV.
+
+        Args:
+            src: Encoded payload (trailing padding is ignored).
+            layer_ptrs: int64 XPU vector, one paged-KV base pointer per layer.
+            block_ids: int64 XPU vector of this chunk's destination block ids.
+            block_size: Tokens per paged block.
+            block_stride_elems: Elements between consecutive blocks.
+            num_blocks: Number of blocks in each paged tensor (id bound).
+            skip_blocks: Leading blocks of the chunk to leave untouched.
+            dtype: Paged KV dtype.
+            hidden: Fused content width (``num_heads * 2 * head_size``).
+
+        Raises:
+            ValueError: If the payload is not decodable in place for this
+                destination (unsupported codec/shape, or a header that does not
+                match the paged geometry).
+        """
+        if not self.supports_paged_fused_decode(hidden):
+            raise ValueError("paged fused decode is not supported for this codec/shape")
+        payload = self._payload_u8(src)
+        parsed = self._read_fused_header(payload)
+        layers, tokens, parsed_hidden = parsed["shape"]
+        if (
+            not parsed["per_head_scales"]
+            or parsed["scaling"] != "per_token"
+            or parsed["qbit"] > 8
+            or parsed_hidden != hidden
+            or layers != int(layer_ptrs.numel())
+            or tokens != int(block_ids.numel()) * block_size
+            or parsed["head_dim"] != self._fused_head_dim(hidden)
+            or parsed["head_num"] != self._fused_head_num(hidden)
+        ):
+            raise ValueError(
+                f"fused payload (shape={parsed['shape']}, scaling={parsed['scaling']}) "
+                "does not match the paged destination"
+            )
+        q = self._payload_tail(payload, parsed["q_offset"], torch.int8)
+        signs = perm = None
+        if parsed["precond"]:
+            transform_size = self._fused_rh_transform_size(
+                tokens, hidden, parsed["head_dim"], parsed["scaling"], True
+            )
+            signs, perm = self._config.mamba_precond_tensors(transform_size)
+        self.native.kvweave_dequantize_fused_paged_direct(
+            q, parsed["scales"], layer_ptrs, block_ids, block_size,
+            block_stride_elems, num_blocks, skip_blocks, dtype, parsed["qbit"],
+            parsed["head_num"], parsed["head_dim"],
+            rh=parsed["rh"], asym=parsed["asym"], signs=signs, perm=perm,
+        )
+
+    def _paged_mamba_geometry_ok(
+        self,
+        mamba_layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout],
+        mamba_options: MambaCodecOptions,
+        blocks_per_chunk: int,
+    ) -> bool:
+        """Whether Mamba quant / dequant can read or write paged pages in place.
+
+        Needs XPU, both sub-states quantized (and ssm not in the raw-fp16
+        fallback), per_token or per_channel scaling, element-aligned sub-state
+        offsets, and every sub-state's quantization chunk to fit the kernel's SLM
+        path (or the tiny-chunk kernels).
+        """
+        if (
+            self.device != "xpu"
+            or not hasattr(self.native, "kvweave_paged_state_supported")
+            or not (mamba_options.conv_quant_enabled and mamba_options.ssm_quant_enabled)
+            or mamba_options.ssm_qbit == 16
+        ):
+            return False
+        conv_layout, ssm_layout = mamba_layout
+        split = mamba_options.conv_qkv_split
+        # (layout, scaling method, row widths): conv is quantized as three Q/K/V
+        # segments, each its own row width; ssm is a single state.
+        states = (
+            (
+                conv_layout,
+                mamba_options.conv_scaling_method,
+                (split.key_dim, split.key_dim, split.value_dim),
+            ),
+            (ssm_layout, mamba_options.ssm_scaling_method, (int(ssm_layout.shape[-1]),)),
+        )
+        for layout, method, widths in states:
+            if method not in {"per_token", "per_channel"}:
+                return False
+            itemsize = KVWeaveCodecConfig.mamba_dtype(layout.dtype_str).itemsize
+            if layout.byte_offset % itemsize or min(widths) <= 0:
+                return False
+            rows_per_page = int(np.prod(layout.shape[:-1]))
+            for width in widths:
+                chunk_size = width if method == "per_token" else blocks_per_chunk * rows_per_page
+                if not self.native.kvweave_paged_state_supported(chunk_size):
+                    return False
+        return True
+
+    def supports_paged_mamba_encode(
+        self,
+        mamba_layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout],
+        mamba_options: MambaCodecOptions,
+        blocks_per_chunk: int,
+    ) -> bool:
+        """Whether a Mamba chunk can be quantized straight from paged KV pages.
+
+        The kernel reads conv's Q/K/V segments and ssm in place (no gather, no
+        split, no raw upload) and only the payloads are copied to host.
+        """
+        return (
+            self.paged_direct_encode
+            and hasattr(self.native, "kvweave_serialize_mamba_state_paged")
+            and self._paged_mamba_geometry_ok(mamba_layout, mamba_options, blocks_per_chunk)
+        )
+
+    def supports_paged_mamba_decode(
+        self,
+        mamba_layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout],
+        mamba_options: MambaCodecOptions,
+        blocks_per_chunk: int,
+    ) -> bool:
+        """Whether a Mamba payload can be dequantized straight into paged KV pages.
+
+        Judged from the group's options, which also produced the stored payloads;
+        :meth:`deserialize_mamba_paged` re-checks the payload itself.
+        """
+        return (
+            self.paged_direct_decode
+            and hasattr(self.native, "kvweave_dequantize_mamba_state_paged")
+            and self._paged_mamba_geometry_ok(mamba_layout, mamba_options, blocks_per_chunk)
+        )
+
+    def serialize_mamba_paged_into(
+        self,
+        layer_ptrs: torch.Tensor,
+        block_ids: torch.Tensor,
+        num_blocks: int,
+        page_stride_bytes: int,
+        mamba_layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout],
+        mamba_options: MambaCodecOptions,
+        out: torch.Tensor,
+    ) -> int:
+        """Quantize one Mamba chunk straight from paged KV pages into ``out``.
+
+        Produces the same bytes as :meth:`encode_chunk` on the gathered chunk
+        (conv's Q/K/V segments and ssm, each framed exactly as there).
+
+        Args:
+            layer_ptrs: int64 XPU vector, one paged-KV base pointer per layer.
+            block_ids: int64 XPU vector of this chunk's block ids.
+            num_blocks: Number of pages in each paged tensor (id bound).
+            page_stride_bytes: Bytes between consecutive pages.
+            mamba_layout: ``(conv, ssm)`` byte layout inside one page.
+            mamba_options: Resolved Mamba codec options for this group.
+            out: Contiguous uint8 CPU tensor receiving the payload.
+
+        Returns:
+            Number of payload bytes written to ``out``.
+
+        Raises:
+            ValueError: If the codec cannot encode this chunk from paged KV.
+        """
+        blocks = int(block_ids.numel())
+        if not self.supports_paged_mamba_encode(mamba_layout, mamba_options, blocks):
+            raise ValueError("paged Mamba encode is not supported for this codec/layout")
+        layers = int(layer_ptrs.numel())
+        conv_layout, ssm_layout = mamba_layout
+        conv_dtype = KVWeaveCodecConfig.mamba_dtype(conv_layout.dtype_str)
+        conv_dim = int(conv_layout.shape[-1])
+        split = mamba_options.conv_qkv_split
+        if conv_dim != split.key_dim * 2 + split.value_dim:
+            raise ValueError(
+                f"conv_state last dim ({conv_dim}) does not match "
+                f"key_dim*2 + value_dim ({split.key_dim * 2 + split.value_dim})"
+            )
+
+        def state_payload(
+            substate: str,
+            dtype: torch.dtype,
+            tail: tuple[int, ...],
+            base_off: int,
+            row_stride_bytes: int,
+            scaling_method: str,
+            rh: bool,
+            qbit: int,
+        ) -> bytes:
+            shape = (layers, blocks, *tail)
+            header, blocks_num, heads, head_dim, signs, perm = self._mamba_state_params(
+                shape, dtype, substate, scaling_method, rh, mamba_options.asym, qbit
+            )
+            return bytes(
+                self.native.kvweave_serialize_mamba_state_paged(
+                    layer_ptrs, block_ids, num_blocks, page_stride_bytes, base_off,
+                    head_dim, row_stride_bytes, int(np.prod(tail[:-1])), dtype, header,
+                    qbit, blocks_num, heads, head_dim,
+                    rh=rh, asym=mamba_options.asym, scaling_method=scaling_method,
+                    signs=signs, perm=perm,
+                )
+            )
+
+        conv_parts = []
+        segment_start = 0
+        for width in (split.key_dim, split.key_dim, split.value_dim):
+            conv_parts.append(
+                state_payload(
+                    "conv", conv_dtype, (*conv_layout.shape[:-1], width),
+                    conv_layout.byte_offset + segment_start * conv_dtype.itemsize,
+                    conv_dim * conv_dtype.itemsize,
+                    mamba_options.conv_scaling_method, mamba_options.conv_rh,
+                    mamba_options.conv_qbit,
+                )
+            )
+            segment_start += width
+        ssm_dtype = KVWeaveCodecConfig.mamba_dtype(ssm_layout.dtype_str)
+        ssm_payload = state_payload(
+            "ssm", ssm_dtype, tuple(ssm_layout.shape), ssm_layout.byte_offset,
+            int(ssm_layout.shape[-1]) * ssm_dtype.itemsize,
+            mamba_options.ssm_scaling_method, mamba_options.ssm_rh,
+            mamba_options.ssm_qbit,
+        )
+        payload = self.pack_mamba_payloads(
+            b"\x01" + self.pack_conv_qkv_payloads(*conv_parts), b"\x01" + ssm_payload
+        )
+        return self._copy_payload_into(payload, out)
+
+    def deserialize_mamba_paged(
+        self,
+        src: torch.Tensor,
+        layer_ptrs: torch.Tensor,
+        block_ids: torch.Tensor,
+        num_blocks: int,
+        page_stride_bytes: int,
+        mamba_layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout],
+        skip_blocks: int,
+    ) -> None:
+        """Decode a Mamba payload straight into paged KV pages.
+
+        Only conv's and ssm's own bytes inside each page are written, so page
+        padding keeps its value. The first ``skip_blocks`` blocks of the chunk are
+        left untouched.
+
+        Args:
+            src: Encoded Mamba payload (trailing padding is ignored).
+            layer_ptrs: int64 XPU vector, one paged-KV base pointer per layer.
+            block_ids: int64 XPU vector of this chunk's destination block ids.
+            num_blocks: Number of pages in each paged tensor (id bound).
+            page_stride_bytes: Bytes between consecutive pages.
+            mamba_layout: ``(conv, ssm)`` byte layout inside one page.
+            skip_blocks: Leading blocks of the chunk to leave untouched.
+
+        Raises:
+            ValueError: If the payload cannot be decoded in place (a sub-state is
+                not quantized, or its header does not match the destination).
+        """
+        conv_payload, ssm_payload = self.unpack_mamba_payloads(self._tensor_bytes(src))
+        if conv_payload[0] != 1 or ssm_payload[0] != 1:
+            raise ValueError("paged Mamba decode needs both sub-states quantized")
+        conv_layout, ssm_layout = mamba_layout
+        layers = int(layer_ptrs.numel())
+        blocks = int(block_ids.numel())
+        conv_itemsize = KVWeaveCodecConfig.mamba_dtype(conv_layout.dtype_str).itemsize
+        conv_dim = int(conv_layout.shape[-1])
+
+        def decode(
+            payload: bytes, base_off: int, row_stride_bytes: int, tail: tuple[int, ...]
+        ) -> None:
+            p = self._read_mamba_substate_payload(payload)
+            shape = tuple(p["shape"])
+            if (
+                shape[0] != layers
+                or shape[1] != blocks
+                or tuple(shape[2:-1]) != tuple(tail[:-1])
+                or p["head_dim"] != shape[-1]
+                or p["qbit"] > 8
+            ):
+                raise ValueError(
+                    f"Mamba payload shape {shape} does not match the paged destination"
+                )
+            self.native.kvweave_dequantize_mamba_state_paged(
+                p["q_data"], p["scales"], layer_ptrs, block_ids, num_blocks,
+                page_stride_bytes, base_off, int(shape[-1]), row_stride_bytes,
+                int(np.prod(tail[:-1])), skip_blocks, p["output_dtype"], p["qbit"],
+                p["blocks_num"], p["head_num"], p["head_dim"],
+                rh=p["rh"], asym=p["asym"], scaling_method=p["scaling_method"],
+                signs=p["signs"], perm=p["perm"],
+            )
+
+        segment_start = 0
+        for part in self.unpack_conv_qkv_payloads(conv_payload[1:]):
+            width = int(self._read_mamba_substate_payload(part)["shape"][-1])
+            decode(
+                part,
+                conv_layout.byte_offset + segment_start * conv_itemsize,
+                conv_dim * conv_itemsize,
+                (*conv_layout.shape[:-1], width),
+            )
+            segment_start += width
+        if segment_start != conv_dim:
+            raise ValueError(
+                f"conv segments cover {segment_start} of {conv_dim} columns"
+            )
+        ssm_itemsize = KVWeaveCodecConfig.mamba_dtype(ssm_layout.dtype_str).itemsize
+        decode(
+            ssm_payload[1:],
+            ssm_layout.byte_offset,
+            int(ssm_layout.shape[-1]) * ssm_itemsize,
+            tuple(ssm_layout.shape),
+        )
 
     def supports_fused_direct_dequant(self) -> bool:
         """Whether fused-K/V attention decodes straight into the fused layout."""
@@ -417,11 +822,50 @@ class _KVWeaveCodec:
             restored = restored.squeeze(1).permute(1, 0, 2)
         dst.copy_(restored.to(dtype=dst.dtype, device=dst.device))
 
+    def _fused_quant_params(
+        self,
+        dtype: torch.dtype,
+        shape: tuple[int, int, int],
+        method: str,
+        per_head_scales: bool,
+    ) -> tuple[bytes, bool, bool, torch.Tensor | None, torch.Tensor | None]:
+        """Header and RH/asym/precond parameters for quantizing a fused chunk.
+
+        Returns:
+            ``(header, rh, asym, signs, perm)``; ``signs``/``perm`` are ``None``
+            unless preconditioning is on. Shared by every fused encode entry so
+            their payloads cannot drift apart.
+        """
+        _, tokens, hidden = shape
+        rh, asym = (False, False) if method == "per_tensor" else (self.rh, self.asym)
+        precond = rh and self.precond
+        flags = (
+            (1 if rh else 0)
+            | (2 if asym else 0)
+            | (4 if precond else 0)
+            | (8 if per_head_scales else 0)
+        )
+        header = self._config.MAGIC_QUANT_FUSED + struct.pack(
+            ">BBBBB" + "i" * len(shape),
+            self.qbit,
+            self._config.DTYPE_TO_CODE.get(dtype, 0),
+            flags,
+            self._config.SCALING_TO_CODE.get(method, 1),
+            len(shape),
+            *shape,
+        )
+        signs = perm = None
+        if precond:
+            transform_size = self._fused_rh_transform_size(
+                tokens, hidden, self._fused_head_dim(hidden), method, per_head_scales
+            )
+            signs, perm = self._config.mamba_precond_tensors(transform_size)
+        return header, rh, asym, signs, perm
+
     def serialize_fused_tensor(
         self,
         tensor: torch.Tensor,
         scaling_method: str | None = None,
-        head_split: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
     ) -> bytes | int:
         """Serialize a fused-K/V attention chunk (no leading K/V axis).
@@ -439,33 +883,13 @@ class _KVWeaveCodec:
         shape = tuple(int(dim) for dim in work.shape)
         layers, tokens, hidden = shape
         method = scaling_method or self.scaling_method
-        rh, asym = (False, False) if method == "per_tensor" else (self.rh, self.asym)
-        precond = rh and self.precond
         head_num = self._fused_head_num(hidden)
         head_dim = self._fused_head_dim(hidden)
         per_head_scales = method != "per_tensor" and head_num > 1
-        flags = (
-            (1 if rh else 0)
-            | (2 if asym else 0)
-            | (4 if precond else 0)
-            | (8 if per_head_scales else 0)
-        )
-        header = self._config.MAGIC_QUANT_FUSED + struct.pack(
-            ">BBBBB" + "i" * len(shape),
-            self.qbit,
-            self._config.DTYPE_TO_CODE.get(work.dtype, 0),
-            flags,
-            self._config.SCALING_TO_CODE.get(method, 1),
-            len(shape),
-            *shape,
+        header, rh, asym, signs, perm = self._fused_quant_params(
+            work.dtype, shape, method, per_head_scales
         )
         blocks_num = max(1, tokens // self.block_size)
-        signs = perm = None
-        if precond:
-            transform_size = self._fused_rh_transform_size(
-                tokens, hidden, head_dim, method, per_head_scales
-            )
-            signs, perm = self._config.mamba_precond_tensors(transform_size)
         if self.fused_quant_uses_direct(hidden, method):
             result = self.native.kvweave_serialize_fused_chunk_direct(
                 work, header, self.qbit, head_num, head_dim,
@@ -476,17 +900,7 @@ class _KVWeaveCodec:
         native_src = work
         native_layers = layers
         if per_head_scales:
-            expected_shape = (layers * head_num, tokens, head_dim)
-            if head_split is not None:
-                if (
-                    tuple(head_split.shape) != expected_shape
-                    or head_split.dtype != work.dtype
-                    or not head_split.is_contiguous()
-                ):
-                    raise ValueError("head_split does not match fused attention layout")
-                native_src = head_split
-            else:
-                native_src = self.split_fused_attention_heads(work, head_num, head_dim)
+            native_src = self.split_fused_attention_heads(work, head_num, head_dim)
             native_layers *= head_num
         native_kwargs = dict(
             qbit=self.qbit, blocks_num=blocks_num,
@@ -512,32 +926,22 @@ class _KVWeaveCodec:
         source: torch.Tensor,
         head_num: int,
         head_dim: int,
-        out: torch.Tensor | None = None,
         num_threads: int = 0,
     ) -> torch.Tensor:
         """Reorder fused ``[L,T,H*D]`` attention into contiguous head rows."""
         layers, tokens, hidden = map(int, source.shape)
-        expected_shape = (layers * head_num, tokens, head_dim)
         if hidden != head_num * head_dim:
             raise ValueError("fused hidden size does not match head layout")
-        if out is not None and (
-            tuple(out.shape) != expected_shape
-            or out.dtype != source.dtype
-            or not out.is_contiguous()
-        ):
-            raise ValueError("out does not match fused attention head layout")
         if kvweave_quant is not None and hasattr(kvweave_quant, "kvweave_split_fused_heads"):
             return kvweave_quant.kvweave_split_fused_heads(
-                source.contiguous(), head_num, head_dim, num_threads, out
+                source.contiguous(), head_num, head_dim, num_threads, None
             )
-        if out is None:
-            out = torch.empty(expected_shape, dtype=source.dtype)
-        out.copy_(
+        return (
             source.reshape(layers, tokens, head_num, head_dim)
             .permute(0, 2, 1, 3)
-            .reshape(expected_shape)
+            .reshape(layers * head_num, tokens, head_dim)
+            .contiguous()
         )
-        return out
 
     def deserialize_fused_tensor(self, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Decode a fused-K/V payload and restore it into the destination tensor."""
@@ -996,6 +1400,70 @@ class _KVWeaveCodec:
         return pages.view(split.conv.dtype).reshape(layers, blocks, 2, block_size, hidden_dim).permute(2, 0, 1, 3, 4).reshape(2, layers, blocks * block_size, hidden_dim).contiguous()
 
     @staticmethod
+    def _mamba_state_geometry(
+        shape: tuple[int, ...], substate: str, scaling_method: str, rh: bool
+    ) -> tuple[int, int, int, torch.Tensor | None, torch.Tensor | None]:
+        """Native geometry and RH parameters of a dense Mamba sub-state.
+
+        Returns:
+            ``(blocks_num, heads, head_dim, signs, perm)``; ``signs`` and ``perm``
+            are ``None`` unless ``rh``.
+        """
+        blocks_num, heads, head_dim, chunks = _KVWeaveCodec._mamba_layout(
+            substate, shape, scaling_method
+        )
+        signs = perm = None
+        if rh:
+            signs, perm = _KVWeaveCodec._mamba_precond_pair(
+                max(int(np.prod(shape)) // shape[0] // chunks, 1)
+            )
+        return blocks_num, heads, head_dim, signs, perm
+
+    @staticmethod
+    def _mamba_state_params(
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        substate: str,
+        scaling_method: str,
+        rh: bool,
+        asym: bool,
+        qbit: int,
+    ) -> tuple[bytes, int, int, int, torch.Tensor | None, torch.Tensor | None]:
+        """Header and native geometry for quantizing one Mamba sub-state.
+
+        Args:
+            shape: Dense sub-state shape ``(layers, blocks, *tail)``.
+            dtype: Sub-state dtype.
+            substate: ``"conv"`` or ``"ssm"``.
+            scaling_method: ``per_tensor`` / ``per_channel`` / ``per_token``.
+            rh: Whether the random Hadamard transform is on.
+            asym: Whether asymmetric quantization is on.
+            qbit: Quantization bit width.
+
+        Returns:
+            ``(header, blocks_num, heads, head_dim, signs, perm)``. ``signs`` and
+            ``perm`` are ``None`` unless ``rh``. Shared by every Mamba encode
+            entry so their payloads cannot drift apart.
+        """
+        blocks_num, heads, head_dim, signs, perm = _KVWeaveCodec._mamba_state_geometry(
+            shape, substate, scaling_method, rh
+        )
+        flags = (KVWeaveCodecConfig.MAMBA_FLAG_RH if rh else 0) | (
+            KVWeaveCodecConfig.MAMBA_FLAG_ASYM if asym else 0
+        )
+        header = KVWeaveCodecConfig.MAMBA_MAGIC + struct.pack(
+            ">BBBBBB" + "i" * len(shape),
+            qbit,
+            KVWeaveCodecConfig.DTYPE_TO_CODE[dtype],
+            flags,
+            KVWeaveCodecConfig.SCALING_TO_CODE[scaling_method],
+            KVWeaveCodecConfig.SUBSTATE_TO_CODE[substate],
+            len(shape),
+            *shape,
+        )
+        return header, blocks_num, heads, head_dim, signs, perm
+
+    @staticmethod
     def _quantize_mamba_substate_payload(
         tensor: torch.Tensor,
         *,
@@ -1018,14 +1486,9 @@ class _KVWeaveCodec:
             raise ValueError("invalid Mamba tensor or RH configuration")
         work = tensor.detach().to("cpu").contiguous()
         shape = tuple(int(dim) for dim in work.shape)
-        blocks, heads, head_dim, chunks = _KVWeaveCodec._mamba_layout(substate, shape, scaling_method)
-        signs = perm = None
-        if rh:
-            signs, perm = _KVWeaveCodec._mamba_precond_pair(
-                max(work.numel() // shape[0] // chunks, 1)
-            )
-        flags = (KVWeaveCodecConfig.MAMBA_FLAG_RH if rh else 0) | (KVWeaveCodecConfig.MAMBA_FLAG_ASYM if asym else 0)
-        header = KVWeaveCodecConfig.MAMBA_MAGIC + struct.pack(">BBBBBB" + "i" * len(shape), qbit, KVWeaveCodecConfig.DTYPE_TO_CODE[work.dtype], flags, KVWeaveCodecConfig.SCALING_TO_CODE[scaling_method], KVWeaveCodecConfig.SUBSTATE_TO_CODE[substate], len(shape), *shape)
+        header, blocks, heads, head_dim, signs, perm = _KVWeaveCodec._mamba_state_params(
+            shape, work.dtype, substate, scaling_method, rh, asym, qbit
+        )
         native = _resolve_native(device)
         payload = bytes(native.kvweave_serialize_chunk_state(
             work.view(-1), header, KVWeaveCodecConfig.next_scale_id(),
@@ -1070,22 +1533,8 @@ class _KVWeaveCodec:
         """
         ssm_dtype = KVWeaveCodecConfig.mamba_dtype(ssm_layout.dtype_str)
         shape = (layers, blocks, *ssm_layout.shape)
-        blocks_num, heads, head_dim, chunks = _KVWeaveCodec._mamba_layout(
-            "ssm", shape, scaling_method
-        )
-        signs = perm = None
-        if rh:
-            transform_size = max(int(np.prod(shape)) // shape[0] // chunks, 1)
-            signs, perm = _KVWeaveCodec._mamba_precond_pair(transform_size)
-        flags = (
-            (KVWeaveCodecConfig.MAMBA_FLAG_RH if rh else 0)
-            | (KVWeaveCodecConfig.MAMBA_FLAG_ASYM if asym else 0)
-        )
-        header = KVWeaveCodecConfig.MAMBA_MAGIC + struct.pack(
-            ">BBBBBB" + "i" * len(shape), qbit,
-            KVWeaveCodecConfig.DTYPE_TO_CODE[ssm_dtype], flags,
-            KVWeaveCodecConfig.SCALING_TO_CODE[scaling_method],
-            KVWeaveCodecConfig.SUBSTATE_TO_CODE["ssm"], len(shape), *shape,
+        header, blocks_num, heads, head_dim, signs, perm = _KVWeaveCodec._mamba_state_params(
+            shape, ssm_dtype, "ssm", scaling_method, rh, asym, qbit
         )
         is_two_plane = raw_chunk.dim() == 4 and int(raw_chunk.shape[0]) == 2
         page_bytes = block_size * raw_chunk.shape[-1] * raw_chunk.element_size()
@@ -1238,25 +1687,11 @@ class _KVWeaveCodec:
         )
         payloads: list[bytes] = []
         for _name, col_offset, seg_dim in segments:
-            shape = (layers, blocks, kernel_hist, seg_dim)
-            blocks_num, heads, head_dim, chunks = _KVWeaveCodec._mamba_layout(
-                "conv", shape, scaling_method
-            )
-            signs = perm = None
-            if rh:
-                transform_size = max(
-                    int(np.prod(shape)) // shape[0] // chunks, 1
+            header, blocks_num, heads, head_dim, signs, perm = (
+                _KVWeaveCodec._mamba_state_params(
+                    (layers, blocks, kernel_hist, seg_dim), conv_dtype, "conv",
+                    scaling_method, rh, asym, qbit,
                 )
-                signs, perm = _KVWeaveCodec._mamba_precond_pair(transform_size)
-            flags = (
-                (KVWeaveCodecConfig.MAMBA_FLAG_RH if rh else 0)
-                | (KVWeaveCodecConfig.MAMBA_FLAG_ASYM if asym else 0)
-            )
-            header = KVWeaveCodecConfig.MAMBA_MAGIC + struct.pack(
-                ">BBBBBB" + "i" * len(shape), qbit,
-                KVWeaveCodecConfig.DTYPE_TO_CODE[conv_dtype], flags,
-                KVWeaveCodecConfig.SCALING_TO_CODE[scaling_method],
-                KVWeaveCodecConfig.SUBSTATE_TO_CODE["conv"], len(shape), *shape,
             )
             payload = bytes(native.kvweave_serialize_mamba_page_substate_direct(
                 native_raw, page_bytes, conv_layout.byte_offset, conv_dim, rows_per_page,
@@ -1354,23 +1789,9 @@ class _KVWeaveCodec:
             tensor = job["tensor"]
             work = tensor.detach().to("cpu").contiguous()
             shape = tuple(int(dim) for dim in work.shape)
-            blocks, heads, head_dim, chunks = _KVWeaveCodec._mamba_layout(
-                job["substate"], shape, job["scaling_method"]
-            )
-            signs = perm = None
-            if job["rh"]:
-                signs, perm = _KVWeaveCodec._mamba_precond_pair(
-                    max(work.numel() // shape[0] // chunks, 1)
-                )
-            flags = (
-                (KVWeaveCodecConfig.MAMBA_FLAG_RH if job["rh"] else 0)
-                | (KVWeaveCodecConfig.MAMBA_FLAG_ASYM if job["asym"] else 0)
-            )
-            header = KVWeaveCodecConfig.MAMBA_MAGIC + struct.pack(
-                ">BBBBBB" + "i" * len(shape),
-                job["qbit"], KVWeaveCodecConfig.DTYPE_TO_CODE[work.dtype], flags,
-                KVWeaveCodecConfig.SCALING_TO_CODE[job["scaling_method"]],
-                KVWeaveCodecConfig.SUBSTATE_TO_CODE[job["substate"]], len(shape), *shape,
+            header, blocks, heads, head_dim, signs, perm = _KVWeaveCodec._mamba_state_params(
+                shape, work.dtype, job["substate"], job["scaling_method"],
+                job["rh"], job["asym"], job["qbit"],
             )
             works.append(work.view(-1))
             headers.append(header)
@@ -1530,15 +1951,14 @@ class _KVWeaveCodec:
             numel *= dim
         num_layers = shape[0]
         num_blocks = shape[1]
-        blocks, heads, head_dim, chunks = _KVWeaveCodec._mamba_layout(substate, shape, scaling)
+        rh = bool(flags & KVWeaveCodecConfig.MAMBA_FLAG_RH)
+        blocks, heads, head_dim, signs, perm = _KVWeaveCodec._mamba_state_geometry(
+            shape, substate, scaling, rh
+        )
         (scale_size,) = struct.unpack_from(">I", view, offset)
         offset += 4
         scales = bytes(view[offset:offset + scale_size])
         offset += scale_size
-        signs = perm = None
-        if flags & KVWeaveCodecConfig.MAMBA_FLAG_RH:
-            transform = max(torch.tensor(shape).prod().item() // shape[0] // chunks, 1)
-            signs, perm = _KVWeaveCodec._mamba_precond_pair(int(transform))
         output_dtype = KVWeaveCodecConfig.CODE_TO_DTYPE[dtype_code]
         q_data = torch.frombuffer(view[offset:], dtype=torch.int8)
         return {
@@ -2056,7 +2476,6 @@ class _KVWeaveCodec:
         raw_chunk: torch.Tensor,
         attention_plane_layout: AttentionPlaneLayout | None = None,
         mamba_split: MambaChunkSplit | None = None,
-        fused_head_split: torch.Tensor | None = None,
     ) -> bytes:
         """Encode one gathered raw chunk into its wire-quantized byte payload.
 
@@ -2173,7 +2592,7 @@ class _KVWeaveCodec:
                 ssm_payload = b"\x00" + self._tensor_bytes(split.ssm)
             return self.pack_mamba_payloads(conv_payload, ssm_payload)
         if attention_plane_layout == AttentionPlaneLayout.FUSED_KV:
-            return self.serialize_fused_tensor(raw_chunk, head_split=fused_head_split)
+            return self.serialize_fused_tensor(raw_chunk)
         return self.serialize_tensor(raw_chunk)
 
     def encode_chunk_into(
@@ -2186,7 +2605,6 @@ class _KVWeaveCodec:
         destination: torch.Tensor,
         attention_plane_layout: AttentionPlaneLayout | None = None,
         mamba_split: MambaChunkSplit | None = None,
-        fused_head_split: torch.Tensor | None = None,
     ) -> int:
         """Encode a chunk and copy its payload directly into ``destination``.
 
@@ -2202,9 +2620,7 @@ class _KVWeaveCodec:
             self._validate_cache_category_dispatch(
                 cache_category, mamba_layout, attention_plane_layout
             )
-            written = self.serialize_fused_tensor(
-                raw_chunk, head_split=fused_head_split, out=destination.view(-1)
-            )
+            written = self.serialize_fused_tensor(raw_chunk, out=destination.view(-1))
             if isinstance(written, int):
                 return written
             return self._copy_payload_into(written, destination)
@@ -2216,7 +2632,6 @@ class _KVWeaveCodec:
             raw_chunk,
             attention_plane_layout,
             mamba_split,
-            fused_head_split,
         )
         return self._copy_payload_into(payload, destination)
 
