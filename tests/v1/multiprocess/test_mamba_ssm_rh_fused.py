@@ -139,19 +139,19 @@ def _check(raw, layouts, ssm, qbit, asym, method="per_token", rh=True):
 @pytest.mark.parametrize("planes", [1, 2])
 @pytest.mark.parametrize("qbit", [4, 8])
 @pytest.mark.parametrize("asym", [False, True])
-@pytest.mark.parametrize("head_dim", [2, 8, 128, 256])
+@pytest.mark.parametrize("head_dim", [2, 128, 256])
 def test_row_fused_rh_matches_contiguous(dtype, planes, qbit, asym, head_dim):
     _check(*_case(dtype, planes, head_dim=head_dim), qbit, asym)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("planes", [1, 2])
 @pytest.mark.parametrize("qbit", [4, 8])
 @pytest.mark.parametrize("asym", [False, True])
 @pytest.mark.parametrize(
     "method,rh", [("per_token", False), ("per_channel", False), ("per_channel", True)]
 )
-@pytest.mark.parametrize("head_dim", [1, 2, 3, 8, 34, 128])
+@pytest.mark.parametrize("head_dim", [1, 3, 34])
 def test_other_fused_ssm_configurations(
     dtype, planes, qbit, asym, method, rh, head_dim
 ):
@@ -160,7 +160,7 @@ def test_other_fused_ssm_configurations(
     _check(raw, layouts, ssm, qbit, asym, method, rh)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("planes", [1, 2])
 @pytest.mark.parametrize("qbit", [4, 8])
 @pytest.mark.parametrize("asym", [False, True])

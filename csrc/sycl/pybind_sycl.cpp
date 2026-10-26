@@ -18,6 +18,7 @@
 #include "../kv_transfer_plan_types.h"
 #include "../kv_transfer_types.h"
 #include "cachegen_kernels_sycl.h"
+#include "host_register.h"
 #include "mem_kernels_sycl.h"
 
 namespace py = pybind11;
@@ -142,6 +143,12 @@ thread_local ThreadLocalBlockIdUsm g_block_id_usm;
 // already registered" error, so xpu_ops accepts them as plain ints and casts.
 // Same convention as csrc/cuda/pybind.cpp (cuda_ops).
 PYBIND11_MODULE(xpu_ops, m) {
+  // Register externally allocated host memory (such as a shared mmap region)
+  // with the active XPU context so transfers can use direct DMA.
+  m.def("xpu_host_register", &xpu_host_register, py::arg("ptr"),
+        py::arg("n_bytes"), py::call_guard<py::gil_scoped_release>());
+  m.def("xpu_host_unregister", &xpu_host_unregister, py::arg("ptr"),
+        py::call_guard<py::gil_scoped_release>());
       m.def(
                   "multi_layer_block_kv_transfer",
                   [](const torch::Tensor& paged_buffer_ptrs,

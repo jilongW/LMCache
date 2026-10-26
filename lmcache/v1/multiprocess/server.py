@@ -288,6 +288,32 @@ def _build_modules(
     ]
 
 
+def _prefer_shm_over_lazy_l1(mem_cfg, device_type: str) -> None:
+    """Keep SHM transport on XPU by turning a lazy L1 off.
+
+    The engine-driven path on XPU moves KV through the SHM-backed L1 pool, and a
+    lazy L1 allocator has no SHM segment, so ``_compute_shm_pool_info`` would
+    silently disable SHM and the transfer would fall back to pickle. Lazy defaults
+    to on, and whether it survives ``L1MemoryManagerConfig`` validation depends on
+    whether the platform can pin host memory -- XPU can once the SYCL host
+    registration backend is available. So when SHM is still requested, SHM wins.
+
+    Args:
+        mem_cfg: The L1 memory config, modified in place.
+        device_type: The worker device type (``torch_device_type``).
+    """
+    if device_type == "xpu" and mem_cfg.shm_name and mem_cfg.use_lazy:
+        logger.warning(
+            "L1 lazy allocation is incompatible with the SHM transport that "
+            "engine-driven transfer uses on XPU; disabling lazy allocation so the "
+            "full %d-byte L1 pool is allocated up front (SHM name %s). Pass "
+            '--shm-name "" to keep lazy allocation and use pickle transport.',
+            mem_cfg.size_in_bytes,
+            mem_cfg.shm_name,
+        )
+        mem_cfg.use_lazy = False
+
+
 def run_cache_server(
     mp_config: MPServerConfig,
     storage_manager_config: StorageManagerConfig,
@@ -358,6 +384,7 @@ def run_cache_server(
                     exc_info=True,
                 )
                 mem_cfg.shm_name = ""
+        _prefer_shm_over_lazy_l1(mem_cfg, torch_device_type)
 
     # blend engine: full per-chunk SWA KV (blended chunks reuse at arbitrary
     # positions). full_sw_kv widens attention groups only; recurrent groups

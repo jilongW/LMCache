@@ -211,41 +211,6 @@ def test_qwen35_fused_attention_direct_matches_split_path(scaling_method, precon
     assert abs(mse_direct - mse_split) <= 1e-3 * mse_split
 
 
-@pytest.mark.parametrize("fused_direct_quant", [True, False])
-def test_fused_direct_quant_skips_head_split_scratch(fused_direct_quant):
-    from types import SimpleNamespace
-
-    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
-        EngineDrivenTransferContext,
-    )
-
-    codec = _codec(
-        num_kv_heads=4, head_dim=256, scaling_method="per_token",
-        fused_direct_quant=fused_direct_quant,
-    )
-    if fused_direct_quant and not codec.supports_fused_direct_quant():
-        pytest.skip("kvweave native build lacks kvweave_serialize_fused_chunk_direct")
-    allocations = []
-
-    class _Context:
-        def allocate_scratch_tensors(self, shape, dtype, count, wait):
-            allocations.append(tuple(shape))
-            return [torch.empty(shape, dtype=dtype)] * count, object()
-
-    plan = SimpleNamespace(
-        raw_layout_desc=MemoryLayoutDesc([torch.Size((8, 64, 2048))], [torch.float16]),
-        attention_plane_layout=AttentionPlaneLayout.FUSED_KV,
-    )
-    result = EngineDrivenTransferContext._allocate_fused_head_split_scratch(
-        SimpleNamespace(_kvweave_codec=codec), plan, 1, _Context(), wait=False
-    )
-
-    assert codec.fused_quant_uses_direct(2048) is fused_direct_quant
-    if fused_direct_quant:
-        assert result is None and not allocations
-    else:
-        assert result is not None and allocations == [(64, 64, 256)]
-
 def test_rejects_non_kv_shape():
     with pytest.raises(ValueError, match="KVWeave"):
         _codec().serialize_tensor(torch.randn(1, 64, 8))

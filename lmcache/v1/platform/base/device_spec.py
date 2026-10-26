@@ -168,6 +168,29 @@ class DeviceSpec:
         return None
 
     @property
+    def pins_shm_pool_in_server(self) -> bool:
+        """Whether the server pins its SHM-backed L1 pool when it allocates it.
+
+        Pinning registers (and so commits) every page of the pool at once. A
+        platform returns ``False`` when only the *workers* DMA to and from the pool
+        -- each pins its own mapping when it registers -- so the server leaves the
+        new segment unpinned and its pages are committed when a worker registers
+        rather than at server startup.
+        """
+        return True
+
+    @property
+    def shm_pool_precommit_bytes(self) -> int:
+        """Bytes at the start of an unpinned SHM pool the server commits up front.
+
+        Only consulted when :attr:`pins_shm_pool_in_server` is ``False``. Workers
+        then register (pin) the pool segment by segment on demand; having the
+        first part's pages already resident makes that first registration cheap.
+        ``0`` leaves the whole pool uncommitted until workers touch it.
+        """
+        return 0
+
+    @property
     def ipc_wrapper_cls(self) -> type[DeviceIPCWrapper] | None:
         """:class:`DeviceIPCWrapper` subclass used to ship KV tensors across
         the multiprocess wire for this device, or ``None`` when the

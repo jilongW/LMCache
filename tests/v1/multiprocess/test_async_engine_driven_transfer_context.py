@@ -20,7 +20,8 @@ from lmcache.v1.multiprocess.transfer_context import (
 from lmcache.v1.multiprocess.transfer_context.async_engine_driven import (
     AsyncEngineDrivenTransferContext,
 )
-from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.distributed.serde.kvweave.kvweave_config import AttentionPlaneLayout
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo, MambaSubStateWireLayout
 from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
     EngineDrivenTransferContext,
     GroupTransferPlan,
@@ -569,6 +570,7 @@ def test_submit_store_pipelines_across_quantized_shm_groups(
     monkeypatch.setattr(async_engine_driven, "EngineDrivenContextShm", _FakeShmContext)
 
     ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    ctx._kvweave_enabled = True  # quantized plans imply the master switch is on
     fake_context = _FakeShmContext(
         commit_impl=lambda _c: True,
         prepare_result=([torch.zeros(1, dtype=torch.uint8) for _ in range(2)], [0, 1]),
@@ -607,7 +609,6 @@ def test_submit_store_pipelines_across_quantized_shm_groups(
         gathered: list[torch.Tensor],
         slots: list[torch.Tensor],
         mamba_splits: object = None,
-        fused_head_splits: object = None,
     ) -> None:
         assert plan.group_info is not None
         slots[0].fill_(plan.group_info.engine_group_id + 1)
@@ -711,6 +712,7 @@ def test_raw_mamba_copy_failure_releases_scratch_without_committing(
     context = _FakeShmContext(commit_impl=commit, prepare_result=([slot], [0]))
     ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
     ctx._engine_driven_context = context  # type: ignore[assignment]
+    ctx._kvweave_enabled = True  # master switch on: raw Mamba stages via scratch
     plan = replace(
         _make_quantized_plan(0),
         quantized=False,
@@ -755,6 +757,7 @@ def test_raw_mamba_waits_for_gather_before_copy_and_commit(
     context = _FakeShmContext(commit_impl=commit, prepare_result=([slot], [0]))
     ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
     ctx._engine_driven_context = context  # type: ignore[assignment]
+    ctx._kvweave_enabled = True  # master switch on: raw Mamba stages via scratch
     plan = replace(
         _make_quantized_plan(0),
         quantized=False,
@@ -790,3 +793,186 @@ def test_raw_mamba_waits_for_gather_before_copy_and_commit(
     finally:
         gate.set()
         ctx.close()
+
+
+def test_paged_fused_quantized_group_skips_gather_and_encodes_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An eligible fused-K/V group is quantized straight from paged KV.
+
+    No raw gather may run; the codec receives the chunk's own block ids and the
+    group's SHM slot, and the payload lands in that slot.
+    """
+    gather_gate = threading.Event()
+    gather_gate.set()
+    gather_calls: list[object] = []
+    encode_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
+    monkeypatch.setattr(async_engine_driven, "EngineDrivenContextShm", _FakeShmContext)
+    monkeypatch.setattr(
+        async_engine_driven,
+        "gather_paged_kv_to_cpu",
+        lambda *a, **kw: gather_calls.append((a, kw)),
+    )
+    source = async_engine_driven.PagedFusedSource(
+        layer_ptrs=torch.zeros(2, dtype=torch.int64),
+        block_size=16,
+        block_stride_elems=1024,
+        num_blocks=8,
+        dtype=torch.bfloat16,
+        hidden=64,
+        device=torch.device("cpu"),
+    )
+    monkeypatch.setattr(
+        worker_transfer, "prepare_paged_fused_source", lambda *_a, **_kw: source
+    )
+    monkeypatch.setattr(
+        async_engine_driven,
+        "paged_block_ids_tensor",
+        lambda ids, _device: torch.tensor(ids, dtype=torch.int64),
+    )
+
+    class _PagedCodec:
+        def supports_paged_fused_encode(self, hidden: int) -> bool:
+            return hidden == 64
+
+        def serialize_fused_paged(
+            self,
+            layer_ptrs: torch.Tensor,
+            block_ids: torch.Tensor,
+            block_size: int,
+            block_stride_elems: int,
+            num_blocks: int,
+            dtype: torch.dtype,
+            hidden: int,
+            out: torch.Tensor,
+        ) -> int:
+            encode_calls.append({"block_ids": block_ids.tolist(), "out": out})
+            out.fill_(7)
+            return int(out.numel())
+
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    ctx._kvweave_enabled = True  # quantized plans imply the master switch is on
+    ctx._kvweave_codec = _PagedCodec()  # type: ignore[assignment]
+    slot = torch.zeros(4, dtype=torch.uint8)
+    fake_context = _FakeShmContext(
+        commit_impl=lambda _c: True, prepare_result=([slot], [0])
+    )
+    ctx._engine_driven_context = fake_context  # type: ignore[assignment]
+
+    plan = replace(
+        _make_quantized_plan(0),
+        blocks_per_chunk=2,
+        attention_plane_layout=AttentionPlaneLayout.FUSED_KV,
+    )
+    monkeypatch.setattr(
+        ctx,
+        "iter_transfer_groups",
+        lambda *_a, **_kw: iter([(plan, {"k": torch.zeros(1)}, [3, 5])]),
+    )
+
+    future = ctx.submit_store(
+        "r1", object(), 1, {"k": torch.zeros(1)}, [[3, 5]], _FakeEvent(gather_gate), 2
+    )
+    assert future.result(timeout=1) is True
+
+    assert gather_calls == []
+    assert [call["block_ids"] for call in encode_calls] == [[3, 5]]
+    assert slot.tolist() == [7, 7, 7, 7]
+    ctx.close()
+
+
+def test_paged_mamba_quantized_group_skips_gather_and_encodes_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quantized Mamba group on XPU is quantized straight from its pages.
+
+    No raw gather may run; the codec receives the chunk's own block ids and the
+    group's real conv/ssm layout, and writes the payload into the group's slot.
+    """
+    gather_gate = threading.Event()
+    gather_gate.set()
+    gather_calls: list[object] = []
+    encode_calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(async_engine_driven, "torch_dev", _FakeTorchDev(gather_gate))
+    monkeypatch.setattr(async_engine_driven, "EngineDrivenContextShm", _FakeShmContext)
+    monkeypatch.setattr(
+        async_engine_driven,
+        "gather_paged_kv_to_cpu",
+        lambda *a, **kw: gather_calls.append((a, kw)),
+    )
+    layout = (
+        MambaSubStateWireLayout(0, 8, "torch.float16", (2, 2)),
+        MambaSubStateWireLayout(8, 16, "torch.float32", (2, 2)),
+    )
+    source = async_engine_driven.PagedMambaSource(
+        layer_ptrs=torch.zeros(2, dtype=torch.int64),
+        page_stride_bytes=4096,
+        page_bytes=1024,
+        num_blocks=8,
+        block_size=4,
+        device=torch.device("cpu"),
+    )
+    monkeypatch.setattr(
+        worker_transfer, "prepare_paged_mamba_source", lambda *_a, **_kw: source
+    )
+    monkeypatch.setattr(
+        async_engine_driven,
+        "paged_block_ids_tensor",
+        lambda ids, _device: torch.tensor(ids, dtype=torch.int64),
+    )
+
+    class _MambaPagedCodec:
+        def supports_paged_mamba_encode(self, mamba_layout, options, blocks) -> bool:
+            return blocks == 2 and mamba_layout is layout
+
+        def serialize_mamba_paged_into(
+            self,
+            layer_ptrs: torch.Tensor,
+            block_ids: torch.Tensor,
+            num_blocks: int,
+            page_stride_bytes: int,
+            mamba_layout: object,
+            options: object,
+            out: torch.Tensor,
+        ) -> int:
+            encode_calls.append({"block_ids": block_ids.tolist(), "layout": mamba_layout})
+            out.fill_(9)
+            return int(out.numel())
+
+    ctx = AsyncEngineDrivenTransferContext(commit_workers=1)
+    ctx._kvweave_enabled = True  # quantized plans imply the master switch is on
+    ctx._kvweave_codec = _MambaPagedCodec()  # type: ignore[assignment]
+    slot = torch.zeros(4, dtype=torch.uint8)
+    ctx._engine_driven_context = _FakeShmContext(  # type: ignore[assignment]
+        commit_impl=lambda _c: True, prepare_result=([slot], [0])
+    )
+    plan = replace(
+        _make_quantized_plan(0),
+        blocks_per_chunk=2,
+        group_info=EngineGroupInfo(
+            engine_group_id=0,
+            cache_category="mamba",
+            tokens_per_block=4,
+            mamba_real_layout=layout,
+        ),
+        mamba_options=MagicMock(),
+    )
+    monkeypatch.setattr(
+        ctx,
+        "iter_transfer_groups",
+        lambda *_a, **_kw: iter([(plan, {"k": torch.zeros(1)}, [3, 5])]),
+    )
+
+    future = ctx.submit_store(
+        "r1", object(), 1, {"k": torch.zeros(1)}, [[3, 5]], _FakeEvent(gather_gate), 2
+    )
+    assert future.result(timeout=1) is True
+
+    assert gather_calls == []
+    assert [call["block_ids"] for call in encode_calls] == [[3, 5]]
+    assert encode_calls[0]["layout"] is layout
+    assert slot.tolist() == [9, 9, 9, 9]
+    ctx.close()

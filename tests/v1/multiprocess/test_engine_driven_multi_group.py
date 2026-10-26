@@ -826,6 +826,8 @@ def _register_context(
         mq_timeout=1.0,
         engine_group_infos=_two_groups(),
     )
+    # These tests force quantized plans, which only exist with the master switch on.
+    ctx._kvweave_enabled = True  # noqa: SLF001
     return ctx
 
 
@@ -1875,6 +1877,7 @@ def test_async_submit_store_quantizes_only_selected_chunks(
         mq_timeout=1.0,
         engine_group_infos=_two_groups(),
     )
+    ctx._kvweave_enabled = True  # noqa: SLF001  (forced quantized plans imply master on)
     spy_codec = _SpyCodec()
     ctx._kvweave_codec = spy_codec  # noqa: SLF001
     quantized_group0 = worker_transfer.GroupTransferPlan(
