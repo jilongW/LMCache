@@ -170,9 +170,16 @@ PYBIND11_MODULE(xpu_ops, m) {
                         object_tensors.reserve(lmcache_objects_obj.size());
                         for (const auto& item : lmcache_objects_obj) {
                               const auto ptr = item.cast<uintptr_t>();
+                              // The object buffer is only ever moved as raw words, so the dtype just has
+                              // to carry the right element width. An fp8 KV cache is one byte per element:
+                              // treating it as fp16 doubled every copy and ran past the buffers.
+                              TORCH_CHECK(shape_desc.element_size == 1 || shape_desc.element_size == 2 ||
+                                                                          shape_desc.element_size == 4,
+                                                                  "unsupported KV element size ", shape_desc.element_size);
                               auto options = torch::TensorOptions().dtype(
-                                          shape_desc.element_size == 4 ? torch::kFloat32
-                                                                                                                               : torch::kFloat16);
+                                          shape_desc.element_size == 4   ? torch::kFloat32
+                                          : shape_desc.element_size == 1 ? torch::kUInt8
+                                                                         : torch::kFloat16);
                               object_tensors.push_back(torch::from_blob(
                                           reinterpret_cast<void*>(ptr),
                                           {shape_desc.kv_size, shape_desc.nl, lmcache_chunk_size,

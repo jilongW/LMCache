@@ -132,6 +132,22 @@ def _env_device(name: str = "LMCACHE_MP_KVWEAVE_QUANT_DEVICE") -> str:
     return value
 
 
+def _env_kv_fp8_dtype(name: str = "LMCACHE_MP_KVWEAVE_KV_CACHE_DTYPE") -> torch.dtype | None:
+    """Resolve the fp8 format of the engine's KV cache, or ``None`` for a float KV cache.
+
+    vLLM stores an fp8 KV cache as plain ``uint8`` tensors, so the tensor dtype alone
+    cannot say which fp8 format the bytes are in. The vLLM adapter exports vLLM's
+    ``--kv-cache-dtype`` here; ``fp8`` means e4m3, as in vLLM. Non-fp8 values
+    (``auto``, ``float16``, ...) and an unset variable mean no fp8 reinterpretation.
+    """
+    value = os.environ.get(name, "").strip().lower()
+    if value in {"fp8", "fp8_e4m3", "e4m3", "float8_e4m3fn"}:
+        return torch.float8_e4m3fn
+    if value in {"fp8_e5m2", "e5m2", "float8_e5m2"}:
+        return torch.float8_e5m2
+    return None
+
+
 _FEW_GROUPS_THRESHOLD = 4
 
 
@@ -356,6 +372,7 @@ class KVWeaveRuntimeConfig:
                 "asym": _env_flag("LMCACHE_MP_KVWEAVE_ASYM", True),
                 "precond": _env_flag("LMCACHE_MP_KVWEAVE_PRECOND", True),
                 "device": _env_device(),
+                "kv_fp8_dtype": _env_kv_fp8_dtype(),
                 "num_threads": _env_num_threads(num_groups),
                 "fused_direct_quant": _env_flag(
                     "LMCACHE_MP_KVWEAVE_FUSED_DIRECT_QUANT", True
@@ -400,11 +417,16 @@ class KVWeaveCodecConfig:
         torch.float16: 0,
         torch.bfloat16: 1,
         torch.float32: 2,
+        # fp8 KV cache (vLLM --kv-cache-dtype fp8); appended so existing payload codes are unchanged.
+        torch.float8_e4m3fn: 3,
+        torch.float8_e5m2: 4,
     }
     CODE_TO_DTYPE: ClassVar[dict[int, torch.dtype]] = {
         0: torch.float16,
         1: torch.bfloat16,
         2: torch.float32,
+        3: torch.float8_e4m3fn,
+        4: torch.float8_e5m2,
     }
     SCALING_TO_CODE: ClassVar[dict[str, int]] = {
         "per_tensor": 0,

@@ -40,6 +40,27 @@ def is_false(value: str) -> bool:
     return value.lower() in ("false", "0", "no", "n", "off")
 
 
+def export_kv_cache_dtype(vllm_config: "VllmConfig | None" = None) -> None:
+    """Tell KVWeave the engine's fp8 KV-cache format.
+
+    vLLM stores an fp8 KV cache as ``uint8`` tensors, so the format (e4m3 / e5m2) is
+    only known from ``--kv-cache-dtype``. It is exported as
+    ``LMCACHE_MP_KVWEAVE_KV_CACHE_DTYPE`` (never overriding an explicit setting) for
+    the worker-side KVWeave configuration, which reads it when the KV caches register.
+    """
+    try:
+        if vllm_config is None:
+            # Third Party
+            from vllm.config import get_current_vllm_config
+
+            vllm_config = get_current_vllm_config()
+        cache_dtype = str(vllm_config.cache_config.cache_dtype)
+    except Exception:  # noqa: BLE001 - no ambient vLLM config: nothing to export
+        return
+    if cache_dtype.startswith("fp8"):
+        os.environ.setdefault("LMCACHE_MP_KVWEAVE_KV_CACHE_DTYPE", cache_dtype)
+
+
 def vllm_layout_hints(vllm_config: "VllmConfig | None" = None) -> "LayoutHints":
     """Build layout_hints dict by querying vLLM at runtime."""
     hints: dict[str, str] = {}
