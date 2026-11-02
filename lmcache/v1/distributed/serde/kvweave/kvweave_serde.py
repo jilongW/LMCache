@@ -744,7 +744,7 @@ class _KVWeaveCodec:
 
     @staticmethod
     def _tensor_bytes(tensor: torch.Tensor) -> bytes:
-        return bytes(tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+        return tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
 
     @staticmethod
     def _payload_u8(tensor: torch.Tensor) -> torch.Tensor:
@@ -779,7 +779,7 @@ class _KVWeaveCodec:
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         }:
-            itemsize = torch.empty((), dtype=dtype).element_size()
+            itemsize = dtype.itemsize
             tail = payload[offset:]
             if offset % itemsize:
                 return torch.frombuffer(bytearray(tail.contiguous().numpy().tobytes()), dtype=dtype)
@@ -1634,7 +1634,7 @@ class _KVWeaveCodec:
         page_bytes = block_size * raw_chunk.shape[-1] * raw_chunk.element_size()
         if is_two_plane:
             page_bytes *= 2
-        elem_size = torch.empty((), dtype=ssm_dtype).element_size()
+        elem_size = ssm_dtype.itemsize
         rows_per_page = ssm_layout.byte_length // elem_size // head_dim
         native = _resolve_native("cpu")
         payload = bytes(native.kvweave_serialize_mamba_page_substate_direct(
@@ -1700,7 +1700,7 @@ class _KVWeaveCodec:
         if is_two_plane:
             page_bytes *= 2
         head_dim = p["head_dim"]
-        elem_size = torch.empty((), dtype=p["output_dtype"]).element_size()
+        elem_size = p["output_dtype"].itemsize
         rows_per_page = ssm_layout.byte_length // elem_size // head_dim
         native = _resolve_native("cpu")
         native.kvweave_dequantize_mamba_page_substate_direct(
@@ -1755,7 +1755,7 @@ class _KVWeaveCodec:
                 f"key_dim*2 + value_dim ({key_dim * 2 + value_dim})"
             )
         kernel_hist = conv_layout.shape[-2]
-        elem_size = torch.empty((), dtype=conv_dtype).element_size()
+        elem_size = conv_dtype.itemsize
         rows_per_page = conv_layout.byte_length // elem_size // conv_dim
         is_two_plane = raw_chunk.dim() == 4 and int(raw_chunk.shape[0]) == 2
         hidden = raw_chunk.shape[-1]
@@ -1845,7 +1845,7 @@ class _KVWeaveCodec:
         for payload in _KVWeaveCodec.unpack_conv_qkv_payloads(conv_qkv_payload):
             p = _KVWeaveCodec._read_mamba_substate_payload(payload)
             head_dim = p["head_dim"]
-            elem_size = torch.empty((), dtype=p["output_dtype"]).element_size()
+            elem_size = p["output_dtype"].itemsize
             rows_per_page = conv_layout.byte_length // elem_size // conv_dim
             native.kvweave_dequantize_mamba_page_substate_direct(
                 p["q_data"], p["scales"], native_target, page_bytes, conv_layout.byte_offset,
