@@ -5,6 +5,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 from unittest.mock import MagicMock, PropertyMock, patch
+import enum
 import os
 import pickle
 import sys
@@ -1117,6 +1118,11 @@ def stub_lmcache_native() -> Any:
     module.PeriodicEventNotifier = type(  # type: ignore[attr-defined]
         "PeriodicEventNotifier", (), {}
     )
+    # The mp_observability subscribers imported by the server read
+    # ``TransferDirection.__members__`` and ``int(member)`` at import time.
+    module.TransferDirection = enum.IntEnum(  # type: ignore[attr-defined]
+        "TransferDirection", {"H2D": 0, "D2H": 1}
+    )
     with patch.dict(
         sys.modules,
         {
@@ -1474,9 +1480,16 @@ def test_server_engine_driven_reregister_returns_existing_shm_response(
     second_response = module.register_kv_cache_engine_driven_context(payload)
 
     assert first_response.shm_name == "lmcache_l1_pool_lmcache_test_pool"
-    assert first_response.pool_size == 2048
-    assert second_response.shm_name == "lmcache_l1_pool_lmcache_test_pool"
-    assert second_response.pool_size == 2048
+    # The advertised pool is the L1 region (2048 bytes) followed by the scratch
+    # region, whose size depends on the environment (scratch GB, /dev/shm).
+    assert first_response.scratch_offset == 2048
+    assert first_response.pool_size == (
+        first_response.scratch_offset + first_response.scratch_size
+    )
+    assert second_response.shm_name == first_response.shm_name
+    assert second_response.pool_size == first_response.pool_size
+    assert second_response.scratch_offset == first_response.scratch_offset
+    assert second_response.scratch_size == first_response.scratch_size
 
 
 def test_server_unregister_engine_driven_context_releases_pending_shm_locks(
