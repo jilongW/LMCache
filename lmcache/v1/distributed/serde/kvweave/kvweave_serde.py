@@ -413,24 +413,78 @@ class _KVWeaveCodec:
             scaling_method: str,
             rh: bool,
             qbit: int,
-        ) -> bytes:
+            dest: torch.Tensor | None = None,
+        ) -> bytes | int:
+            """Quantize one sub-state; returns bytes, or the byte count when ``dest`` is given."""
             shape = (layers, blocks, *tail)
             header, blocks_num, heads, head_dim, signs, perm = self._mamba_state_params(
                 shape, dtype, substate, scaling_method, rh, mamba_options.asym, qbit
             )
-            return bytes(
-                self.native.kvweave_serialize_mamba_state_paged(
-                    layer_ptrs, block_ids, num_blocks, page_stride_bytes, base_off,
-                    head_dim, row_stride_bytes, int(np.prod(tail[:-1])), dtype, header,
-                    qbit, blocks_num, heads, head_dim,
-                    rh=rh, asym=mamba_options.asym, scaling_method=scaling_method,
-                    signs=signs, perm=perm,
-                )
+            result = self.native.kvweave_serialize_mamba_state_paged(
+                layer_ptrs, block_ids, num_blocks, page_stride_bytes, base_off,
+                head_dim, row_stride_bytes, int(np.prod(tail[:-1])), dtype, header,
+                qbit, blocks_num, heads, head_dim,
+                rh=rh, asym=mamba_options.asym, scaling_method=scaling_method,
+                signs=signs, perm=perm, out=dest,
             )
+            return int(result) if dest is not None else bytes(result)
+
+        ssm_dtype = KVWeaveCodecConfig.mamba_dtype(ssm_layout.dtype_str)
+        conv_segments = (split.key_dim, split.key_dim, split.value_dim)
+
+        dest = out.view(-1)
+        if dest.dtype == torch.uint8 and dest.device.type == "cpu" and dest.is_contiguous():
+            # Zero-copy assembly: every sub-state is written by the native call straight
+            # into its final position in ``out`` (the framing below is exactly what
+            # pack_mamba_payloads / pack_conv_qkv_payloads produce), and the 4-byte length
+            # prefixes are back-patched once each sub-payload's size is known. This avoids
+            # a bytes object per sub-state, the concatenations, and the final copy.
+            capacity = int(dest.numel())
+            frame = memoryview(dest.numpy())  # shares memory with ``out``
+
+            def reserve(position: int, count: int) -> None:
+                if position + count > capacity:
+                    raise ValueError(
+                        f"encoded payload exceeds destination capacity ({capacity} bytes)"
+                    )
+
+            conv_len_pos = 0
+            reserve(0, 5)
+            frame[4] = 1  # conv payload flag: quantized
+            position = 5
+            segment_start = 0
+            for width in conv_segments:
+                length_pos = position
+                reserve(position, 4)
+                position += 4
+                written = state_payload(
+                    "conv", conv_dtype, (*conv_layout.shape[:-1], width),
+                    conv_layout.byte_offset + segment_start * conv_dtype.itemsize,
+                    conv_dim * conv_dtype.itemsize,
+                    mamba_options.conv_scaling_method, mamba_options.conv_rh,
+                    mamba_options.conv_qbit, dest[position:],
+                )
+                struct.pack_into(">I", frame, length_pos, written)
+                position += written
+                segment_start += width
+            struct.pack_into(">I", frame, conv_len_pos, position - conv_len_pos - 4)
+            length_pos = position
+            reserve(position, 5)
+            position += 4
+            frame[position] = 1  # ssm payload flag: quantized
+            position += 1
+            written = state_payload(
+                "ssm", ssm_dtype, tuple(ssm_layout.shape), ssm_layout.byte_offset,
+                int(ssm_layout.shape[-1]) * ssm_dtype.itemsize,
+                mamba_options.ssm_scaling_method, mamba_options.ssm_rh,
+                mamba_options.ssm_qbit, dest[position:],
+            )
+            struct.pack_into(">I", frame, length_pos, written + 1)
+            return position + written
 
         conv_parts = []
         segment_start = 0
-        for width in (split.key_dim, split.key_dim, split.value_dim):
+        for width in conv_segments:
             conv_parts.append(
                 state_payload(
                     "conv", conv_dtype, (*conv_layout.shape[:-1], width),
@@ -441,7 +495,6 @@ class _KVWeaveCodec:
                 )
             )
             segment_start += width
-        ssm_dtype = KVWeaveCodecConfig.mamba_dtype(ssm_layout.dtype_str)
         ssm_payload = state_payload(
             "ssm", ssm_dtype, tuple(ssm_layout.shape), ssm_layout.byte_offset,
             int(ssm_layout.shape[-1]) * ssm_dtype.itemsize,
@@ -482,7 +535,13 @@ class _KVWeaveCodec:
             ValueError: If the payload cannot be decoded in place (a sub-state is
                 not quantized, or its header does not match the destination).
         """
-        conv_payload, ssm_payload = self.unpack_mamba_payloads(self._tensor_bytes(src))
+        if src.device.type == "cpu":
+            # Parse in place: slicing a memoryview of the (SHM) tensor copies nothing, whereas
+            # _tensor_bytes() would first copy the whole payload.
+            blob = memoryview(src.detach().contiguous().view(torch.uint8).numpy())
+        else:
+            blob = self._tensor_bytes(src)
+        conv_payload, ssm_payload = self.unpack_mamba_payloads(blob)
         if conv_payload[0] != 1 or ssm_payload[0] != 1:
             raise ValueError("paged Mamba decode needs both sub-states quantized")
         conv_layout, ssm_layout = mamba_layout

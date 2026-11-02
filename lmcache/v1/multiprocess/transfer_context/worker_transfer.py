@@ -2020,8 +2020,6 @@ class EngineDrivenTransferContext(TransferContext):
         )
         self._warmup_quantized_engine_transfer(kv_caches)
         self._warmup_paged_kernels(kv_caches)
-        if isinstance(self._engine_driven_context, EngineDrivenContextShm):
-            self._engine_driven_context.prewarm_first_segment()
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
         logger.info(
             "Worker non-GPU transfer context registered (instance_id=%d, mode=%s, "
