@@ -320,14 +320,14 @@ def test_runtime_config_resolves_environment(monkeypatch, tmp_path):
     assert config.attention_codec_kwargs["num_kv_heads"] == 8
     assert config.attention_codec_kwargs["head_dim"] == 128
     assert config.attention_codec_kwargs["qbit"] == 4
-    assert config.attention_codec_kwargs["scaling_method"] == "per_token"
+    assert config.attention_codec_kwargs["scaling_method"] == "per_channel"
     assert config.attention_codec_kwargs["precond"]
     assert config.mamba_options == MambaCodecOptions(
         conv_scaling_method="per_token",
         conv_rh=True,
         ssm_scaling_method="per_token",
-        ssm_rh=True,
-        asym=True,
+        ssm_rh=False,
+        asym=False,
         ssm_qbit=4,
         conv_qkv_split=ConvQKVSplit(key_dim=256, value_dim=256),
     )
@@ -341,9 +341,13 @@ def test_runtime_config_falls_back_to_qwen35_9b_defaults(monkeypatch):
 
     assert config.attention_codec_kwargs["num_kv_heads"] == 4
     assert config.attention_codec_kwargs["head_dim"] == 256
-    assert config.attention_codec_kwargs["scaling_method"] == "per_token"
+    assert config.attention_codec_kwargs["scaling_method"] == "per_channel"
     assert config.mamba_options.conv_scaling_method == "per_token"
     assert config.mamba_options.ssm_scaling_method == "per_token"
+    # Default Mamba configuration (the one vllm-start.sh ships): RH off, symmetric.
+    assert not config.mamba_options.conv_rh
+    assert not config.mamba_options.ssm_rh
+    assert not config.mamba_options.asym
     assert config.mamba_options.conv_qkv_split == ConvQKVSplit(
         key_dim=2048, value_dim=4096
     )

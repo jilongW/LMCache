@@ -37,11 +37,19 @@ def test_scatter_syncs_before_releasing_dynamically_pinned_chunks() -> None:
     # Mock chunks, not real tensors: pin_memory() needs an accelerator, so the
     # ptr-only branch cannot execute for real on the CPU-only unit CI. What we
     # are pinning down is the ordering contract, not the copy itself.
+    # The mocks still have to satisfy scatter's raw-buffer contract (contiguous CPU
+    # storage holding every block of every layer, in the cache dtype).
+    chunk_numel = sum(t.numel() for t in kv.values())
+
     def _unpinned_chunk() -> MagicMock:
         c = MagicMock()
         c.is_pinned.return_value = False
         c.pin_memory.return_value = c
         c.data_ptr.return_value = 0
+        c.device.type = "cpu"
+        c.is_contiguous.return_value = True
+        c.dtype = next(iter(kv.values())).dtype
+        c.numel.return_value = chunk_numel
         return c
 
     chunks = [_unpinned_chunk()]

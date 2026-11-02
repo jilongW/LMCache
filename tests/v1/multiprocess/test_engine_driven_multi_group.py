@@ -368,9 +368,14 @@ class TestBuildGroupTransferPlans:
             _disabled_kvweave_config(),
             KVWeaveCodec(),
         )
-        assert [p.engine_kv_format for p in plans] == [
+        detected = [
             worker_transfer._detect_group_kv_format(p.select_kv_caches(kv_caches), None)
             for p in plans
+        ]
+        assert [p.engine_kv_format for p in plans] == [fmt for fmt, _ in detected]
+        # The detected raw dtype is cached on the plan as well.
+        assert [p.raw_layout_desc.dtypes[0] for p in plans] == [
+            dtype for _, dtype in detected
         ]
         assert all(p.engine_kv_format is not None for p in plans)
 
@@ -410,7 +415,10 @@ class TestBuildGroupTransferPlans:
         monkeypatch.setattr(
             "lmcache.v1.gpu_connector.utils.normalize_kv_and_discover_format", _boom
         )
-        assert worker_transfer._detect_group_kv_format(_make_kv_caches(2), None) is None
+        assert worker_transfer._detect_group_kv_format(_make_kv_caches(2), None) == (
+            None,
+            None,
+        )
 
     def test_misaligned_tokens_per_block_raises(self) -> None:
         kv_caches = _make_kv_caches(2)

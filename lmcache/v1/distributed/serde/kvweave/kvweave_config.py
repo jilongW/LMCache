@@ -212,9 +212,10 @@ class MambaCodecOptions:
         ``LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD`` and
         ``SSM_SCALING_METHOD`` both default to ``per_token``, independently
         of ``LINEAR_*``.
-        ``CONV_RH`` still
-        falls back to ``LINEAR_RH`` (now defaulting to ``true``) while
-        ``SSM_RH`` defaults to ``true`` independently.
+        ``CONV_RH`` still falls back to ``LINEAR_RH`` while ``SSM_RH`` is
+        independent; both default to ``false`` (RH off), and
+        ``LINEAR_ASYM`` defaults to ``false`` (symmetric quantization) --
+        the same configuration ``vllm-start.sh`` ships.
 
         ``LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED``/``SSM_QUANT_ENABLED``
         (DEBUG ONLY, default ``true``) independently disable
@@ -251,7 +252,7 @@ class MambaCodecOptions:
         _env_scaling_method(
             "LMCACHE_MP_KVWEAVE_LINEAR_SCALING_METHOD", "per_channel"
         )
-        linear_rh = _env_flag("LMCACHE_MP_KVWEAVE_LINEAR_RH", True)
+        linear_rh = _env_flag("LMCACHE_MP_KVWEAVE_LINEAR_RH", False)
         conv_scaling = _env_scaling_method(
             "LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD", "per_token"
         )
@@ -269,8 +270,8 @@ class MambaCodecOptions:
             ssm_scaling_method=_env_scaling_method(
                 "LMCACHE_MP_KVWEAVE_SSM_SCALING_METHOD", "per_token"
             ),
-            ssm_rh=_env_flag("LMCACHE_MP_KVWEAVE_SSM_RH", True),
-            asym=_env_flag("LMCACHE_MP_KVWEAVE_LINEAR_ASYM", True),
+            ssm_rh=_env_flag("LMCACHE_MP_KVWEAVE_SSM_RH", False),
+            asym=_env_flag("LMCACHE_MP_KVWEAVE_LINEAR_ASYM", False),
             conv_qbit=int(os.environ.get("LMCACHE_MP_KVWEAVE_CONV_QBIT", "4")),
             ssm_qbit=int(os.environ.get("LMCACHE_MP_KVWEAVE_SSM_QBIT", "4")),
             conv_quant_enabled=_env_flag(
@@ -312,8 +313,8 @@ class KVWeaveRuntimeConfig:
             conv_scaling_method="per_token",
             conv_rh=False,
             ssm_scaling_method="per_token",
-            ssm_rh=True,
-            asym=True,
+            ssm_rh=False,
+            asym=False,
             conv_qbit=4,
             ssm_qbit=4,
         )
@@ -366,7 +367,7 @@ class KVWeaveRuntimeConfig:
                 "num_kv_heads": text_config["num_key_value_heads"],
                 "head_dim": text_config["head_dim"],
                 "scaling_method": os.environ.get(
-                    "LMCACHE_MP_KVWEAVE_SCALING_METHOD", "per_token"
+                    "LMCACHE_MP_KVWEAVE_SCALING_METHOD", "per_channel"
                 ),
                 "rh": _env_flag("LMCACHE_MP_KVWEAVE_RH", True),
                 "asym": _env_flag("LMCACHE_MP_KVWEAVE_ASYM", True),
