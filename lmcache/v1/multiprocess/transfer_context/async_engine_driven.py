@@ -3,8 +3,8 @@
 
 # Standard
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable
 import threading
 
 # Third Party
@@ -42,6 +42,17 @@ logger = init_logger(__name__)
 # not block the commit of another store whose gather already finished.
 DEFAULT_ENGINE_DRIVEN_COMMIT_WORKERS = 4
 # TODO: async retrieve path TBD, but benefit might be very limited
+
+
+@dataclass
+class _StoreTaskState:
+    """Per-store state the shared cleanup in ``_launch_store_task`` releases."""
+
+    gather_launched: threading.Event
+    gather_done: Any | None = None
+    staged_chunks: list[torch.Tensor] = field(default_factory=list)
+
+
 class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
     """Fully async engine-driven data transfer context (store-only async).
 
@@ -189,7 +200,8 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
             * blocks_per_chunk
         ]
         if len(chunk_block_ids) != blocks_per_chunk or any(
-            block_id < 0 or block_id >= source.num_blocks for block_id in chunk_block_ids
+            block_id < 0 or block_id >= source.num_blocks
+            for block_id in chunk_block_ids
         ):
             raise ValueError(
                 f"paged encode block ids {chunk_block_ids} outside "
@@ -361,19 +373,28 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         event.record(torch_dev.current_stream())
         return event
 
-    def _submit_store_baseline(
+    def _launch_store_task(
         self,
         _request_id: str,
         key: Any,
-        instance_id: int,
         kv_caches: dict[str, torch.Tensor],
         block_ids: list[list[int]],
         _event: IPCEvent | None,
         blocks_in_chunk: int,
+        body: Callable[[Any, Any, list[Any], _StoreTaskState], bool],
     ) -> MessagingFuture:
-        """Baseline async store, byte-for-byte the pre-KVWeave ``submit_store``.
+        """Run ``body`` on the commit executor and return its completion future.
 
-        Used for every group when the KVWeave master switch is off.
+        Owns everything the baseline and KVWeave stores share: registration
+        checks, in-flight bookkeeping, null-chunk masking, and the cleanup
+        (staging release, in-flight event/pending-store discard, resolving the
+        future) that must run however ``body`` exits.
+
+        ``body(engine_driven_context, key, transfer_groups, state)`` returns
+        whether the commit succeeded. It must set ``state.gather_done`` once the
+        gather event is recorded, append pinned staging buffers to
+        ``state.staged_chunks``, and register the event via
+        ``state.gather_launched``.
         """
         if self._engine_driven_context is None:
             raise RuntimeError(
@@ -407,114 +428,10 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 )
 
             def _prepare_gather_and_commit() -> None:
-                gather_done: Any | None = None
+                state = _StoreTaskState(gather_launched=gather_launched)
                 ok = False
-                # Whether we gathered directly into SHM views (True) or into
-                # pinned staging buffers that need to be released later (False).
-                used_shm_direct = False
-                staged_chunks: list[torch.Tensor] = []
                 try:
-                    # --- Phase 1: prepare_store ---
-                    # In pickle mode this is the costliest step (sync RPC
-                    # round-trip).  Running it here keeps the forward thread free.
-                    result = engine_driven_context.prepare_store(key, instance_id)
-                    out_buffers, chunk_indices = (
-                        result if result is not None else (None, None)
-                    )
-
-                    if chunk_indices is not None and len(chunk_indices) == 0:
-                        # All chunks are already in cache: no gather, no commit.
-                        ok = True
-                        return
-
-                    # Latch SHM vs. pickle mode once here, since it's the
-                    # same for every group in this store.
-                    used_shm_direct = out_buffers is not None
-                    if out_buffers is None:
-                        layout_desc = engine_driven_context.layout_desc
-                        if not layout_desc.shapes:
-                            raise RuntimeError(
-                                "engine-driven layout_desc.shapes is empty"
-                            )
-                        if not layout_desc.dtypes:
-                            raise RuntimeError(
-                                "engine-driven layout_desc.dtypes is empty"
-                            )
-
-                    # --- Phase 2: gather (GPU->CPU copy on copy stream) ---
-                    # ``out_buffers`` / ``chunk_indices`` (when present) are
-                    # flat over the whole multi-group chunk sequence,
-                    # group-major; each group's own chunk-count range is
-                    # sliced out before gathering that group.
-                    gather_target: list[torch.Tensor] = []
-                    group_offset = 0
-                    with torch.inference_mode(), torch_dev.stream(self._copy_stream):
-                        _event.wait(stream=self._copy_stream)
-
-                        for (
-                            plan,
-                            group_kv_caches,
-                            group_block_ids,
-                        ) in transfer_groups:
-                            selection = _select_group_chunks(
-                                chunk_indices,
-                                group_offset,
-                                len(group_block_ids) // plan.blocks_per_chunk,
-                            )
-                            group_offset += selection.num_group_chunks
-                            if selection.is_empty:
-                                continue
-
-                            if out_buffers is not None:
-                                group_out = [
-                                    out_buffers[out_idx]
-                                    for out_idx in selection.out_indices
-                                ]
-                            else:
-                                group_out = self._alloc_pinned_staging(
-                                    plan.chunk_shape,
-                                    engine_driven_context.layout_desc.dtypes[0],
-                                    len(selection.out_indices),
-                                )
-                                staged_chunks.extend(group_out)
-
-                            gather_target.extend(
-                                gather_paged_kv_to_cpu(
-                                    group_kv_caches,
-                                    group_block_ids,
-                                    plan.blocks_per_chunk,
-                                    layout_hints=self._layout_hints,
-                                    # This group's own pre-detected format
-                                    # (see GroupTransferPlan).
-                                    engine_kv_format=plan.engine_kv_format,
-                                    out=group_out,
-                                    chunk_indices=selection.chunk_indices,
-                                )
-                            )
-
-                        gather_done = torch_dev.Event()
-                        gather_done.record(self._copy_stream)
-
-                    with self._inflight_lock:
-                        if gather_done is not None:
-                            self._inflight_gather_events.add(gather_done)
-                        self._pending_stores.discard(gather_launched)
-                    gather_launched.set()
-
-                    if gather_done is not None:
-                        gather_done.synchronize()
-
-                    # --- Phase 3: commit ---
-                    with self._commit_lock:
-                        ok = engine_driven_context.commit_store(
-                            key, instance_id, gather_target
-                        )
-
-                    if not ok:
-                        logger.error(
-                            "Async engine-driven commit_store failed for request_id=%s",
-                            _request_id,
-                        )
+                    ok = body(engine_driven_context, key, transfer_groups, state)
                 except Exception:
                     logger.exception(
                         "Async engine-driven store failed for request_id=%s",
@@ -522,11 +439,16 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                     )
                     ok = False
                 finally:
-                    if not used_shm_direct:
-                        self._release_staging(staged_chunks)
+                    # ``staged_chunks`` is the source of truth for what needs
+                    # releasing: in SHM mode, ordinary non-quantized groups
+                    # gather into SHM views (nothing staged), but scratch-staged
+                    # groups may use pinned buffers, so keying off the SHM mode
+                    # alone would skip releasing them back to the pool.
+                    if state.staged_chunks:
+                        self._release_staging(state.staged_chunks)
                     with self._inflight_lock:
-                        if gather_done is not None:
-                            self._inflight_gather_events.discard(gather_done)
+                        if state.gather_done is not None:
+                            self._inflight_gather_events.discard(state.gather_done)
                         self._pending_stores.discard(gather_launched)
                     gather_launched.set()
                     completion.set_result(ok)
@@ -545,6 +467,123 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
             return completion
 
         return completion
+
+    def _submit_store_baseline(
+        self,
+        _request_id: str,
+        key: Any,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        _event: IPCEvent | None,
+        blocks_in_chunk: int,
+    ) -> MessagingFuture:
+        """Baseline async store, byte-for-byte the pre-KVWeave ``submit_store``.
+
+        Used for every group when the KVWeave master switch is off.
+        """
+
+        def _store_body(engine_driven_context, key, transfer_groups, state):
+            # --- Phase 1: prepare_store ---
+            # In pickle mode this is the costliest step (sync RPC
+            # round-trip).  Running it here keeps the forward thread free.
+            result = engine_driven_context.prepare_store(key, instance_id)
+            out_buffers, chunk_indices = result if result is not None else (None, None)
+
+            if chunk_indices is not None and len(chunk_indices) == 0:
+                # All chunks are already in cache: no gather, no commit.
+                return True
+
+            if out_buffers is None:
+                layout_desc = engine_driven_context.layout_desc
+                if not layout_desc.shapes:
+                    raise RuntimeError("engine-driven layout_desc.shapes is empty")
+                if not layout_desc.dtypes:
+                    raise RuntimeError("engine-driven layout_desc.dtypes is empty")
+
+            # --- Phase 2: gather (GPU->CPU copy on copy stream) ---
+            # ``out_buffers`` / ``chunk_indices`` (when present) are
+            # flat over the whole multi-group chunk sequence,
+            # group-major; each group's own chunk-count range is
+            # sliced out before gathering that group.
+            gather_target: list[torch.Tensor] = []
+            group_offset = 0
+            with torch.inference_mode(), torch_dev.stream(self._copy_stream):
+                _event.wait(stream=self._copy_stream)
+
+                for (
+                    plan,
+                    group_kv_caches,
+                    group_block_ids,
+                ) in transfer_groups:
+                    selection = _select_group_chunks(
+                        chunk_indices,
+                        group_offset,
+                        len(group_block_ids) // plan.blocks_per_chunk,
+                    )
+                    group_offset += selection.num_group_chunks
+                    if selection.is_empty:
+                        continue
+
+                    if out_buffers is not None:
+                        group_out = [
+                            out_buffers[out_idx] for out_idx in selection.out_indices
+                        ]
+                    else:
+                        group_out = self._alloc_pinned_staging(
+                            plan.chunk_shape,
+                            engine_driven_context.layout_desc.dtypes[0],
+                            len(selection.out_indices),
+                        )
+                        state.staged_chunks.extend(group_out)
+
+                    gather_target.extend(
+                        gather_paged_kv_to_cpu(
+                            group_kv_caches,
+                            group_block_ids,
+                            plan.blocks_per_chunk,
+                            layout_hints=self._layout_hints,
+                            # This group's own pre-detected format
+                            # (see GroupTransferPlan).
+                            engine_kv_format=plan.engine_kv_format,
+                            out=group_out,
+                            chunk_indices=selection.chunk_indices,
+                        )
+                    )
+
+                state.gather_done = torch_dev.Event()
+                state.gather_done.record(self._copy_stream)
+
+            with self._inflight_lock:
+                if state.gather_done is not None:
+                    self._inflight_gather_events.add(state.gather_done)
+                self._pending_stores.discard(state.gather_launched)
+            state.gather_launched.set()
+
+            if state.gather_done is not None:
+                state.gather_done.synchronize()
+
+            # --- Phase 3: commit ---
+            with self._commit_lock:
+                ok = engine_driven_context.commit_store(key, instance_id, gather_target)
+
+            if not ok:
+                logger.error(
+                    "Async engine-driven commit_store failed for request_id=%s",
+                    _request_id,
+                )
+
+            return ok
+
+        return self._launch_store_task(
+            _request_id,
+            key,
+            kv_caches,
+            block_ids,
+            _event,
+            blocks_in_chunk,
+            _store_body,
+        )
 
     def submit_store(
         self,
@@ -583,292 +622,220 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
         """
         if not self._kvweave_enabled:
             return self._submit_store_baseline(
-                _request_id, key, instance_id, kv_caches, block_ids, _event, blocks_in_chunk
+                _request_id,
+                key,
+                instance_id,
+                kv_caches,
+                block_ids,
+                _event,
+                blocks_in_chunk,
             )
-        if self._engine_driven_context is None:
-            raise RuntimeError(
-                "Engine-driven transfer context is not registered. "
-                "Call register() before submit_store()."
-            )
-        if _event is None:
-            raise RuntimeError(
-                "Async engine-driven transfer requires a local ordering event."
-            )
-        completion: MessagingFuture[bool] = MessagingFuture()
-        engine_driven_context = self._engine_driven_context
-        commit_executor = self._commit_executor
 
-        # Signals when this task has recorded its CUDA event (or exited early),
-        # allowing flush_inflight_stores to safely proceed.
-        gather_launched = threading.Event()
-        try:
-            with self._inflight_lock:
-                if self._is_closing:
-                    completion.set_result(False)
-                    return completion
-                self._pending_stores.add(gather_launched)
+        def _store_body(engine_driven_context, key, transfer_groups, state):
+            # --- Phase 1: prepare_store ---
+            # In pickle mode this is the costliest step (sync RPC
+            # round-trip).  Running it here keeps the forward thread free.
+            result = engine_driven_context.prepare_store(key, instance_id)
+            out_buffers, chunk_indices = result if result is not None else (None, None)
 
-            transfer_groups = list(
-                self.iter_transfer_groups(kv_caches, block_ids, blocks_in_chunk)
-            )
-            if self._has_maskable_group():
-                key = replace(
-                    key, null_chunk_mask=null_chunk_mask_from_groups(transfer_groups)
+            if chunk_indices is not None and len(chunk_indices) == 0:
+                # All chunks are already in cache: no gather, no commit.
+                return True
+
+            if out_buffers is None:
+                layout_desc = engine_driven_context.layout_desc
+                if not layout_desc.shapes:
+                    raise RuntimeError("engine-driven layout_desc.shapes is empty")
+                if not layout_desc.dtypes:
+                    raise RuntimeError("engine-driven layout_desc.dtypes is empty")
+
+            # --- Phase 2: gather (GPU->CPU copy on copy stream) ---
+            # ``out_buffers`` / ``chunk_indices`` (when present) are
+            # flat over the whole multi-group chunk sequence,
+            # group-major; each group's own chunk-count range is
+            # sliced out before gathering that group. Boundaries are
+            # tracked per group so a pickle-mode quantized group's
+            # chunks can be encoded in Phase 2.5 below without
+            # re-enumerating them (MIGRATION_PLAN.md R2).
+            gather_target: list[torch.Tensor] = []
+            # (plan, start, end, quantized SHM slots or None): quantized
+            # slots are only supplied by a context that hands out slots
+            # without being SHM-bounded; encoded bytes are copied into them.
+            group_ranges: list[
+                tuple[
+                    GroupTransferPlan,
+                    int,
+                    int,
+                    list[torch.Tensor] | None,
+                ]
+            ] = []
+            # Quantized-SHM groups' chunks are flattened across ALL
+            # such groups (not just within one group) into one
+            # ordered list, processed after this loop by a depth-2
+            # gather/process pipeline -- see
+            # _run_async_bounded_pipeline. This lets group N+1's D2H
+            # gather overlap with group N's CPU-side split/encode,
+            # instead of each group running its own pipeline in
+            # isolation (which can't overlap when a group has only
+            # one chunk, the common case in production).
+            bounded_batches: list[_BoundedStoreBatch] = []
+            group_offset = 0
+            groups_with_selections = []
+            for group_index, (
+                plan,
+                group_kv_caches,
+                group_block_ids,
+            ) in enumerate(transfer_groups):
+                selection = _select_group_chunks(
+                    chunk_indices,
+                    group_offset,
+                    len(group_block_ids) // plan.blocks_per_chunk,
                 )
-
-            def _prepare_gather_and_commit() -> None:
-                gather_done: Any | None = None
-                ok = False
-                staged_chunks: list[torch.Tensor] = []
-                try:
-                    # --- Phase 1: prepare_store ---
-                    # In pickle mode this is the costliest step (sync RPC
-                    # round-trip).  Running it here keeps the forward thread free.
-                    result = engine_driven_context.prepare_store(key, instance_id)
-                    out_buffers, chunk_indices = (
-                        result if result is not None else (None, None)
-                    )
-
-                    if chunk_indices is not None and len(chunk_indices) == 0:
-                        # All chunks are already in cache: no gather, no commit.
-                        ok = True
-                        return
-
-                    if out_buffers is None:
-                        layout_desc = engine_driven_context.layout_desc
-                        if not layout_desc.shapes:
-                            raise RuntimeError(
-                                "engine-driven layout_desc.shapes is empty"
-                            )
-                        if not layout_desc.dtypes:
-                            raise RuntimeError(
-                                "engine-driven layout_desc.dtypes is empty"
-                            )
-
-                    # --- Phase 2: gather (GPU->CPU copy on copy stream) ---
-                    # ``out_buffers`` / ``chunk_indices`` (when present) are
-                    # flat over the whole multi-group chunk sequence,
-                    # group-major; each group's own chunk-count range is
-                    # sliced out before gathering that group. Boundaries are
-                    # tracked per group so a pickle-mode quantized group's
-                    # chunks can be encoded in Phase 2.5 below without
-                    # re-enumerating them (MIGRATION_PLAN.md R2).
-                    gather_target: list[torch.Tensor] = []
-                    # (plan, start, end, quantized SHM slots or None): quantized
-                    # slots are only supplied by a context that hands out slots
-                    # without being SHM-bounded; encoded bytes are copied into them.
-                    group_ranges: list[
-                        tuple[
-                            GroupTransferPlan,
-                            int,
-                            int,
-                            list[torch.Tensor] | None,
-                        ]
-                    ] = []
-                    # Quantized-SHM groups' chunks are flattened across ALL
-                    # such groups (not just within one group) into one
-                    # ordered list, processed after this loop by a depth-2
-                    # gather/process pipeline -- see
-                    # _run_async_bounded_pipeline. This lets group N+1's D2H
-                    # gather overlap with group N's CPU-side split/encode,
-                    # instead of each group running its own pipeline in
-                    # isolation (which can't overlap when a group has only
-                    # one chunk, the common case in production).
-                    bounded_batches: list[_BoundedStoreBatch] = []
-                    group_offset = 0
-                    groups_with_selections = []
-                    for group_index, (
+                group_offset += selection.num_group_chunks
+                groups_with_selections.append(
+                    (
+                        group_index,
                         plan,
                         group_kv_caches,
                         group_block_ids,
-                    ) in enumerate(transfer_groups):
-                        selection = _select_group_chunks(
-                            chunk_indices,
-                            group_offset,
-                            len(group_block_ids) // plan.blocks_per_chunk,
+                        selection,
+                    )
+                )
+
+            with torch.inference_mode(), torch_dev.stream(self._copy_stream):
+                _event.wait(stream=self._copy_stream)
+
+                for (
+                    group_index,
+                    plan,
+                    group_kv_caches,
+                    group_block_ids,
+                    selection,
+                ) in groups_with_selections:
+                    if selection.is_empty:
+                        continue
+
+                    group_slots = (
+                        [out_buffers[out_idx] for out_idx in selection.out_indices]
+                        if out_buffers is not None
+                        else None
+                    )
+                    route = self._store_route(
+                        plan,
+                        paged_ok=self._paged_encode_source(plan, group_kv_caches)
+                        is not None,
+                    )
+                    if (
+                        group_slots is not None
+                        and route is not StoreRoute.DIRECT
+                        and isinstance(engine_driven_context, EngineDrivenContextShm)
+                    ):
+                        _group_id = (
+                            plan.group_info.engine_group_id
+                            if plan.group_info is not None
+                            else -1
                         )
-                        group_offset += selection.num_group_chunks
-                        groups_with_selections.append(
-                            (
-                                group_index,
-                                plan,
-                                group_kv_caches,
-                                group_block_ids,
-                                selection,
+                        bounded_batches.extend(
+                            _BoundedStoreBatch(
+                                plan=plan,
+                                group_kv_caches=group_kv_caches,
+                                group_block_ids=group_block_ids,
+                                group_slots=group_slots,
+                                group_id=_group_id,
+                                start=start,
+                                batch_index=batch_index,
                             )
+                            for start, batch_index in enumerate(selection.chunk_indices)
                         )
+                        continue
+                    # A quantized group's slot is sized for the *quantized*
+                    # payload, so it always gathers raw into pinned staging
+                    # and is encoded into its slots in Phase 2.5. Other
+                    # groups with slots gather straight into them.
+                    # SHM-quantized and Mamba groups were bounded above.
+                    if group_slots is not None and not plan.quantized:
+                        group_out = group_slots
+                    else:
+                        if plan.raw_layout_desc is None:
+                            raise ValueError(
+                                f"Missing raw layout for group {group_index}"
+                            )
+                        group_out = self._alloc_pinned_staging(
+                            _raw_gather_shape(plan),
+                            plan.raw_layout_desc.dtypes[0],
+                            len(selection.out_indices),
+                        )
+                        state.staged_chunks.extend(group_out)
 
-                    with torch.inference_mode(), torch_dev.stream(self._copy_stream):
-                        _event.wait(stream=self._copy_stream)
-
-                        for (
-                            group_index,
-                            plan,
+                    start_idx = len(gather_target)
+                    gather_target.extend(
+                        gather_paged_kv_to_cpu(
                             group_kv_caches,
                             group_block_ids,
-                            selection,
-                        ) in groups_with_selections:
-                            if selection.is_empty:
-                                continue
-
-                            group_slots = (
-                                [
-                                    out_buffers[out_idx]
-                                    for out_idx in selection.out_indices
-                                ]
-                                if out_buffers is not None
-                                else None
-                            )
-                            route = self._store_route(
-                                plan,
-                                paged_ok=self._paged_encode_source(
-                                    plan, group_kv_caches
-                                )
-                                is not None,
-                            )
-                            if (
-                                group_slots is not None
-                                and route is not StoreRoute.DIRECT
-                                and isinstance(
-                                    engine_driven_context, EngineDrivenContextShm
-                                )
-                            ):
-                                _group_id = (
-                                    plan.group_info.engine_group_id
-                                    if plan.group_info is not None
-                                    else -1
-                                )
-                                bounded_batches.extend(
-                                    _BoundedStoreBatch(
-                                        plan=plan,
-                                        group_kv_caches=group_kv_caches,
-                                        group_block_ids=group_block_ids,
-                                        group_slots=group_slots,
-                                        group_id=_group_id,
-                                        start=start,
-                                        batch_index=batch_index,
-                                    )
-                                    for start, batch_index in enumerate(
-                                        selection.chunk_indices
-                                    )
-                                )
-                                continue
-                            # A quantized group's slot is sized for the *quantized*
-                            # payload, so it always gathers raw into pinned staging
-                            # and is encoded into its slots in Phase 2.5. Other
-                            # groups with slots gather straight into them.
-                            # SHM-quantized and Mamba groups were bounded above.
-                            if group_slots is not None and not plan.quantized:
-                                group_out = group_slots
-                            else:
-                                if plan.raw_layout_desc is None:
-                                    raise ValueError(
-                                        f"Missing raw layout for group {group_index}"
-                                    )
-                                group_out = self._alloc_pinned_staging(
-                                    _raw_gather_shape(plan),
-                                    plan.raw_layout_desc.dtypes[0],
-                                    len(selection.out_indices),
-                                )
-                                staged_chunks.extend(group_out)
-
-                            start_idx = len(gather_target)
-                            gather_target.extend(
-                                gather_paged_kv_to_cpu(
-                                    group_kv_caches,
-                                    group_block_ids,
-                                    plan.blocks_per_chunk,
-                                    layout_hints=self._layout_hints,
-                                    # This group's own pre-detected format
-                                    # (see GroupTransferPlan).
-                                    engine_kv_format=plan.engine_kv_format,
-                                    out=group_out,
-                                    chunk_indices=selection.chunk_indices,
-                                )
-                            )
-                            group_ranges.append(
-                                (
-                                    plan,
-                                    start_idx,
-                                    len(gather_target),
-                                    group_slots if plan.quantized else None,
-                                )
-                            )
-
-                        gather_done = torch_dev.Event()
-                        gather_done.record(self._copy_stream)
-                        if bounded_batches:
-                            self._run_async_bounded_pipeline(
-                                _request_id, bounded_batches
-                            )
-                    with self._inflight_lock:
-                        if gather_done is not None:
-                            self._inflight_gather_events.add(gather_done)
-                        self._pending_stores.discard(gather_launched)
-                    gather_launched.set()
-
-                    if gather_done is not None:
-                        gather_done.synchronize()
-
-                    # --- Phase 2.5: quantize (post-gather, pre-commit) ---
-                    # encode_chunk() must not run until gather_done has been
-                    # synchronized above: gather issues async device->CPU
-                    # copies, and encoding reads the gathered tensor's bytes.
-                    commit_target: list[torch.Tensor] = []
-                    for plan, start_idx, end_idx, quant_slots in group_ranges:
-                        commit_target.extend(
-                            self._encode_group_for_commit(
-                                plan, gather_target[start_idx:end_idx], quant_slots
-                            )
+                            plan.blocks_per_chunk,
+                            layout_hints=self._layout_hints,
+                            # This group's own pre-detected format
+                            # (see GroupTransferPlan).
+                            engine_kv_format=plan.engine_kv_format,
+                            out=group_out,
+                            chunk_indices=selection.chunk_indices,
                         )
-
-                    # --- Phase 3: commit ---
-                    with self._commit_lock:
-                        ok = engine_driven_context.commit_store(
-                            key, instance_id, commit_target
-                        )
-
-                    if not ok:
-                        logger.error(
-                            "Async engine-driven commit_store failed for request_id=%s",
-                            _request_id,
-                        )
-                except Exception:
-                    logger.exception(
-                        "Async engine-driven store failed for request_id=%s",
-                        _request_id,
                     )
-                    ok = False
-                finally:
-                    # ``staged_chunks`` (not ``used_shm_direct``) is the
-                    # source of truth for what needs releasing: in SHM mode,
-                    # ordinary non-quantized groups gather into SHM views
-                    # (nothing staged), but scratch-staged groups may use
-                    # pinned buffers above, so ``used_shm_direct`` alone would
-                    # skip releasing them back to the pool.
-                    if staged_chunks:
-                        self._release_staging(staged_chunks)
-                    with self._inflight_lock:
-                        if gather_done is not None:
-                            self._inflight_gather_events.discard(gather_done)
-                        self._pending_stores.discard(gather_launched)
-                    gather_launched.set()
-                    completion.set_result(ok)
+                    group_ranges.append(
+                        (
+                            plan,
+                            start_idx,
+                            len(gather_target),
+                            group_slots if plan.quantized else None,
+                        )
+                    )
 
-            # Submitting the task is the ownership-transfer point: once it
-            # succeeds, the closure is solely responsible for releasing staging
-            # buffers and resolving the future. The except below therefore only
-            # handles failures that occur *before* this submit.
-            commit_executor.submit(_prepare_gather_and_commit)
-        except Exception:
-            logger.exception("Failed to submit async engine-driven store")
+                state.gather_done = torch_dev.Event()
+                state.gather_done.record(self._copy_stream)
+                if bounded_batches:
+                    self._run_async_bounded_pipeline(_request_id, bounded_batches)
             with self._inflight_lock:
-                self._pending_stores.discard(gather_launched)
-            gather_launched.set()
-            completion.set_result(False)
-            return completion
+                if state.gather_done is not None:
+                    self._inflight_gather_events.add(state.gather_done)
+                self._pending_stores.discard(state.gather_launched)
+            state.gather_launched.set()
 
-        return completion
+            if state.gather_done is not None:
+                state.gather_done.synchronize()
+
+            # --- Phase 2.5: quantize (post-gather, pre-commit) ---
+            # encode_chunk() must not run until state.gather_done has been
+            # synchronized above: gather issues async device->CPU
+            # copies, and encoding reads the gathered tensor's bytes.
+            commit_target: list[torch.Tensor] = []
+            for plan, start_idx, end_idx, quant_slots in group_ranges:
+                commit_target.extend(
+                    self._encode_group_for_commit(
+                        plan, gather_target[start_idx:end_idx], quant_slots
+                    )
+                )
+
+            # --- Phase 3: commit ---
+            with self._commit_lock:
+                ok = engine_driven_context.commit_store(key, instance_id, commit_target)
+
+            if not ok:
+                logger.error(
+                    "Async engine-driven commit_store failed for request_id=%s",
+                    _request_id,
+                )
+
+            return ok
+
+        return self._launch_store_task(
+            _request_id,
+            key,
+            kv_caches,
+            block_ids,
+            _event,
+            blocks_in_chunk,
+            _store_body,
+        )
 
     def flush_inflight_stores(self) -> None:
         """Synchronize all in-flight gather (GPU->CPU) events.
