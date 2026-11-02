@@ -113,10 +113,34 @@ class _KVWeaveCodec:
         if self.device == "xpu" and not torch.xpu.is_available():
             raise RuntimeError("device='xpu' but torch.xpu.is_available() is False")
         self.native = _resolve_native(self.device)
+        # fp8 KV cache: the engine hands over uint8 tensors, this says which fp8 format they hold.
+        self.kv_fp8_dtype: torch.dtype | None = kwargs.get("kv_fp8_dtype")  # type: ignore[assignment]
         self.fused_direct_quant = bool(kwargs.get("fused_direct_quant", True))
         self.fused_direct_dequant = bool(kwargs.get("fused_direct_dequant", True))
         self.paged_direct_encode = bool(kwargs.get("paged_direct_encode", True))
         self.paged_direct_decode = bool(kwargs.get("paged_direct_decode", True))
+
+    def supports_fp8_attention(self) -> bool:
+        """Whether this codec can quantize an fp8 KV cache (fused-K/V attention).
+
+        Both the XPU and the CPU kernels read and write fp8 natively.
+        """
+        return self.kv_fp8_dtype is not None and self.scaling_method in {
+            "per_channel",
+            "per_token",
+        }
+
+    def _kv_dtype(self, dtype: torch.dtype) -> torch.dtype:
+        """Map the engine's uint8 fp8-KV storage dtype to the configured fp8 format."""
+        if dtype == torch.uint8 and self.kv_fp8_dtype is not None:
+            return self.kv_fp8_dtype
+        return dtype
+
+    def _kv_view(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Reinterpret a uint8 fp8-KV tensor as the configured fp8 dtype (same memory)."""
+        if tensor.dtype == torch.uint8 and self.kv_fp8_dtype is not None:
+            return tensor.view(self.kv_fp8_dtype)
+        return tensor
 
     def supports_fused_direct_quant(self) -> bool:
         """Whether fused-K/V attention quantizes without a separate head split."""
@@ -204,6 +228,7 @@ class _KVWeaveCodec:
         """
         if not self.supports_paged_fused_encode(hidden):
             raise ValueError("paged fused encode is not supported for this codec/shape")
+        dtype = self._kv_dtype(dtype)
         shape = (int(layer_ptrs.numel()), int(block_ids.numel()) * block_size, hidden)
         header, rh, asym, signs, perm = self._fused_quant_params(
             dtype, shape, "per_token", per_head_scales=True
@@ -250,6 +275,7 @@ class _KVWeaveCodec:
         """
         if not self.supports_paged_fused_decode(hidden):
             raise ValueError("paged fused decode is not supported for this codec/shape")
+        dtype = self._kv_dtype(dtype)
         payload = self._payload_u8(src)
         parsed = self._read_fused_header(payload)
         layers, tokens, parsed_hidden = parsed["shape"]
@@ -745,7 +771,14 @@ class _KVWeaveCodec:
             if offset % 2:
                 raise ValueError("KVWeave int16 q_data is not 2-byte aligned")
             return payload[offset:].view(torch.int16)
-        if dtype in {torch.float16, torch.bfloat16, torch.float32, torch.float64}:
+        if dtype in {
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        }:
             itemsize = torch.empty((), dtype=dtype).element_size()
             tail = payload[offset:]
             if offset % itemsize:
@@ -812,7 +845,7 @@ class _KVWeaveCodec:
 
     def serialize_tensor(self, tensor: torch.Tensor, scaling_method: str | None = None) -> bytes:
         """Normalize a KV tensor and serialize it as raw or 4-bit data."""
-        work = tensor.detach().to("cpu").contiguous()
+        work = self._kv_view(tensor.detach().to("cpu").contiguous())
         shape = self._normalize(work)
         method = scaling_method or self.scaling_method
         if not self.quantize:
@@ -847,6 +880,7 @@ class _KVWeaveCodec:
 
     def deserialize_tensor(self, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Decode a payload and restore it into the destination KV tensor."""
+        dst = self._kv_view(dst)
         payload = self._payload_u8(src)
         parsed = self._read_header(payload)
         if parsed["raw"]:
@@ -938,7 +972,7 @@ class _KVWeaveCodec:
             raise ValueError(
                 f"KVWeave fused-K/V tensor expects [L, T, H], got {tuple(tensor.shape)}"
             )
-        work = tensor.detach().to("cpu").contiguous()
+        work = self._kv_view(tensor.detach().to("cpu").contiguous())
         shape = tuple(int(dim) for dim in work.shape)
         layers, tokens, hidden = shape
         method = scaling_method or self.scaling_method
@@ -1004,6 +1038,7 @@ class _KVWeaveCodec:
 
     def deserialize_fused_tensor(self, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Decode a fused-K/V payload and restore it into the destination tensor."""
+        dst = self._kv_view(dst)
         payload = self._payload_u8(src)
         parsed = self._read_fused_header(payload)
         layers, tokens, hidden = parsed["shape"]

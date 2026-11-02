@@ -19,7 +19,10 @@ import zmq
 from lmcache import torch_dev
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
 from lmcache.integration.vllm.experimental import dispatch
-from lmcache.integration.vllm.utils import vllm_layout_hints
+from lmcache.integration.vllm.utils import (
+    export_kv_cache_dtype,
+    vllm_layout_hints,
+)
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate, init_logger
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
@@ -1437,6 +1440,7 @@ class LMCacheMPWorkerAdapter:
                 )
         self.kv_caches = kv_caches
         self.engine_group_infos = list(engine_group_infos)
+        export_kv_cache_dtype()
         # Reused when heartbeat recovery re-registers.
         self._layout_hints = (
             layout_hints if layout_hints is not None else vllm_layout_hints()

@@ -994,6 +994,24 @@ def _decide_group_quantization(
     if category == "attention":
         if not kvweave_config.full_attention_quant_enabled:
             return False, None, None
+        if dtype == torch.uint8 and not (
+            codec.supports_fp8_attention()
+            and attention_plane_layout == AttentionPlaneLayout.FUSED_KV
+        ):
+            # An fp8 KV cache reaches LMCache as uint8 bytes. Only the XPU fused-K/V
+            # kernels understand fp8, and they need to know the format
+            # (LMCACHE_MP_KVWEAVE_KV_CACHE_DTYPE); quantizing the bytes as numbers
+            # would corrupt the cache, so this group is transferred raw instead.
+            logger.warning(
+                "KVWeave cannot quantize this uint8 (fp8) attention group "
+                "(engine_group_id=%s, plane_layout=%s, device=%s, fp8 format=%s); "
+                "falling back to unquantized transfer for this group",
+                group_info.engine_group_id if group_info is not None else None,
+                attention_plane_layout,
+                codec.device,
+                codec.kv_fp8_dtype,
+            )
+            return False, None, None
         try:
             if attention_plane_layout == AttentionPlaneLayout.SPLIT_KV:
                 if not kvweave_config.split_attention_quant_enabled:
