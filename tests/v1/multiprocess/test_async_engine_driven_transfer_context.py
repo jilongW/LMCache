@@ -834,7 +834,7 @@ def test_paged_fused_quantized_group_skips_gather_and_encodes_in_place(
     )
 
     class _PagedCodec:
-        def supports_paged_fused_encode(self, hidden: int) -> bool:
+        def supports_paged_fused_encode(self, hidden: int, tokens: int | None = None) -> bool:
             return hidden == 64
 
         def serialize_fused_paged(

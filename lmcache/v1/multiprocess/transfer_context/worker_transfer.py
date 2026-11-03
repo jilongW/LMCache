@@ -2628,7 +2628,7 @@ class EngineDrivenTransferContext(TransferContext):
         self,
         plan: GroupTransferPlan,
         group_kv_caches: dict[str, torch.Tensor],
-        codec_supports: Callable[[int], bool],
+        codec_supports: Callable[[int, int], bool],
     ) -> PagedFusedSource | None:
         """Describe a group's paged KV if the codec can quantize it in place.
 
@@ -2642,7 +2642,10 @@ class EngineDrivenTransferContext(TransferContext):
         ):
             return None
         source = prepare_paged_fused_source(group_kv_caches, self._layout_hints)
-        if source is None or not codec_supports(source.hidden):
+        # Chunk length in tokens: per_channel quantizes one channel column per chunk.
+        if source is None or not codec_supports(
+            source.hidden, plan.blocks_per_chunk * source.block_size
+        ):
             return None
         return source
 
@@ -2657,7 +2660,7 @@ class EngineDrivenTransferContext(TransferContext):
         return self._paged_fused_source(
             plan,
             group_kv_caches,
-            lambda hidden: self._kvweave_codec.supports_paged_fused_decode(hidden),  # type: ignore[union-attr]
+            lambda hidden, tokens: self._kvweave_codec.supports_paged_fused_decode(hidden, tokens),  # type: ignore[union-attr]
         )
 
     def _paged_mamba_source(
@@ -2746,7 +2749,7 @@ class EngineDrivenTransferContext(TransferContext):
         return self._paged_fused_source(
             plan,
             group_kv_caches,
-            lambda hidden: self._kvweave_codec.supports_paged_fused_encode(hidden),  # type: ignore[union-attr]
+            lambda hidden, tokens: self._kvweave_codec.supports_paged_fused_encode(hidden, tokens),  # type: ignore[union-attr]
         )
 
     def _decode_group_into_paged_kv(

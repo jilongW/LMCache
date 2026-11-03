@@ -54,7 +54,7 @@ class _Codec:
         self.supported = supported
         self.calls: list[dict[str, Any]] = []
 
-    def supports_paged_fused_decode(self, hidden: int) -> bool:
+    def supports_paged_fused_decode(self, hidden: int, tokens: int | None = None) -> bool:
         return self.supported and hidden == 64
 
     def deserialize_fused_paged(

@@ -158,21 +158,32 @@ class _KVWeaveCodec:
         per_head_scales = method != "per_tensor" and self._fused_head_num(hidden) > 1
         return per_head_scales and self.supports_fused_direct_quant()
 
-    def _paged_fused_geometry_ok(self, hidden: int) -> bool:
+    def _paged_fused_geometry_ok(self, hidden: int, tokens: int | None = None) -> bool:
         """Whether paged in-place quant/dequant handles this fused width.
 
-        XPU, per_token scaling, per-K/V-plane heads, an RH-compatible head width,
-        and a native kernel whose SLM path fits one head row.
+        XPU, per_token or per_channel scaling, per-K/V-plane heads, an
+        RH-compatible transform length, and a native kernel whose SLM path fits one
+        quantization chunk. A chunk is one head row (per_token) or one channel
+        column over the chunk's ``tokens`` (per_channel), so per_channel also needs
+        the chunk's token count.
         """
-        if self.device != "xpu" or self.scaling_method != "per_token":
+        if self.device != "xpu" or self.scaling_method not in {"per_token", "per_channel"}:
             return False
         head_num = self._fused_head_num(hidden)
         head_dim = self._fused_head_dim(hidden)
-        if head_num <= 1 or (self.rh and head_dim & (head_dim - 1)):
+        if head_num <= 1:
             return False
-        return bool(self.native.kvweave_fused_paged_supported(head_dim))
+        if self.scaling_method == "per_channel":
+            if tokens is None or tokens <= 0:
+                return False
+            transform_len = tokens
+        else:
+            transform_len = head_dim
+        if self.rh and transform_len & (transform_len - 1):
+            return False
+        return bool(self.native.kvweave_fused_paged_supported(transform_len))
 
-    def supports_paged_fused_encode(self, hidden: int) -> bool:
+    def supports_paged_fused_encode(self, hidden: int, tokens: int | None = None) -> bool:
         """Whether a fused-K/V chunk can be quantized straight from paged KV.
 
         The caller can then skip the gather: only the quantized payload is copied
@@ -183,10 +194,10 @@ class _KVWeaveCodec:
             self.paged_direct_encode
             and self.quantize
             and hasattr(self.native, "kvweave_serialize_fused_paged_direct")
-            and self._paged_fused_geometry_ok(hidden)
+            and self._paged_fused_geometry_ok(hidden, tokens)
         )
 
-    def supports_paged_fused_decode(self, hidden: int) -> bool:
+    def supports_paged_fused_decode(self, hidden: int, tokens: int | None = None) -> bool:
         """Whether a fused-K/V payload can be dequantized straight into paged KV.
 
         The caller can then skip the dense raw decode and the scatter.
@@ -194,7 +205,7 @@ class _KVWeaveCodec:
         return (
             self.paged_direct_decode
             and hasattr(self.native, "kvweave_dequantize_fused_paged_direct")
-            and self._paged_fused_geometry_ok(hidden)
+            and self._paged_fused_geometry_ok(hidden, tokens)
         )
 
     def serialize_fused_paged(
@@ -226,12 +237,13 @@ class _KVWeaveCodec:
         Raises:
             ValueError: If the codec cannot encode paged KV for this ``hidden``.
         """
-        if not self.supports_paged_fused_encode(hidden):
+        tokens = int(block_ids.numel()) * block_size
+        if not self.supports_paged_fused_encode(hidden, tokens):
             raise ValueError("paged fused encode is not supported for this codec/shape")
         dtype = self._kv_dtype(dtype)
-        shape = (int(layer_ptrs.numel()), int(block_ids.numel()) * block_size, hidden)
+        shape = (int(layer_ptrs.numel()), tokens, hidden)
         header, rh, asym, signs, perm = self._fused_quant_params(
-            dtype, shape, "per_token", per_head_scales=True
+            dtype, shape, self.scaling_method, per_head_scales=True
         )
         head_num = self._fused_head_num(hidden)
         head_dim = self._fused_head_dim(hidden)
@@ -240,6 +252,7 @@ class _KVWeaveCodec:
                 layer_ptrs, block_ids, block_size, block_stride_elems, num_blocks,
                 dtype, header, self.qbit, head_num, head_dim,
                 rh=rh, asym=asym, signs=signs, perm=perm, out=out,
+                **self._paged_scaling_kwargs(),
             )
         )
 
@@ -273,7 +286,7 @@ class _KVWeaveCodec:
                 destination (unsupported codec/shape, or a header that does not
                 match the paged geometry).
         """
-        if not self.supports_paged_fused_decode(hidden):
+        if not self.supports_paged_fused_decode(hidden, int(block_ids.numel()) * block_size):
             raise ValueError("paged fused decode is not supported for this codec/shape")
         dtype = self._kv_dtype(dtype)
         payload = self._payload_u8(src)
@@ -281,7 +294,7 @@ class _KVWeaveCodec:
         layers, tokens, parsed_hidden = parsed["shape"]
         if (
             not parsed["per_head_scales"]
-            or parsed["scaling"] != "per_token"
+            or parsed["scaling"] != self.scaling_method
             or parsed["qbit"] > 8
             or parsed_hidden != hidden
             or layers != int(layer_ptrs.numel())
@@ -305,7 +318,15 @@ class _KVWeaveCodec:
             block_stride_elems, num_blocks, skip_blocks, dtype, parsed["qbit"],
             parsed["head_num"], parsed["head_dim"],
             rh=parsed["rh"], asym=parsed["asym"], signs=signs, perm=perm,
+            **self._paged_scaling_kwargs(),
         )
+
+    def _paged_scaling_kwargs(self) -> dict[str, str]:
+        """Scaling-method kwarg for the paged native calls (omitted for per_token, the
+        native default, so an older extension without the argument keeps working)."""
+        if self.scaling_method == "per_token":
+            return {}
+        return {"scaling_method": self.scaling_method}
 
     def _paged_mamba_geometry_ok(
         self,
