@@ -655,6 +655,35 @@ class TestDecideGroupQuantization:
         )
         assert quantized is False
 
+    def test_mamba_group_with_mismatched_conv_split_falls_back_unquantized(
+        self,
+    ) -> None:
+        """A conv_qkv_split that does not describe the registered conv_state
+        (e.g. config.json's whole-model widths on a tensor-parallel shard) must
+        fall back to unquantized transfer, not fail engine startup."""
+        group = EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=(0, 1),
+            cache_category="mamba",
+            mamba_real_layout=_mamba_layouts(),
+        )
+        # Default conv_qkv_split is 2048/4096 (conv width 8192); the real
+        # conv_state here is 2 wide.
+        quantized, quant_layout, mamba_options = (
+            worker_transfer._decide_group_quantization(
+                group,
+                torch.Size([2, 2, 8, 16]),
+                torch.float32,
+                4,
+                None,
+                _enabled_kvweave_config(),
+                KVWeaveCodec(),
+            )
+        )
+        assert quantized is False
+        assert quant_layout is None
+        assert mamba_options is None
+
     def test_none_group_info_never_quantizes(self) -> None:
         """The single-group (no cache_category) fallback predates the
         cache_category field and must never be quantized."""
@@ -668,6 +697,58 @@ class TestDecideGroupQuantization:
             KVWeaveCodec(),
         )
         assert quantized is False
+
+
+class TestLocalKVWeaveGeometry:
+    """The per-worker widths that rescale config.json's whole-model geometry."""
+
+    def test_measures_split_attention_and_mamba_widths(self) -> None:
+        kv_caches = _make_kv_caches(2, num_heads=2, head_size=8)
+        groups = [
+            EngineGroupInfo(
+                engine_group_id=0,
+                layer_indices=(0, 1),
+                tokens_per_block=4,
+                cache_category="attention",
+            ),
+            EngineGroupInfo(
+                engine_group_id=1,
+                layer_indices=(),
+                tokens_per_block=4,
+                cache_category="mamba",
+                mamba_real_layout=_mamba_layouts(),
+            ),
+        ]
+        layout_desc = MemoryLayoutDesc(
+            shapes=[torch.Size([2, 2, 8, 16])], dtypes=[torch.float32]
+        )
+
+        attention_plane_hidden, conv_dim = worker_transfer._local_kvweave_geometry(
+            groups, kv_caches, layout_desc, 2, 16, None
+        )
+
+        # One K/V plane holds this worker's 2 heads * head_size 8.
+        assert attention_plane_hidden == 16
+        # conv_state's last dim from mamba_real_layout.
+        assert conv_dim == 2
+
+    def test_reports_zero_for_absent_group_kinds(self) -> None:
+        groups = [
+            EngineGroupInfo(
+                engine_group_id=0,
+                layer_indices=(),
+                tokens_per_block=4,
+                cache_category="mamba",
+                mamba_real_layout=None,
+            )
+        ]
+        layout_desc = MemoryLayoutDesc(
+            shapes=[torch.Size([2, 2, 8, 16])], dtypes=[torch.float32]
+        )
+
+        assert worker_transfer._local_kvweave_geometry(
+            groups, {}, layout_desc, 2, 16, None
+        ) == (0, 0)
 
 
 class TestIterTransferGroups:

@@ -1054,27 +1054,43 @@ def _decide_group_quantization(
                 group_info.engine_group_id if group_info is not None else None,
             )
             return False, None, None
-        mamba_options = _resolve_mamba_options_for_group(
-            cast(EngineGroupInfo, group_info),
-            chunk_shape,
-            block_size,
-            kvweave_config.mamba_options,
-        )
-        quant_size = KVWeaveCodec.estimate_mamba_serialized_size(
-            raw_layout_desc,
-            mamba_layout,
-            block_size,
-            scaling_methods=(
-                mamba_options.conv_scaling_method,
-                mamba_options.ssm_scaling_method,
-            ),
-            qbits=(mamba_options.conv_qbit, mamba_options.ssm_qbit),
-            conv_qkv_split=mamba_options.conv_qkv_split,
-            quant_enabled=(
-                mamba_options.conv_quant_enabled,
-                mamba_options.ssm_quant_enabled,
-            ),
-        )
+        try:
+            mamba_options = _resolve_mamba_options_for_group(
+                cast(EngineGroupInfo, group_info),
+                chunk_shape,
+                block_size,
+                kvweave_config.mamba_options,
+            )
+            quant_size = KVWeaveCodec.estimate_mamba_serialized_size(
+                raw_layout_desc,
+                mamba_layout,
+                block_size,
+                scaling_methods=(
+                    mamba_options.conv_scaling_method,
+                    mamba_options.ssm_scaling_method,
+                ),
+                qbits=(mamba_options.conv_qbit, mamba_options.ssm_qbit),
+                conv_qkv_split=mamba_options.conv_qkv_split,
+                quant_enabled=(
+                    mamba_options.conv_quant_enabled,
+                    mamba_options.ssm_quant_enabled,
+                ),
+            )
+        except ValueError:
+            # The configured conv Q/K/V split does not match the registered
+            # conv_state (e.g. config.json disagrees with the real layout, or
+            # a TP shard that localized_to_shard could not rescale). Transfer
+            # this group raw instead of failing engine startup, like the
+            # attention branch above.
+            logger.warning(
+                "KVWeave Mamba size estimate rejected chunk_shape=%s "
+                "(engine_group_id=%s); falling back to unquantized transfer "
+                "for this group",
+                tuple(chunk_shape),
+                group_info.engine_group_id if group_info is not None else None,
+                exc_info=True,
+            )
+            return False, None, None
         if quant_size <= raw_size * kvweave_config.linear_max_size_ratio:
             quant_layout_desc = MemoryLayoutDesc(
                 shapes=[torch.Size([quant_size])], dtypes=[torch.uint8]
@@ -1085,6 +1101,65 @@ def _decide_group_quantization(
     # "unknown" (or MLA/unknown attention layout, or "mamba" with linear
     # quantization disabled): never quantized.
     return False, None, None
+
+
+def _local_kvweave_geometry(
+    engine_group_infos: Sequence[EngineGroupInfo],
+    kv_caches: dict[str, torch.Tensor],
+    layout_desc: MemoryLayoutDesc,
+    num_layers: int,
+    hidden_dim_size: int,
+    layout_hints: LayoutHints | None,
+) -> tuple[int, int]:
+    """Measure this worker's KV widths for :meth:`KVWeaveRuntimeConfig.localized_to_shard`.
+
+    The registered tensors are the only reliable source of the per-worker head
+    shard: ``config.json`` describes the whole model, and the ``world_size``
+    passed to ``register`` is the KV world size (it folds in PP, MLA
+    replication and the server count), not the tensor-parallel degree.
+
+    Args:
+        engine_group_infos: The worker's registered LMCache groups; empty for
+            a single collapsed group (attention only).
+        kv_caches: Worker KV-cache tensors keyed by layer name.
+        layout_desc: The default (single-group) layout descriptor.
+        num_layers: The default (single-group) layer count.
+        hidden_dim_size: The default (single-group) hidden dimension.
+        layout_hints: Optional engine layout hints.
+
+    Returns:
+        ``(attention_plane_hidden, conv_dim)``: the width of one K/V plane of
+        the first split- or fused-K/V attention group, and the last dimension
+        of the first Mamba group's ``conv_state``. Either is ``0`` when no such
+        group exists.
+    """
+    attention_plane_hidden = 0
+    conv_dim = 0
+    group_infos: Sequence[EngineGroupInfo | None] = engine_group_infos or [None]
+    for group_info in group_infos:
+        if group_info is not None and group_info.cache_category == "mamba":
+            if conv_dim == 0 and group_info.mamba_real_layout is not None:
+                conv_dim = int(group_info.mamba_real_layout[0].shape[-1])
+            continue
+        if attention_plane_hidden:
+            continue
+        group_kv_caches = _kv_caches_for_group(kv_caches, group_info)
+        chunk_shape, _ = _group_chunk_shape(
+            group_info,
+            layout_desc,
+            num_layers,
+            hidden_dim_size,
+            group_kv_caches,
+            layout_hints,
+        )
+        engine_kv_format, _ = _detect_group_kv_format(group_kv_caches, layout_hints)
+        plane_layout = _attention_plane_layout_for_group(group_info, engine_kv_format)
+        if plane_layout == AttentionPlaneLayout.SPLIT_KV:
+            attention_plane_hidden = int(chunk_shape[-1])
+        elif plane_layout == AttentionPlaneLayout.FUSED_KV:
+            # Fused chunks pack ``[K|V]`` per head on the trailing axis.
+            attention_plane_hidden = int(chunk_shape[-1]) // 2
+    return attention_plane_hidden, conv_dim
 
 
 def _build_group_transfer_plans(
@@ -1944,7 +2019,20 @@ class EngineDrivenTransferContext(TransferContext):
 
         # Resolved once per registration and reused by every subsequent
         # transfer -- see KVWeaveRuntimeConfig's docstring.
-        kvweave_config = KVWeaveRuntimeConfig.from_env(len(self._engine_group_infos))
+        # The head counts from config.json describe the whole model; rescale
+        # them to the shard this worker actually holds (tensor parallelism).
+        kvweave_config = KVWeaveRuntimeConfig.from_env(
+            len(self._engine_group_infos)
+        ).localized_to_shard(
+            *_local_kvweave_geometry(
+                engine_group_infos,
+                kv_caches,
+                layout_desc,
+                num_layers,
+                hidden_dim_size,
+                layout_hints,
+            )
+        )
         self._kvweave_codec = KVWeaveCodec(kvweave_config.attention_codec_kwargs)
         self._kvweave_enabled = kvweave_config.enabled
         self._quant_device = QuantDevice(kvweave_config.attention_codec_kwargs["device"])

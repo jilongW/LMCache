@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from itertools import count
 import json
@@ -390,6 +390,99 @@ class KVWeaveRuntimeConfig:
             },
             mamba_options=MambaCodecOptions.from_env(),
         )
+
+    def localized_to_shard(
+        self, attention_plane_hidden: int, conv_dim: int
+    ) -> "KVWeaveRuntimeConfig":
+        """Rescale the model-wide geometry to what this worker actually holds.
+
+        ``from_env`` reads head counts from the model's ``config.json``, which
+        describes the whole model. Under tensor parallelism each worker only
+        holds a head shard (``num_key_value_heads / tp`` attention heads, or
+        one replicated head when ``tp`` exceeds the head count, and
+        ``linear_num_*_heads / tp`` Mamba heads), so the codec must be built
+        from the registered tensors' real widths instead. ``head_dim`` and the
+        linear head dims are TP-invariant and kept as is.
+
+        Args:
+            attention_plane_hidden: Width of one K (or V) plane of this
+                worker's attention KV, i.e. ``local_kv_heads * head_dim``;
+                ``0`` when no quantizable attention group was registered.
+            conv_dim: Last dimension of this worker's Mamba ``conv_state``
+                (``local key_dim * 2 + local value_dim``); ``0`` when no Mamba
+                group was registered.
+
+        Returns:
+            ``self`` when nothing changes, otherwise a copy with
+            ``attention_codec_kwargs["num_kv_heads"]`` and/or
+            ``mamba_options.conv_qkv_split`` set to this worker's shard. A
+            width that is not an exact shard of the configured geometry is
+            left unchanged (with a warning), so the per-group size checks
+            fall back to unquantized transfer instead of mis-splitting data.
+        """
+        updates: dict[str, Any] = {}
+
+        head_dim = int(self.attention_codec_kwargs.get("head_dim", 0))
+        num_kv_heads = int(self.attention_codec_kwargs.get("num_kv_heads", 0))
+        if attention_plane_hidden > 0 and head_dim > 0:
+            local_heads, remainder = divmod(attention_plane_hidden, head_dim)
+            if remainder:
+                logger.warning(
+                    "KVWeave: attention plane width %d is not a multiple of "
+                    "head_dim %d; keeping configured num_kv_heads=%d",
+                    attention_plane_hidden,
+                    head_dim,
+                    num_kv_heads,
+                )
+            elif local_heads != num_kv_heads:
+                logger.info(
+                    "KVWeave: using this worker's num_kv_heads=%d (config.json "
+                    "has %d; tensor-parallel shard)",
+                    local_heads,
+                    num_kv_heads,
+                )
+                updates["attention_codec_kwargs"] = {
+                    **self.attention_codec_kwargs,
+                    "num_kv_heads": local_heads,
+                }
+
+        split = self.mamba_options.conv_qkv_split
+        global_conv_dim = split.key_dim * 2 + split.value_dim
+        if conv_dim > 0 and conv_dim != global_conv_dim:
+            shard, remainder = divmod(global_conv_dim, conv_dim)
+            if (
+                remainder
+                or split.key_dim % shard
+                or split.value_dim % shard
+            ):
+                logger.warning(
+                    "KVWeave: conv_state width %d is not a tensor-parallel shard "
+                    "of key_dim*2 + value_dim = %d; keeping configured "
+                    "conv_qkv_split (Mamba groups will be transferred raw)",
+                    conv_dim,
+                    global_conv_dim,
+                )
+            else:
+                local_split = ConvQKVSplit(
+                    key_dim=split.key_dim // shard,
+                    value_dim=split.value_dim // shard,
+                )
+                logger.info(
+                    "KVWeave: using this worker's conv_qkv_split key_dim=%d "
+                    "value_dim=%d (config.json has %d/%d; shard 1/%d)",
+                    local_split.key_dim,
+                    local_split.value_dim,
+                    split.key_dim,
+                    split.value_dim,
+                    shard,
+                )
+                updates["mamba_options"] = replace(
+                    self.mamba_options, conv_qkv_split=local_split
+                )
+
+        if not updates:
+            return self
+        return replace(self, **updates)
 
 
 @dataclass

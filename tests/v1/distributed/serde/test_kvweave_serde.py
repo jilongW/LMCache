@@ -407,6 +407,83 @@ def test_runtime_config_falls_back_when_config_json_missing_fields(
     )
 
 
+def _qwen35_9b_runtime_config(monkeypatch) -> KVWeaveRuntimeConfig:
+    monkeypatch.delenv("MODEL_PATH", raising=False)
+    monkeypatch.delenv("MODEL", raising=False)
+    return KVWeaveRuntimeConfig.from_env(4)
+
+
+def test_localized_to_shard_keeps_single_worker_geometry(monkeypatch):
+    config = _qwen35_9b_runtime_config(monkeypatch)
+
+    # TP=1: the worker holds all 4 KV heads (4 * 256) and the full conv width.
+    assert config.localized_to_shard(4 * 256, 2048 * 2 + 4096) is config
+    # Nothing registered of either kind: also unchanged.
+    assert config.localized_to_shard(0, 0) is config
+
+
+def test_localized_to_shard_rescales_tp2_shard(monkeypatch):
+    config = _qwen35_9b_runtime_config(monkeypatch)
+
+    local = config.localized_to_shard(2 * 256, (2048 * 2 + 4096) // 2)
+
+    assert local.attention_codec_kwargs["num_kv_heads"] == 2
+    assert local.attention_codec_kwargs["head_dim"] == 256
+    assert local.mamba_options.conv_qkv_split == ConvQKVSplit(
+        key_dim=1024, value_dim=2048
+    )
+    # Every other setting is carried over untouched.
+    assert local.enabled == config.enabled
+    assert local.attention_codec_kwargs["qbit"] == config.attention_codec_kwargs["qbit"]
+    assert local.mamba_options.conv_scaling_method == (
+        config.mamba_options.conv_scaling_method
+    )
+    # The env-resolved config itself is not mutated.
+    assert config.attention_codec_kwargs["num_kv_heads"] == 4
+
+
+def test_localized_to_shard_handles_replicated_kv_head(monkeypatch):
+    config = _qwen35_9b_runtime_config(monkeypatch)
+
+    # TP=8 > 4 KV heads: vLLM gives every worker one replicated head.
+    local = config.localized_to_shard(256, 0)
+
+    assert local.attention_codec_kwargs["num_kv_heads"] == 1
+    assert local.mamba_options.conv_qkv_split == config.mamba_options.conv_qkv_split
+
+
+def test_localized_to_shard_keeps_geometry_for_non_shard_widths(monkeypatch):
+    config = _qwen35_9b_runtime_config(monkeypatch)
+
+    # 300 is not a multiple of head_dim=256; 3000 does not divide 8192.
+    assert config.localized_to_shard(300, 3000) is config
+
+
+def test_tp2_split_attention_shard_encodes_after_localization(monkeypatch):
+    config = _qwen35_9b_runtime_config(monkeypatch)
+    kwargs = {**config.attention_codec_kwargs, "device": "cpu", "rh": False}
+    # One TP=2 worker's split-K/V chunk: 2 of the model's 4 KV heads.
+    source = torch.randn(2, 1, 64, 2 * 256, dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="hidden size"):
+        _KVWeaveCodec(kwargs).encode_chunk("attention", None, 64, None, source)
+
+    local = config.localized_to_shard(2 * 256, 0)
+    codec = _KVWeaveCodec({**local.attention_codec_kwargs, "device": "cpu", "rh": False})
+    payload = codec.encode_chunk("attention", None, 64, None, source)
+    restored = codec.decode_chunk(
+        "attention",
+        None,
+        64,
+        source.shape,
+        source.dtype,
+        torch.tensor(list(payload), dtype=torch.uint8),
+    )
+
+    assert restored.shape == source.shape
+    assert torch.max(torch.abs(source.float() - restored.float())) < 0.5
+
+
 def test_codec_chunk_methods_dispatch_attention():
     codec = _codec()
     source = torch.randn(2, 1, 64, 8, dtype=torch.float16)
