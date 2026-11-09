@@ -88,6 +88,7 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
                 align_bytes=config.align_bytes,
                 shm_name=shm_name,
                 use_hugepages=config.use_hugepages,
+                backing_size=config.shm_pool_size_in_bytes,
             )
         return MixedMemoryAllocator(
             config.size_in_bytes,
@@ -230,6 +231,18 @@ class L1MemoryManager:
             align_bytes=self._align_bytes,
             stable_registration_size=stable_registration_size,
         )
+
+    def is_variable_size(self) -> bool:
+        """Whether this tier can allocate chunks of arbitrary byte size.
+
+        Returns:
+            ``True``: both ``MixedMemoryAllocator`` and ``LazyMemoryAllocator``
+            are backed by an ``AddressManager``/``TensorMemoryAllocator``
+            byte-granular address space on this path (``create_memory_allocator``
+            never enables ``use_paging``), so either can serve arbitrarily
+            sized allocations.
+        """
+        return True
 
     def close(self) -> None:
         """

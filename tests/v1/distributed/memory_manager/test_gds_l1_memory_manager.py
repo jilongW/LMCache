@@ -83,3 +83,7 @@ class TestMisc:
 
     def test_close_does_not_raise(self):
         GDSL1MemoryManager(_config(1 << 20)).close()
+
+    def test_is_variable_size_is_false(self):
+        # The slab's cuFile/O_DIRECT DMA path assumes uniformly-sized chunks.
+        assert GDSL1MemoryManager(_config(1 << 20)).is_variable_size() is False

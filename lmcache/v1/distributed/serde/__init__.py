@@ -15,6 +15,7 @@ from lmcache.v1.distributed.serde.base import (
 from lmcache.v1.distributed.serde.factory import (
     create_serde_processor,
     get_registered_serde_types,
+    is_lossy_serde_type,
     register_serde_factory,
 )
 from lmcache.v1.distributed.serde.fp8 import (
@@ -63,6 +64,7 @@ __all__ = [
     "Serializer",
     "create_serde_processor",
     "get_registered_serde_types",
+    "is_lossy_serde_type",
     "make_temp_key",
     "register_serde_factory",
     "serialized_layout_desc",

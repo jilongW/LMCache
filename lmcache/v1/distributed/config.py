@@ -272,11 +272,30 @@ class L1MemoryManagerConfig:
     mlock: bool = False
     """ mlock the L1 buffer so compaction cannot migrate it (ROCm only). """
 
+    shm_pool_size_in_bytes: int | None = None
+    """ Backing SHM size when it includes a non-L1 scratch tail. ``None`` means
+    the pool is exactly ``size_in_bytes``. Must be >= ``size_in_bytes``. """
+
     def __post_init__(self):
         self.init_size_in_bytes = min(self.init_size_in_bytes, self.size_in_bytes)
 
         if self.devdax_path is not None:
             self.devdax_path = self.devdax_path.strip()
+
+        if self.shm_pool_size_in_bytes is not None:
+            if self.shm_pool_size_in_bytes < self.size_in_bytes:
+                raise ValueError(
+                    "shm_pool_size_in_bytes must be >= size_in_bytes "
+                    f"({self.shm_pool_size_in_bytes} < {self.size_in_bytes})"
+                )
+            if self.shm_pool_size_in_bytes > self.size_in_bytes and (
+                self.use_lazy or self.devdax_path or not self.shm_name
+            ):
+                raise ValueError(
+                    "shm_pool_size_in_bytes (a scratch tail behind the L1 pool) "
+                    "requires an eager SHM-backed L1: set --no-l1-use-lazy, a "
+                    "non-empty --shm-name, and no --l1-devdax-path."
+                )
 
         if self.devdax_offset_in_bytes < 0:
             raise ValueError("devdax_offset_in_bytes must be >= 0")

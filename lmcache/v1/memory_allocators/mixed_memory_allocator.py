@@ -56,9 +56,15 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             self.shm_name = kwargs.get("shm_name", None)
 
         self.size = size
+        backing_size = kwargs.get("backing_size") or size
+        if backing_size < size:
+            raise ValueError("backing_size must be >= allocator size")
 
         self.buffer = memory_management._allocate_cpu_memory(
-            size, self.numa_mapping, self.shm_name, use_hugepages=use_hugepages
+            backing_size,
+            self.numa_mapping,
+            self.shm_name,
+            use_hugepages=use_hugepages,
         )
 
         self._unregistered = False
@@ -73,14 +79,14 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             )
             assert "fmt" in kwargs, "fmt must be specified for paged memory allocator"
             self.pin_allocator = PagedTensorMemoryAllocator(
-                tensor=self.buffer,
+                tensor=self.buffer[:size],
                 shapes=kwargs["shapes"],
                 dtypes=kwargs["dtypes"],
                 fmt=kwargs["fmt"],
             )
         else:
             self.pin_allocator = TensorMemoryAllocator(
-                self.buffer, align_bytes=self.align_bytes
+                self.buffer[:size], align_bytes=self.align_bytes
             )
 
         self.host_mem_lock = threading.Lock() if not use_paging else nullcontext()

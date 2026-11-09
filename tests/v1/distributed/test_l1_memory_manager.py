@@ -440,6 +440,36 @@ class TestGetL1MemoryDesc:
 
 
 # =============================================================================
+# Tests for L1MemoryManager.is_variable_size()
+# =============================================================================
+
+
+class TestIsVariableSize:
+    """Tests for L1MemoryManager.is_variable_size().
+
+    Per the docstring: True for both allocator types the CPU tier can hold
+    (MixedMemoryAllocator, LazyMemoryAllocator), since neither uses paging
+    on this path.
+    """
+
+    def test_lazy_allocator_is_variable_size(self, basic_config):
+        """Lazy-allocation config (when supported) reports variable-size."""
+        manager = L1MemoryManager(basic_config)
+
+        assert manager.is_variable_size() is True
+
+        manager.close()
+
+    def test_non_lazy_allocator_is_variable_size(self, non_lazy_config):
+        """Non-lazy (MixedMemoryAllocator) config reports variable-size."""
+        manager = L1MemoryManager(non_lazy_config)
+
+        assert manager.is_variable_size() is True
+
+        manager.close()
+
+
+# =============================================================================
 # Tests for L1MemoryManager integration
 # =============================================================================
 
@@ -707,3 +737,100 @@ def test_create_memory_allocator_passes_use_hugepages(monkeypatch):
     assert allocator is not None
     assert captured.get("use_hugepages") is True
     assert captured.get("align_bytes") == config.align_bytes
+
+
+# =============================================================================
+# Tests for shm_pool_size_in_bytes (non-L1 scratch tail behind the L1 pool)
+# =============================================================================
+
+
+class TestShmPoolSize:
+    """``shm_pool_size_in_bytes`` sizes the SHM backing beyond the L1 pool."""
+
+    def test_default_is_none(self):
+        config = L1MemoryManagerConfig(size_in_bytes=1 << 30, use_lazy=False)
+        assert config.shm_pool_size_in_bytes is None
+
+    def test_smaller_than_pool_rejected(self):
+        with pytest.raises(ValueError, match="must be >= size_in_bytes"):
+            L1MemoryManagerConfig(
+                size_in_bytes=1 << 30,
+                use_lazy=False,
+                shm_pool_size_in_bytes=1 << 29,
+            )
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"use_lazy": True},
+            {"use_lazy": False, "shm_name": ""},
+        ],
+    )
+    def test_scratch_tail_needs_eager_shm(self, kwargs):
+        with pytest.raises(ValueError, match="eager SHM-backed L1"):
+            L1MemoryManagerConfig(
+                size_in_bytes=1 << 30,
+                shm_pool_size_in_bytes=(1 << 30) + (1 << 20),
+                **kwargs,
+            )
+
+    def test_equal_to_pool_is_always_allowed(self):
+        # No tail -> nothing extra to back, so the SHM requirement does not apply.
+        config = L1MemoryManagerConfig(
+            size_in_bytes=1 << 30,
+            use_lazy=True,
+            shm_pool_size_in_bytes=1 << 30,
+        )
+        assert config.shm_pool_size_in_bytes == 1 << 30
+
+    def test_create_memory_allocator_forwards_backing_size(self, monkeypatch):
+        # First Party
+        from lmcache.v1.distributed.memory_manager import l1_memory_manager
+
+        captured = {}
+
+        def fake_mixed_init(self, size, **kwargs):
+            captured.update(kwargs)
+            self.size = size
+
+        monkeypatch.setattr(
+            l1_memory_manager.MixedMemoryAllocator, "__init__", fake_mixed_init
+        )
+        monkeypatch.setattr(l1_memory_manager, "_unlink_stale_shm", lambda name: None)
+
+        config = L1MemoryManagerConfig(
+            size_in_bytes=1 << 30,
+            use_lazy=False,
+            shm_name="scratch_tail_test",
+            shm_pool_size_in_bytes=(1 << 30) + (64 << 20),
+        )
+        l1_memory_manager.create_memory_allocator(config)
+
+        assert captured["backing_size"] == (1 << 30) + (64 << 20)
+        assert captured["shm_name"] == "lmcache_l1_pool_scratch_tail_test"
+
+
+def test_mixed_allocator_keeps_scratch_tail_out_of_the_l1_pool():
+    """The allocator hands out only ``size`` bytes of a larger backing buffer."""
+    # First Party
+    from lmcache.v1.memory_allocators.mixed_memory_allocator import (
+        MixedMemoryAllocator,
+    )
+
+    size, backing = 1 << 20, (1 << 20) + (256 << 10)
+    allocator = MixedMemoryAllocator(size, backing_size=backing)
+    try:
+        assert allocator.buffer.numel() == backing
+        assert allocator.pin_allocator.buffer.numel() == size
+    finally:
+        allocator.close()
+
+
+def test_mixed_allocator_rejects_backing_smaller_than_pool():
+    # First Party
+    from lmcache.v1.memory_allocators.mixed_memory_allocator import (
+        MixedMemoryAllocator,
+    )
+
+    with pytest.raises(ValueError, match="backing_size must be >="):
+        MixedMemoryAllocator(1 << 20, backing_size=1 << 19)

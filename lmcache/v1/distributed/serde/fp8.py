@@ -100,4 +100,4 @@ def _create_fp8_serde(kwargs: dict[str, object]) -> SerdeProcessor:
     )
 
 
-register_serde_factory("fp8", _create_fp8_serde)
+register_serde_factory("fp8", _create_fp8_serde, is_lossy=True)
