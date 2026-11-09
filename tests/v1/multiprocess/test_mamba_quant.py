@@ -1115,7 +1115,7 @@ def test_resolve_mamba_options_downgrades_rh_for_non_power_of_two_conv_dim():
     ``LMCACHE_MP_KVWEAVE_LINEAR_RH``/``CONV_RH`` note)."""
     # First Party
     from lmcache.v1.multiprocess.group_view import EngineGroupInfo
-    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+    from lmcache.v1.multiprocess.transfer_context.kvweave_plan import (
         _resolve_mamba_options_for_group,
     )
 
@@ -1174,7 +1174,7 @@ def test_resolve_mamba_options_keeps_rh_for_power_of_two_shapes():
     """
     # First Party
     from lmcache.v1.multiprocess.group_view import EngineGroupInfo
-    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+    from lmcache.v1.multiprocess.transfer_context.kvweave_plan import (
         _resolve_mamba_options_for_group,
     )
 
