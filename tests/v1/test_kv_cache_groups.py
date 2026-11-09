@@ -5,6 +5,7 @@ import msgspec
 # First Party
 from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
+    MambaSubStateWireLayout,
     expand_engine_block_ids,
     get_engine_group_indices,
     num_engine_group_infos,
@@ -53,6 +54,50 @@ def test_engine_group_info_old_payload_defaults_sw_size():
     )
 
     assert decoded.sw_size_tokens == -1
+
+
+def test_engine_group_info_old_payload_defaults_cache_category():
+    """A pre-cache_category msgspec payload decodes with 'unknown' defaults."""
+    old_payload = {"engine_group_id": 0, "layer_indices": (0, 1)}
+
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(old_payload), type=EngineGroupInfo
+    )
+
+    assert decoded.cache_category == "unknown"
+    assert decoded.mamba_real_layout is None
+
+
+def test_engine_group_infos_msgspec_round_trip_with_mamba_real_layout():
+    """cache_category and mamba_real_layout survive the IPC msgspec round trip."""
+    groups = [
+        EngineGroupInfo(0, (0,), cache_category="attention"),
+        EngineGroupInfo(
+            1,
+            (1,),
+            cache_category="mamba",
+            mamba_real_layout=(
+                MambaSubStateWireLayout(
+                    byte_offset=0,
+                    byte_length=36864,
+                    dtype_str="torch.float16",
+                    shape=(3, 6144),
+                ),
+                MambaSubStateWireLayout(
+                    byte_offset=36864,
+                    byte_length=1048576,
+                    dtype_str="torch.float32",
+                    shape=(16, 128, 128),
+                ),
+            ),
+        ),
+    ]
+
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(groups), type=list[EngineGroupInfo]
+    )
+
+    assert decoded == groups
 
 
 def test_engine_group_infos_msgspec_round_trip():

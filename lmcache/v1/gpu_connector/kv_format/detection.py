@@ -66,7 +66,7 @@ def detect_format(
     engine_kv_format, kv_caches = detector.discover(kv_caches, layout_hints or {})
     if engine_kv_format is None:
         raise ValueError(f"unsupported kv_caches structure for {serving_engine}")
-    logger.info(
+    logger.debug(
         "Engine KV Format: %s %s", engine_kv_format, describe_shape(engine_kv_format)
     )
     return engine_kv_format, kv_caches
