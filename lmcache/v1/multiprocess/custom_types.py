@@ -2,7 +2,7 @@
 # Standard
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 # Third Party
 import msgspec
@@ -17,6 +17,10 @@ from lmcache.v1.multiprocess.token_codec import (
 from lmcache.v1.platform.base.ipc_wrapper import (  # noqa: E402,F401
     DeviceIPCWrapper,
 )
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
 
 """
 Defines the types and the customized encoder/decoders for inter-process
@@ -191,6 +195,77 @@ class IPCCacheServerKey:
 KVCache = list[DeviceIPCWrapper]
 
 
+class SerializedMemoryLayoutDesc(msgspec.Struct, frozen=True):
+    """Message-pack-safe mirror of ``MemoryLayoutDesc``.
+
+    ``MemoryLayoutDesc`` (``lmcache.v1.distributed.api``) holds real
+    ``torch.Size``/``torch.dtype`` objects, which msgspec cannot encode when
+    nested inside another struct (the ``torch.dtype``/``torch.Size``
+    encode/decode hooks only apply when ``MemoryLayoutDesc`` is itself the
+    top-level payload/response class of an RPC). This struct carries the same
+    information with wire-safe primitives so it can be embedded in
+    ``GroupLayout.layout_override``.
+
+    Attributes:
+        shapes: One entry per tensor in the described layout, as plain
+            ``list[int]`` (mirrors ``MemoryLayoutDesc.shapes``).
+        dtypes: One entry per tensor, as ``str(torch.dtype)`` (mirrors
+            ``MemoryLayoutDesc.dtypes``).
+    """
+
+    shapes: list[list[int]]
+    dtypes: list[str]
+
+
+def serialize_memory_layout_desc(
+    layout_desc: "MemoryLayoutDesc",
+) -> SerializedMemoryLayoutDesc:
+    """Encode a memory layout for the engine-driven registration payload.
+
+    Args:
+        layout_desc: The layout to encode.
+
+    Returns:
+        A wire-safe ``SerializedMemoryLayoutDesc`` with the same shapes and
+        dtypes.
+    """
+    return SerializedMemoryLayoutDesc(
+        shapes=[list(shape) for shape in layout_desc.shapes],
+        dtypes=[str(dtype) for dtype in layout_desc.dtypes],
+    )
+
+
+def deserialize_memory_layout_desc(
+    payload: SerializedMemoryLayoutDesc,
+) -> "MemoryLayoutDesc":
+    """Decode a serialized layout descriptor from an IPC payload.
+
+    Args:
+        payload: The wire-safe struct produced by
+            ``serialize_memory_layout_desc``.
+
+    Returns:
+        The equivalent ``MemoryLayoutDesc`` with real ``torch.Size``/
+        ``torch.dtype`` values.
+
+    Raises:
+        ValueError: If any entry in ``payload.dtypes`` does not name a
+            valid ``torch.dtype``.
+    """
+    # First Party
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
+
+    dtypes: list[torch.dtype] = []
+    for dtype_name in payload.dtypes:
+        dtype = getattr(torch, dtype_name.removeprefix("torch."), None)
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"Unsupported torch dtype in payload: {dtype_name}")
+        dtypes.append(dtype)
+    return MemoryLayoutDesc(
+        shapes=[torch.Size(shape) for shape in payload.shapes], dtypes=dtypes
+    )
+
+
 class GroupLayout(msgspec.Struct):
     """Per-LMCache-group layout for multi-group engine-driven registration.
 
@@ -220,6 +295,13 @@ class GroupLayout(msgspec.Struct):
         num_physical_slots: Physical slots stored per chunk, after windowing
             and slot compression. ``None`` retains the legacy one-slot-per-token
             layout derived from ``window_tokens``.
+        layout_override: The group's actual per-chunk transfer layout, set by a
+            worker that does not move the raw KV tensor: the encoded ``uint8``
+            byte layout of a KVWeave-quantized group, or the raw chunk shape and
+            dtype of non-attention state (Mamba) whose real shape the
+            attention-shaped derivation above cannot describe. When set the
+            server uses it verbatim to size SHM slots and L1 objects. ``None``
+            keeps the derivation from the fields above (older workers).
     """
 
     num_layers: int
@@ -231,6 +313,7 @@ class GroupLayout(msgspec.Struct):
     window_chunks: int = 0
     recurrent: bool = False
     num_physical_slots: int | None = None
+    layout_override: SerializedMemoryLayoutDesc | None = None
 
 
 class RegisterEngineDrivenContextPayload(msgspec.Struct):
@@ -252,6 +335,11 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
             in protocol group order. Empty means legacy single-group; the
             top-level ``num_layers``/``hidden_dim_size``/``dtype_str`` then
             describe the sole group.
+        enable_l1_kvweave_quant: Worker's declared intent to quantize at
+            least one group's chunks for this registration. The server is the
+            sole authority on whether this is permitted (every L1 must
+            support variable-size chunks) and rejects the registration via
+            ``RegisterEngineDrivenContextResponse.error`` when it is not.
     """
 
     instance_id: int
@@ -264,6 +352,7 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     use_mla: bool
     num_physical_slots: int | None = None
     group_layouts: list[GroupLayout] = []
+    enable_l1_kvweave_quant: bool = False
 
 
 @dataclass
@@ -275,11 +364,21 @@ class RegisterEngineDrivenContextResponse:
         pool_size: Size of that pool in bytes.
         null_block_id: Engine block ID the server treats as absent KV data.
             Workers skip storing chunks whose blocks are all this ID.
+        scratch_offset: Byte offset in the SHM pool of this worker's scratch
+            slot (the non-L1 tail behind the L1 pool), or ``0`` without one.
+        scratch_size: Size in bytes of that scratch slot; ``0`` means none.
+        error: Human-readable rejection reason when the server declines the
+            registration (e.g. quantization requested on a fixed-size L1).
+            ``None`` on success. Callers must check it before trusting
+            ``shm_name``/``pool_size``.
     """
 
     shm_name: str = ""
     pool_size: int = 0
     null_block_id: int = 0
+    scratch_offset: int = 0
+    scratch_size: int = 0
+    error: str | None = None
 
 
 @dataclass
