@@ -25,7 +25,10 @@ from lmcache.integration.vllm.mp_server_launcher import (
     maybe_start_mp_server_from_url,
     wait_for_mp_server_from_url,
 )
-from lmcache.integration.vllm.utils import vllm_layout_hints
+from lmcache.integration.vllm.utils import (
+    export_kv_cache_dtype,
+    vllm_layout_hints,
+)
 from lmcache.utils import (
     CacheEvent,
     CacheRemoveEvent,
@@ -1559,6 +1562,7 @@ class LMCacheMPWorkerAdapter:
                 )
         self.kv_caches = kv_caches
         self.engine_group_infos = list(engine_group_infos)
+        export_kv_cache_dtype()
         # Reused when heartbeat recovery re-registers.
         self._layout_hints = (
             layout_hints if layout_hints is not None else vllm_layout_hints()

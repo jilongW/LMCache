@@ -766,6 +766,32 @@ def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):
     req_client.register_kv_cache.assert_called_once()
 
 
+def test_register_kv_caches_exports_the_kv_cache_dtype_before_registering(
+    fake_adapter, monkeypatch
+):
+    """The fp8 format must be in the environment before the worker transfer
+    context reads its KVWeave configuration during registration."""
+    # First Party
+    from lmcache.integration.vllm import vllm_multi_process_adapter
+
+    adapter, req_client, _ = fake_adapter
+    order: list[str] = []
+    monkeypatch.setattr(
+        vllm_multi_process_adapter,
+        "export_kv_cache_dtype",
+        lambda: order.append("export"),
+    )
+    req_client.register_kv_cache.side_effect = lambda *a, **k: order.append(
+        "register"
+    ) or MagicMock()
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+
+    adapter.register_kv_caches({"layer.0": fake_tensor})
+
+    assert order[:1] == ["export"]
+
+
 def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
     """Public register_kv_caches surfaces ConnectionError on MQ timeout."""
     adapter, _send_mock, future = fake_adapter
