@@ -2857,6 +2857,9 @@ def _kvweave_payload(
     )
 
 
+_SHM_POOL = {"shm_name": "lmcache_l1_pool_t", "pool_size": 1 << 20}
+
+
 def test_register_uses_group_layout_override(
     stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
@@ -2899,6 +2902,7 @@ def test_register_quant_marks_storage_when_l1_is_variable_size(
     server_module_factory: ServerModuleFactory,
 ) -> None:
     module, mock_storage, _, ctx = server_module_factory(chunk_size=16)
+    module._shm_pool_info = dict(_SHM_POOL)  # type: ignore[assignment]
     mock_storage.is_l1_variable_size.return_value = True
 
     response = module.register_kv_cache_engine_driven_context(
@@ -2917,6 +2921,7 @@ def test_register_quant_rejected_on_fixed_size_l1(
     """Quantization needs every L1 to be variable-size; a rejected registration
     leaves nothing behind."""
     module, mock_storage, _, ctx = server_module_factory(chunk_size=16)
+    module._shm_pool_info = dict(_SHM_POOL)  # type: ignore[assignment]
     mock_storage.is_l1_variable_size.return_value = False
 
     response = module.register_kv_cache_engine_driven_context(
@@ -2931,11 +2936,32 @@ def test_register_quant_rejected_on_fixed_size_l1(
     assert 1 not in module._engine_driven_contexts
 
 
+def test_register_quant_rejected_without_shm_transport(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Inline transport carries raw chunks only, so a quantized registration is
+    refused up front instead of failing on the first store."""
+    module, mock_storage, _, ctx = server_module_factory(chunk_size=16)
+    module._shm_pool_info = {"shm_name": "", "pool_size": 0}  # type: ignore[assignment]
+    mock_storage.is_l1_variable_size.return_value = True
+
+    response = module.register_kv_cache_engine_driven_context(
+        _kvweave_payload(enable_quant=True)
+    )
+
+    assert response.error is not None
+    assert "SHM" in response.error
+    mock_storage.mark_l1_kvweave_quant_enabled.assert_not_called()
+    assert 1 not in module._engine_driven_contexts
+
+
 def test_register_quant_rejected_when_lossy_l2_already_configured(
     stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
     module, mock_storage, _, ctx = server_module_factory(chunk_size=16)
+    module._shm_pool_info = dict(_SHM_POOL)  # type: ignore[assignment]
     mock_storage.is_l1_variable_size.return_value = True
     mock_storage.mark_l1_kvweave_quant_enabled.side_effect = ValueError(
         "L2 adapter(s) ['fs'] already use a lossy serde"

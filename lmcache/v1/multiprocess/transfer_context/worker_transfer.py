@@ -17,6 +17,8 @@ import torch
 from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.distributed.serde.kvweave.kvweave_config import KVWeaveRuntimeConfig
+from lmcache.v1.distributed.serde.kvweave.kvweave_serde import KVWeaveCodec
 from lmcache.v1.gpu_connector.utils import (
     LayoutHints,
     get_device,
@@ -27,6 +29,7 @@ from lmcache.v1.multiprocess.custom_types import (
     GroupLayout,
     RegisterEngineDrivenContextPayload,
     RegisterEngineDrivenContextResponse,
+    serialize_memory_layout_desc,
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
@@ -40,6 +43,11 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     scatter_cpu_to_paged_kv,
 )
 from lmcache.v1.multiprocess.transfer_context.inline import EngineDrivenContextInline
+from lmcache.v1.multiprocess.transfer_context.kvweave_plan import (
+    GroupTransferPlan,
+    build_group_transfer_plan,
+    local_kvweave_geometry,
+)
 from lmcache.v1.multiprocess.transfer_mode import MPTransferMode
 from lmcache.v1.multiprocess.transport.base import RequestClient
 from lmcache.v1.platform import (
@@ -197,6 +205,8 @@ class _GroupState:
         window_chunks: Trailing chunks this group needs for a cache hit
             (``-1`` = full attention). A retrieve returns only these chunks
             for the group, mirroring the server's prefetch window.
+        plan: The group's KVWeave plan (quantized or not), resolved at
+            ``register`` time; ``None`` for states built without one.
     """
 
     layer_names: list[str]
@@ -205,6 +215,12 @@ class _GroupState:
     blocks_per_window: int
     layout_desc: MemoryLayoutDesc
     window_chunks: int = -1
+    plan: "GroupTransferPlan | None" = None
+
+    @property
+    def quantized(self) -> bool:
+        """Whether this group's chunks travel KVWeave-quantized."""
+        return self.plan is not None and self.plan.quantized
 
 
 # Allocates ``count`` CPU gather targets of one shape and dtype.
@@ -841,6 +857,8 @@ class EngineDrivenTransferContext(TransferContext):
         self._null_block_id = 0
         # Tokens in one LMCache chunk (multi-group registration).
         self._chunk_tokens = 0
+        # Set by register() when any group is KVWeave-quantized.
+        self._kvweave_codec: KVWeaveCodec | None = None
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -932,8 +950,19 @@ class EngineDrivenTransferContext(TransferContext):
 
         group_layouts: list[GroupLayout] = []
         group_states: list[_GroupState] = []
-        if len(engine_group_infos) > 1 or (
-            engine_group_infos and engine_group_infos[0].tokens_per_block > block_size
+        # KVWeave quantization works per group on the multi-group path, so with
+        # KVWeave on even a plain single group takes it. Off, the legacy path
+        # is untouched.
+        kvweave_enabled = bool(engine_group_infos) and (
+            KVWeaveRuntimeConfig.from_env(len(engine_group_infos)).enabled
+        )
+        if (
+            len(engine_group_infos) > 1
+            or kvweave_enabled
+            or (
+                engine_group_infos
+                and engine_group_infos[0].tokens_per_block > block_size
+            )
         ):
             # One LMCache chunk must cover a whole number of blocks of EVERY
             # group. Prefer the chunk size the adapter knows: blocks_in_chunk
@@ -956,6 +985,9 @@ class EngineDrivenTransferContext(TransferContext):
                 chunk_tokens = lmcache_chunk_tokens
             self._chunk_tokens = chunk_tokens
             layer_names = list(kv_caches)
+            # Per kernel group: (shape, tokens_per_block) behind its layout, kept
+            # for the KVWeave plan below.
+            group_facts: list[tuple[torch.Size, int]] = []
             normalized_kv, per_layer_formats = normalize_and_discover_per_layer_formats(
                 list(kv_caches.values()),
                 [group.layer_indices for group in engine_group_infos],
@@ -1016,6 +1048,7 @@ class EngineDrivenTransferContext(TransferContext):
                         num_physical_slots=window_slots,
                     )
                 )
+                group_facts.append((group_shape, tokens_per_block))
                 group_states.append(
                     _GroupState(
                         layer_names=[
@@ -1029,6 +1062,14 @@ class EngineDrivenTransferContext(TransferContext):
                         ),
                         window_chunks=window_chunks,
                     )
+                )
+            if kvweave_enabled:
+                self._plan_kvweave_groups(
+                    manager,
+                    engine_group_infos,
+                    group_states,
+                    group_layouts,
+                    group_facts,
                 )
             # Group 0's layout doubles as the legacy top-level layout so
             # single-group readers of the payload keep working.
@@ -1060,6 +1101,9 @@ class EngineDrivenTransferContext(TransferContext):
                     use_mla=use_mla_flag,
                     num_physical_slots=num_physical_slots,
                     group_layouts=group_layouts,
+                    enable_l1_kvweave_quant=any(
+                        state.quantized for state in group_states
+                    ),
                 )
             )
         )
@@ -1070,6 +1114,11 @@ class EngineDrivenTransferContext(TransferContext):
         pool_size = 0
         null_block_id = 0
         if isinstance(response, RegisterEngineDrivenContextResponse):
+            if response.error:
+                raise RuntimeError(
+                    "Server rejected engine-driven context registration: "
+                    f"{response.error}"
+                )
             shm_name = response.shm_name
             pool_size = response.pool_size
             null_block_id = response.null_block_id
@@ -1088,14 +1137,100 @@ class EngineDrivenTransferContext(TransferContext):
             shm_name=shm_name,
             pool_size=pool_size,
         )
+        if self._kvweave_codec is not None and isinstance(
+            self._engine_driven_context, EngineDrivenContextInline
+        ):
+            # SHM setup failed and the factory fell back to inline, which carries
+            # raw chunks only; storing quantized bytes there would corrupt reads.
+            self._engine_driven_context.close()
+            self._engine_driven_context = None
+            raise RuntimeError(
+                "KVWeave quantization needs the SHM transport, but this worker "
+                "ended up on inline transport (server SHM disabled or the SHM "
+                "segment could not be attached)"
+            )
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "inline"
         logger.info(
             "Worker engine-driven context registered "
-            "(instance_id=%d, mode=%s, groups=%d)",
+            "(instance_id=%d, mode=%s, groups=%d, kvweave_quantized_groups=%d)",
             self._instance_id,
             supported_transfer_mode,
             max(1, len(self._group_states)),
+            sum(state.quantized for state in self._group_states),
         )
+
+    def _plan_kvweave_groups(
+        self,
+        manager: KVLayerGroupsManager,
+        engine_group_infos: Sequence[EngineGroupInfo],
+        group_states: "list[_GroupState]",
+        group_layouts: list[GroupLayout],
+        group_facts: "list[tuple[torch.Size, int]]",
+    ) -> None:
+        """Decide each group's KVWeave quantization and record it in place.
+
+        Kernel group ``i`` corresponds to ``engine_group_infos[i]``. A quantized
+        group gets its encoded byte layout as ``GroupLayout.layout_override`` so
+        the server sizes its SHM slots and L1 objects for the quantized payload;
+        every other group keeps the server's own derivation.
+
+        Args:
+            manager: The worker's layer-group manager (source of each kernel
+                group's dtype, format and layer membership).
+            engine_group_infos: The registered groups, one per kernel group.
+            group_states: Per-group worker state; each gets its ``plan``.
+            group_layouts: Registration layouts; quantized groups get an override.
+            group_facts: Per kernel group, its stored raw shape and tokens per
+                block.
+        """
+        infos: Sequence[EngineGroupInfo | None] = engine_group_infos or [None]
+        kernel_groups = manager.kernel_groups
+        # The head counts in config.json describe the whole model; rescale them
+        # to the shard this worker actually holds (tensor parallelism).
+        kvweave_config = KVWeaveRuntimeConfig.from_env(
+            len(engine_group_infos)
+        ).localized_to_shard(
+            *local_kvweave_geometry(
+                [
+                    (infos[i], group_facts[i][0], kernel_groups[i].engine_kv_format)
+                    for i in range(len(kernel_groups))
+                ]
+            )
+        )
+        codec = KVWeaveCodec(kvweave_config.attention_codec_kwargs)
+        for gid, kernel_group in enumerate(kernel_groups):
+            shape, tokens_per_block = group_facts[gid]
+            plan = build_group_transfer_plan(
+                group_info=infos[gid],
+                layer_indices=kernel_group.layer_indices,
+                blocks_per_chunk=group_states[gid].blocks_in_chunk,
+                chunk_shape=shape,
+                dtype=kernel_group.dtype,
+                engine_kv_format=kernel_group.engine_kv_format,
+                block_size=tokens_per_block,
+                kvweave_config=kvweave_config,
+                codec=codec,
+            )
+            group_states[gid].plan = plan
+            if plan.quantized:
+                assert plan.quant_layout_desc is not None
+                group_layouts[gid].layout_override = serialize_memory_layout_desc(
+                    plan.quant_layout_desc
+                )
+            info = infos[gid]
+            logger.info(
+                "KVWeave group %d: engine_group_id=%s category=%s format=%s "
+                "attention_layout=%s raw_shape=%s quantized=%s",
+                gid,
+                info.engine_group_id if info is not None else None,
+                info.cache_category if info is not None else "unknown",
+                kernel_group.engine_kv_format,
+                plan.attention_plane_layout,
+                tuple(shape),
+                plan.quantized,
+            )
+        if any(state.quantized for state in group_states):
+            self._kvweave_codec = codec
 
     def unregister(self) -> MessagingFuture[Any] | None:
         """Start engine-driven unregistration for this worker instance.
@@ -1383,13 +1518,103 @@ class EngineDrivenTransferContext(TransferContext):
                     state.blocks_in_chunk,
                     layout_hints=self._layout_hints,
                     engine_kv_format=state.engine_kv_format,
-                    out=plan.out,
+                    # A quantized group's slots hold encoded bytes, not raw KV:
+                    # gather raw into fresh CPU buffers and encode into the slots
+                    # at commit.
+                    out=None if state.quantized else plan.out,
                     chunk_indices=plan.chunk_indices,
                     blocks_per_window=state.blocks_per_window,
                     engine_type=self._engine_type,
                 )
             )
         return gathered
+
+    def _codec_group_args(self, gid: int) -> tuple[str, Any, int]:
+        """The ``(category, mamba_layout, tokens_per_block)`` the codec takes."""
+        state = self._group_states[gid]
+        plan = state.plan
+        assert plan is not None and plan.group_info is not None
+        tokens_per_block = self._chunk_tokens // state.blocks_in_chunk
+        return (
+            plan.group_info.cache_category,
+            plan.group_info.mamba_real_layout,
+            tokens_per_block,
+        )
+
+    def _encode_quantized_groups(
+        self,
+        plans: "list[_GroupStorePlan]",
+        gathered: list[list[torch.Tensor]],
+    ) -> None:
+        """Encode each quantized group's raw chunks into its SHM slots.
+
+        Groups that are not quantized were gathered straight into their slots and
+        are left alone. Must run after the gather copies completed.
+
+        Raises:
+            RuntimeError: If a quantized group has no codec or no SHM slots (the
+                inline transport cannot carry quantized chunks).
+        """
+        for store_plan, chunks in zip(plans, gathered, strict=True):
+            state = self._group_states[store_plan.gid]
+            if not state.quantized or not chunks:
+                continue
+            group_plan = state.plan
+            assert group_plan is not None
+            if self._kvweave_codec is None or store_plan.out is None:
+                raise RuntimeError(
+                    "A KVWeave-quantized group needs the codec and SHM slots "
+                    f"(group {store_plan.gid})"
+                )
+            category, mamba_layout, tokens_per_block = self._codec_group_args(
+                store_plan.gid
+            )
+            for raw_chunk, slot in zip(chunks, store_plan.out, strict=True):
+                self._kvweave_codec.encode_chunk_into(
+                    category,
+                    mamba_layout,
+                    tokens_per_block,
+                    group_plan.mamba_options,
+                    raw_chunk,
+                    slot.view(torch.uint8),
+                    group_plan.attention_plane_layout,
+                )
+
+    def _decode_quantized_chunks(
+        self, gid: int, chunks: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        """Decode one group's retrieved chunks back to raw KV, if it is quantized.
+
+        Args:
+            gid: LMCache group index.
+            chunks: The group's retrieved SHM chunk views.
+
+        Returns:
+            ``chunks`` unchanged for a raw group; otherwise one raw CPU tensor
+            per chunk, in the group's raw layout.
+        """
+        state = self._group_states[gid]
+        if not state.quantized:
+            return chunks
+        group_plan = state.plan
+        assert group_plan is not None and group_plan.raw_layout_desc is not None
+        if self._kvweave_codec is None:
+            raise RuntimeError("No KVWeave codec for a quantized group's retrieve")
+        category, mamba_layout, tokens_per_block = self._codec_group_args(gid)
+        raw_shape = group_plan.raw_layout_desc.shapes[0]
+        raw_dtype = group_plan.raw_layout_desc.dtypes[0]
+        return [
+            self._kvweave_codec.decode_chunk(
+                category,
+                mamba_layout,
+                tokens_per_block,
+                raw_shape,
+                raw_dtype,
+                chunk,
+                group_plan.attention_plane_layout,
+            )
+            for chunk in chunks
+        ]
 
     def _commit_multigroup(
         self,
@@ -1399,6 +1624,7 @@ class EngineDrivenTransferContext(TransferContext):
         gathered: list[list[torch.Tensor]],
     ) -> bool:
         """Commit a gathered multi-group store; the copies must be complete."""
+        self._encode_quantized_groups(plans, gathered)
         if not isinstance(ctx, EngineDrivenContextInline):
             return ctx.commit_store(key, self._instance_id, [])
         return ctx.commit_store(
@@ -1608,7 +1834,7 @@ class EngineDrivenTransferContext(TransferContext):
                         kv_caches,
                         gid,
                         block_ids[gid],
-                        src_g,
+                        self._decode_quantized_chunks(gid, src_g),
                         first,
                         skip_first_n_tokens,
                     )

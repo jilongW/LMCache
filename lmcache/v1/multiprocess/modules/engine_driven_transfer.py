@@ -447,6 +447,15 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 f"num_physical_slots must be positive, got {num_physical_slots}"
             )
 
+        if payload.enable_l1_kvweave_quant and not (shm_name and pool_size > 0):
+            return RegisterEngineDrivenContextResponse(
+                error=(
+                    "enable_l1_kvweave_quant=True needs the SHM transport (the "
+                    "inline transport carries raw chunks only), but this server "
+                    "has no SHM pool: enable --shm-name and disable lazy L1, "
+                    "Device-DAX and hugepages"
+                )
+            )
         if (
             payload.enable_l1_kvweave_quant
             and not self._ctx.storage_manager.is_l1_variable_size()
