@@ -23,6 +23,34 @@ from typing import cast
 import msgspec
 
 
+class MambaSubStateWireLayout(msgspec.Struct, frozen=True):
+    """Wire-safe byte layout of one Mamba sub-state (``conv`` or ``ssm``).
+
+    Mirrors ``lmcache.integration.vllm.kv_cache_group_edits.
+    MambaSubStateLayout`` in msgspec-friendly form (``dtype`` as its
+    ``str()``, matching ``SerializedMemoryLayoutDesc``'s convention) so it
+    can travel inside :class:`EngineGroupInfo` over the ``REGISTER_KV_CACHE``
+    IPC payload.
+    """
+
+    byte_offset: int
+    """Offset of this sub-state's real data from the page base, in bytes.
+    Identical for every block (all blocks share one page layout)."""
+
+    byte_length: int
+    """Length of this sub-state's real per-block data, in bytes."""
+
+    dtype_str: str
+    """This sub-state's own dtype, as ``str(torch.dtype)`` (e.g.
+    ``"torch.float32"``) -- independent of any other sub-state sharing the
+    page."""
+
+    shape: tuple[int, ...]
+    """This sub-state's real per-block shape (e.g. ``(num_heads, head_dim)``
+    for ``ssm_state``), independent of any other sub-state sharing the
+    page."""
+
+
 class EngineGroupInfo(msgspec.Struct, frozen=True):
     """One LMCache KV group: layers of one engine group that share a copy kernel.
 
@@ -63,6 +91,33 @@ class EngineGroupInfo(msgspec.Struct, frozen=True):
     """Pages hold recurrent state snapshots (Mamba/GDN) rather than attention
     KV; the one-block window reflects restore semantics and blend full-window
     forcing must not widen it. Defaulted field: wire-compatible."""
+
+    cache_category: str = "unknown"
+    """Original engine cache category for this group.
+
+    Expected values are ``"attention"``, ``"mamba"``, or ``"unknown"``.
+    This lets downstream code distinguish Mamba/linear groups from true
+    attention groups even after structural page-view edits make their raw
+    registered layout look attention-shaped. Distinct from
+    ``recurrent_state``: that field is a two-state flag consumed by
+    null-chunk masking (``_has_maskable_group``); this one is a three-state
+    field consumed by codec dispatch. Do not merge the two.
+    """
+
+    mamba_real_layout: (
+        tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None
+    ) = None
+    """``(conv, ssm)`` real byte layout for a ``"mamba"``-category group.
+
+    ``None`` for non-Mamba groups (or Mamba groups registered before this
+    field existed). Lets a quantization codec read each sub-state's real
+    bytes with its own dtype instead of the single dtype the page-view edit
+    exposes for addressing (see ``_MambaPageViewEdit.real_layout`` and its
+    docstring for why per-tensor quantization must not skip this: reading
+    ``ssm_state``'s bytes as the page's addressing dtype reinterprets its
+    real values as a different, unrelated dtype -- not merely losing
+    precision, but reading garbage).
+    """
 
 
 def num_engine_groups(groups: Sequence[EngineGroupInfo]) -> int:

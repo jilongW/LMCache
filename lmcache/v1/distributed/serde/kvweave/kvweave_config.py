@@ -1,0 +1,642 @@
+"""Configuration and preconditioner support for the KVWeave codec."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+from enum import Enum
+from itertools import count
+import json
+import os
+import threading
+from typing import Any, ClassVar, Optional
+
+import numpy as np
+import torch
+
+from lmcache.logging import init_logger
+
+logger = init_logger(__name__)
+
+
+class AttentionPlaneLayout(Enum):
+    """How one attention group's KV object plane(s) are physically laid out.
+
+    ``SPLIT_KV``: the standard two-plane layout (K and V as separate
+    tensors/axis), quantized via the existing K/V-paired codec path.
+    ``FUSED_KV``: K and V packed into one tensor's trailing content axis
+    (e.g. vLLM's non-MLA blocks-first fused backends) -- still per-head K/V
+    data, just packed; quantized via the single-tensor fused codec path.
+    ``MLA``: a true compressed latent vector (Multi-head Latent Attention)
+    with no per-head K/V structure for the codec to exploit -- never
+    quantized.
+    ``UNKNOWN``: single-plane (``kv_size == 1``) but the engine KV format
+    could not be classified -- never quantized (safe default, no guessing).
+    """
+
+    SPLIT_KV = "split_kv"
+    FUSED_KV = "fused_kv"
+    MLA = "mla"
+    UNKNOWN = "unknown"
+
+# Fallback model text-config, used when MODEL_PATH/MODEL are unset or the
+# model's config.json is missing the fields KVWeave needs. Mirrors
+# Qwen3.5-9B's known text_config geometry.
+_QWEN35_9B_DEFAULTS: dict[str, int] = {
+    "num_key_value_heads": 4,
+    "head_dim": 256,
+    "linear_key_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_value_head_dim": 128,
+    "linear_num_value_heads": 32,
+}
+
+
+def _load_model_text_config() -> dict[str, int]:
+    """Resolve KV/Mamba geometry from ``{MODEL_PATH}/{MODEL}/config.json``.
+
+    Reads the ``text_config`` section (falling back to the top-level object
+    for models that don't nest their text config) and returns
+    ``num_key_value_heads``/``head_dim``/``linear_*_head_dim``/
+    ``linear_num_*_heads``. Any field missing from the environment, the
+    model directory, or the model's config falls back to the Qwen3.5-9B
+    defaults above.
+    """
+    result = dict(_QWEN35_9B_DEFAULTS)
+    model_path = os.environ.get("MODEL_PATH")
+    model = os.environ.get("MODEL")
+    if not model_path or not model:
+        return result
+    config_path = os.path.join(model_path, model, "config.json")
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(
+            "Failed to read model config at %s (%s); falling back to "
+            "Qwen3.5-9B KVWeave defaults",
+            config_path,
+            e,
+        )
+        return result
+    text_config = config.get("text_config", config)
+    for key in result:
+        if key in text_config:
+            result[key] = int(text_config[key])
+    return result
+
+
+@dataclass(frozen=True)
+class ConvQKVSplit:
+    """Conv-state Q/K/V split widths used by newer codec variants.
+
+    This branch may not actively use the split in runtime code yet, but the
+    option is part of the public config surface expected by tests.
+    """
+
+    key_dim: int
+    value_dim: int
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Parse a conventional boolean environment flag."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_scaling_method(name: str, default: str) -> str:
+    """Read and validate a KVWeave scaling-method environment variable."""
+    value = os.environ.get(name, default)
+    valid = {"per_tensor", "per_channel", "per_token"}
+    if value not in valid:
+        raise ValueError(f"{name}={value!r} is not one of {sorted(valid)}")
+    return value
+
+
+def _env_attention_qbit() -> int:
+    qbit = int(os.environ.get("LMCACHE_MP_KVWEAVE_QBIT", "4"))
+    if qbit not in {4, 8}:
+        raise ValueError(
+            f"LMCACHE_MP_KVWEAVE_QBIT={qbit!r} is not one of [4, 8]"
+        )
+    return qbit
+
+
+def _env_device(name: str = "LMCACHE_MP_KVWEAVE_QUANT_DEVICE") -> str:
+    """Read and validate the KVWeave quant/dequant compute device."""
+    value = os.environ.get(name, "xpu").strip().lower()
+    valid = {"cpu", "xpu"}
+    if value not in valid:
+        raise ValueError(f"{name}={value!r} is not one of {sorted(valid)}")
+    return value
+
+
+def _env_kv_fp8_dtype(name: str = "LMCACHE_MP_KVWEAVE_KV_CACHE_DTYPE") -> torch.dtype | None:
+    """Resolve the fp8 format of the engine's KV cache, or ``None`` for a float KV cache.
+
+    vLLM stores an fp8 KV cache as plain ``uint8`` tensors, so the tensor dtype alone
+    cannot say which fp8 format the bytes are in. The vLLM adapter exports vLLM's
+    ``--kv-cache-dtype`` here; ``fp8`` means e4m3, as in vLLM. Non-fp8 values
+    (``auto``, ``float16``, ...) and an unset variable mean no fp8 reinterpretation.
+    """
+    value = os.environ.get(name, "").strip().lower()
+    if value in {"fp8", "fp8_e4m3", "e4m3", "float8_e4m3fn"}:
+        return torch.float8_e4m3fn
+    if value in {"fp8_e5m2", "e5m2", "float8_e5m2"}:
+        return torch.float8_e5m2
+    return None
+
+
+_FEW_GROUPS_THRESHOLD = 4
+
+
+def _env_num_threads(num_groups: int) -> int:
+    """Read the native KVWeave quant kernel's OpenMP thread count.
+
+    Previously never wired up despite ``LMCACHE_MP_KVWEAVE_NUM_THREADS``
+    being referenced by deployment scripts -- the codec always ran with
+    ``num_threads=1`` regardless of this env var.
+
+    The bounded store pipeline only overlaps the *current* chunk's native
+    encode with the *next* chunk's D2H gather (a cheap, mostly-idle wait),
+    never two chunks' encodes concurrently -- so with few groups there are
+    fewer chunks competing for CPU in one ``submit_store`` call, leaving
+    more physical cores free for a single chunk's OpenMP encode. When
+    ``num_groups`` is below ``_FEW_GROUPS_THRESHOLD``, the configured thread
+    count is doubled to use those otherwise-idle cores.
+
+    Args:
+        num_groups: Number of engine groups in this registration (from
+            ``len(engine_group_infos)``), used to scale up the thread count
+            when there are few groups to pipeline across.
+    """
+    num_threads = int(os.environ.get("LMCACHE_MP_KVWEAVE_NUM_THREADS", "4"))
+    if num_threads < 1:
+        raise ValueError(
+            f"LMCACHE_MP_KVWEAVE_NUM_THREADS={num_threads!r} must be >= 1"
+        )
+    if num_groups < _FEW_GROUPS_THRESHOLD:
+        num_threads *= 2
+    return num_threads
+
+
+@dataclass(frozen=True)
+class MambaCodecOptions:
+    """Resolved per-substate quantization parameters for Mamba groups.
+
+    ``conv``/``ssm`` scaling and randomized-Hadamard (``rh``) settings are
+    independently configurable; ``asym`` is shared by both sub-states. See
+    ``env_vars.md`` for the full environment variable reference.
+    """
+
+    conv_scaling_method: str
+    conv_rh: bool
+    ssm_scaling_method: str
+    ssm_rh: bool
+    asym: bool
+    conv_qbit: int = 4
+    ssm_qbit: int = 4
+    conv_quant_enabled: bool = True
+    ssm_quant_enabled: bool = True
+    ssm_direct_quant_enabled: bool = True
+    conv_direct_quant_enabled: bool = True
+    conv_qkv_split: ConvQKVSplit = field(
+        default_factory=lambda: ConvQKVSplit(key_dim=2048, value_dim=4096)
+    )
+
+    @classmethod
+    def from_env(cls) -> "MambaCodecOptions":
+        """Resolve Mamba conv/ssm quantization options from the environment.
+
+        ``LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD`` and
+        ``SSM_SCALING_METHOD`` both default to ``per_token``, independently
+        of ``LINEAR_*``.
+        ``CONV_RH`` still falls back to ``LINEAR_RH`` while ``SSM_RH`` is
+        independent; both default to ``false`` (RH off), and
+        ``LINEAR_ASYM`` defaults to ``false`` (symmetric quantization) --
+        the same configuration ``vllm-start.sh`` ships.
+
+        ``LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED``/``SSM_QUANT_ENABLED``
+        (DEBUG ONLY, default ``true``) independently disable
+        quantization for one sub-state while leaving the other quantized --
+        for isolating which sub-state's quantization causes an accuracy
+        regression.
+
+        With the default ``conv_scaling_method="per_token"``, RH operates
+        across each Q/K/V segment's last dimension. It remains enabled when
+        those widths are powers of 2, as they are for Qwen3.5-9B.
+
+        ``LMCACHE_MP_KVWEAVE_SSM_DIRECT_QUANT`` (default ``true``) gates the
+        CPU ssm encode path, avoiding ``split_mamba_chunk``'s gather. It
+        supports RH; compatible native builds fuse eligible 4/8-bit
+        ``per_token`` rows and ``per_channel`` tiles with either RH setting.
+        Two-plane pages require element-aligned boundaries/substate offsets.
+        Per-tensor RH retains native scratch; per-tensor without RH still
+        requires split for two-plane pages. Older builds keep their gates.
+
+        ``LMCACHE_MP_KVWEAVE_CONV_DIRECT_QUANT`` (default ``true``) similarly
+        enables CPU conv Q/K/V direct encode. Compatible builds fuse
+        ``per_channel``/``per_token`` with either RH setting; RH direct
+        supports all scaling methods. For two-plane
+        chunks the conv byte range must fit entirely in plane 0.
+
+        Decode selects direct scatter independently from the payload's
+        scaling/RH metadata, layout and native support, not these encode
+        switches.
+
+        Synchronous and asynchronous SHM store skip pre-split scratch when
+        both substates are eligible for direct encode. Otherwise they
+        retain the pooled split path.
+        """
+        _env_scaling_method(
+            "LMCACHE_MP_KVWEAVE_LINEAR_SCALING_METHOD", "per_channel"
+        )
+        linear_rh = _env_flag("LMCACHE_MP_KVWEAVE_LINEAR_RH", False)
+        conv_scaling = _env_scaling_method(
+            "LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD", "per_token"
+        )
+        conv_rh = _env_flag("LMCACHE_MP_KVWEAVE_CONV_RH", linear_rh)
+        text_config = _load_model_text_config()
+        conv_qkv_split = ConvQKVSplit(
+            key_dim=text_config["linear_key_head_dim"]
+            * text_config["linear_num_key_heads"],
+            value_dim=text_config["linear_value_head_dim"]
+            * text_config["linear_num_value_heads"],
+        )
+        return cls(
+            conv_scaling_method=conv_scaling,
+            conv_rh=conv_rh,
+            ssm_scaling_method=_env_scaling_method(
+                "LMCACHE_MP_KVWEAVE_SSM_SCALING_METHOD", "per_token"
+            ),
+            ssm_rh=_env_flag("LMCACHE_MP_KVWEAVE_SSM_RH", False),
+            asym=_env_flag("LMCACHE_MP_KVWEAVE_LINEAR_ASYM", False),
+            conv_qbit=int(os.environ.get("LMCACHE_MP_KVWEAVE_CONV_QBIT", "4")),
+            ssm_qbit=int(os.environ.get("LMCACHE_MP_KVWEAVE_SSM_QBIT", "4")),
+            conv_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_CONV_QUANT_ENABLED", True
+            ),
+            ssm_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_SSM_QUANT_ENABLED", True
+            ),
+            ssm_direct_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_SSM_DIRECT_QUANT", True
+            ),
+            conv_direct_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_CONV_DIRECT_QUANT", True
+            ),
+            conv_qkv_split=conv_qkv_split,
+        )
+
+
+@dataclass(frozen=True)
+class KVWeaveRuntimeConfig:
+    """Fully resolved L1 KVWeave quantization configuration for one worker.
+
+    The single entry point for every ``LMCACHE_MP_L1_KVWEAVE_QUANT``/
+    ``LMCACHE_MP_KVWEAVE_*`` environment variable (see ``env_vars.md``):
+    callers should read the environment exactly once via :meth:`from_env`
+    and thread the resolved values through, rather than reaching for
+    ``os.environ`` themselves.
+    """
+
+    enabled: bool
+    linear_quant_enabled: bool
+    linear_max_size_ratio: float
+    full_attention_quant_enabled: bool = True
+    split_attention_quant_enabled: bool = True
+    fused_attention_quant_enabled: bool = True
+    attention_codec_kwargs: dict[str, Any] = field(default_factory=dict)
+    mamba_options: MambaCodecOptions = field(
+        default_factory=lambda: MambaCodecOptions(
+            conv_scaling_method="per_token",
+            conv_rh=False,
+            ssm_scaling_method="per_token",
+            ssm_rh=False,
+            asym=False,
+            conv_qbit=4,
+            ssm_qbit=4,
+        )
+    )
+
+    @classmethod
+    def from_env(cls, num_groups: int) -> "KVWeaveRuntimeConfig":
+        """Resolve the full L1 KVWeave runtime configuration from the environment.
+
+        ``enabled`` (``LMCACHE_MP_L1_KVWEAVE_QUANT``) is the overall switch;
+        ``linear_quant_enabled`` (``LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED``,
+        default ``true``) independently gates Mamba/linear groups under it,
+        and ``full_attention_quant_enabled``
+        (``LMCACHE_MP_KVWEAVE_FULL_ATTENTION_QUANT_ENABLED``, default ``true``)
+        gates every attention group, regardless of its K/V plane layout.
+        ``attention_codec_kwargs`` is ready to pass straight into
+        ``KVWeaveCodec(...)``. ``rh``/``asym`` were previously only settable
+        by constructing ``_KVWeaveCodec`` directly (its own default is
+        ``True`` for both); ``LMCACHE_MP_KVWEAVE_RH``/``LMCACHE_MP_KVWEAVE_ASYM``
+        expose that same default as an environment override.
+
+        Args:
+            num_groups: Number of engine groups in this registration, passed
+                through to :func:`_env_num_threads` to scale up the native
+                encode kernel's OpenMP thread count when there are few
+                groups to pipeline across.
+        """
+        enabled = _env_flag("LMCACHE_MP_L1_KVWEAVE_QUANT", False)
+        text_config = _load_model_text_config()
+        return cls(
+            enabled=enabled,
+            linear_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_LINEAR_QUANT_ENABLED", True
+            ),
+            linear_max_size_ratio=float(
+                os.environ.get("LMCACHE_MP_KVWEAVE_LINEAR_MAX_SIZE_RATIO", "1.20")
+            ),
+            full_attention_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_FULL_ATTENTION_QUANT_ENABLED", True
+            ),
+            split_attention_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_SPLIT_ATTENTION_QUANT_ENABLED", True
+            ),
+            fused_attention_quant_enabled=_env_flag(
+                "LMCACHE_MP_KVWEAVE_FUSED_ATTENTION_QUANT_ENABLED", True
+            ),
+            attention_codec_kwargs={
+                "quantize": True,
+                "qbit": _env_attention_qbit(),
+                "num_kv_heads": text_config["num_key_value_heads"],
+                "head_dim": text_config["head_dim"],
+                "scaling_method": os.environ.get(
+                    "LMCACHE_MP_KVWEAVE_SCALING_METHOD", "per_channel"
+                ),
+                "rh": _env_flag("LMCACHE_MP_KVWEAVE_RH", True),
+                "asym": _env_flag("LMCACHE_MP_KVWEAVE_ASYM", True),
+                "precond": _env_flag("LMCACHE_MP_KVWEAVE_PRECOND", True),
+                "device": _env_device(),
+                "kv_fp8_dtype": _env_kv_fp8_dtype(),
+                "num_threads": _env_num_threads(num_groups),
+                "fused_direct_quant": _env_flag(
+                    "LMCACHE_MP_KVWEAVE_FUSED_DIRECT_QUANT", True
+                ),
+                "fused_direct_dequant": _env_flag(
+                    "LMCACHE_MP_KVWEAVE_FUSED_DIRECT_DEQUANT", True
+                ),
+                "paged_direct_encode": _env_flag(
+                    "LMCACHE_MP_KVWEAVE_PAGED_DIRECT_ENCODE", True
+                ),
+                "paged_direct_decode": _env_flag(
+                    "LMCACHE_MP_KVWEAVE_PAGED_DIRECT_DECODE", True
+                ),
+            },
+            mamba_options=MambaCodecOptions.from_env(),
+        )
+
+    def localized_to_shard(
+        self, attention_plane_hidden: int, conv_dim: int
+    ) -> "KVWeaveRuntimeConfig":
+        """Rescale the model-wide geometry to what this worker actually holds.
+
+        ``from_env`` reads head counts from the model's ``config.json``, which
+        describes the whole model. Under tensor parallelism each worker only
+        holds a head shard (``num_key_value_heads / tp`` attention heads, or
+        one replicated head when ``tp`` exceeds the head count, and
+        ``linear_num_*_heads / tp`` Mamba heads), so the codec must be built
+        from the registered tensors' real widths instead. ``head_dim`` and the
+        linear head dims are TP-invariant and kept as is.
+
+        Args:
+            attention_plane_hidden: Width of one K (or V) plane of this
+                worker's attention KV, i.e. ``local_kv_heads * head_dim``;
+                ``0`` when no quantizable attention group was registered.
+            conv_dim: Last dimension of this worker's Mamba ``conv_state``
+                (``local key_dim * 2 + local value_dim``); ``0`` when no Mamba
+                group was registered.
+
+        Returns:
+            ``self`` when nothing changes, otherwise a copy with
+            ``attention_codec_kwargs["num_kv_heads"]`` and/or
+            ``mamba_options.conv_qkv_split`` set to this worker's shard. A
+            width that is not an exact shard of the configured geometry is
+            left unchanged (with a warning), so the per-group size checks
+            fall back to unquantized transfer instead of mis-splitting data.
+        """
+        updates: dict[str, Any] = {}
+
+        head_dim = int(self.attention_codec_kwargs.get("head_dim", 0))
+        num_kv_heads = int(self.attention_codec_kwargs.get("num_kv_heads", 0))
+        if attention_plane_hidden > 0 and head_dim > 0:
+            local_heads, remainder = divmod(attention_plane_hidden, head_dim)
+            if remainder:
+                logger.warning(
+                    "KVWeave: attention plane width %d is not a multiple of "
+                    "head_dim %d; keeping configured num_kv_heads=%d",
+                    attention_plane_hidden,
+                    head_dim,
+                    num_kv_heads,
+                )
+            elif local_heads != num_kv_heads:
+                logger.info(
+                    "KVWeave: using this worker's num_kv_heads=%d (config.json "
+                    "has %d; tensor-parallel shard)",
+                    local_heads,
+                    num_kv_heads,
+                )
+                updates["attention_codec_kwargs"] = {
+                    **self.attention_codec_kwargs,
+                    "num_kv_heads": local_heads,
+                }
+
+        split = self.mamba_options.conv_qkv_split
+        global_conv_dim = split.key_dim * 2 + split.value_dim
+        if conv_dim > 0 and conv_dim != global_conv_dim:
+            shard, remainder = divmod(global_conv_dim, conv_dim)
+            if (
+                remainder
+                or split.key_dim % shard
+                or split.value_dim % shard
+            ):
+                logger.warning(
+                    "KVWeave: conv_state width %d is not a tensor-parallel shard "
+                    "of key_dim*2 + value_dim = %d; keeping configured "
+                    "conv_qkv_split (Mamba groups will be transferred raw)",
+                    conv_dim,
+                    global_conv_dim,
+                )
+            else:
+                local_split = ConvQKVSplit(
+                    key_dim=split.key_dim // shard,
+                    value_dim=split.value_dim // shard,
+                )
+                logger.info(
+                    "KVWeave: using this worker's conv_qkv_split key_dim=%d "
+                    "value_dim=%d (config.json has %d/%d; shard 1/%d)",
+                    local_split.key_dim,
+                    local_split.value_dim,
+                    split.key_dim,
+                    split.value_dim,
+                    shard,
+                )
+                updates["mamba_options"] = replace(
+                    self.mamba_options, conv_qkv_split=local_split
+                )
+
+        if not updates:
+            return self
+        return replace(self, **updates)
+
+
+@dataclass
+class KVWeaveCodecConfig:
+    """Typed settings shared by the KVWeave codec and preconditioner."""
+
+    quantize: bool = True
+    qbit: int = 4
+    scaling_method: str = "per_channel"
+    rh: bool = True
+    asym: bool = True
+    log: bool = False
+    precond: bool = False
+    num_threads: int = 8
+    precond_seed: int = 42
+    precond_path: Optional[str] = None
+    MAGIC_RAW: ClassVar[bytes] = b"KVW0"
+    MAGIC_QUANT: ClassVar[bytes] = b"KVW3"
+    MAGIC_QUANT_FUSED: ClassVar[bytes] = b"KVW4"
+    MAMBA_MAGIC: ClassVar[bytes] = b"MQ01"
+    MAMBA_QBIT: ClassVar[int] = 4
+    MAMBA_FLAG_RH: ClassVar[int] = 1
+    MAMBA_FLAG_ASYM: ClassVar[int] = 2
+    DEFAULT_BLOCK_SIZE: ClassVar[int] = 64
+    DTYPE_TO_CODE: ClassVar[dict[torch.dtype, int]] = {
+        torch.float16: 0,
+        torch.bfloat16: 1,
+        torch.float32: 2,
+        # fp8 KV cache (vLLM --kv-cache-dtype fp8); appended so existing payload codes are unchanged.
+        torch.float8_e4m3fn: 3,
+        torch.float8_e5m2: 4,
+    }
+    CODE_TO_DTYPE: ClassVar[dict[int, torch.dtype]] = {
+        0: torch.float16,
+        1: torch.bfloat16,
+        2: torch.float32,
+        3: torch.float8_e4m3fn,
+        4: torch.float8_e5m2,
+    }
+    SCALING_TO_CODE: ClassVar[dict[str, int]] = {
+        "per_tensor": 0,
+        "per_token": 1,
+        "per_channel": 2,
+    }
+    SUBSTATE_TO_CODE: ClassVar[dict[str, int]] = {"conv": 0, "ssm": 1}
+    SCALE_IDS: ClassVar = count(1)
+
+    def __post_init__(self) -> None:
+        self._pd_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._pd_lock = threading.Lock()
+        self._pd_file: Optional[dict[str, object]] = None
+        self.scaling_method = str(self.scaling_method)
+
+    @classmethod
+    def next_scale_id(cls) -> int:
+        """Allocate a process-wide scale id for native KVWeave state."""
+        return next(cls.SCALE_IDS) & 0xFFFFFFFF
+
+    @classmethod
+    def next_scale_ids(cls, count: int) -> list[int]:
+        return [cls.next_scale_id() for _ in range(count)]
+
+    @staticmethod
+    def quantized_bytes(elements: int, qbit: int) -> int:
+        return (elements + 1) // 2 if qbit == 4 else elements if qbit <= 8 else elements * 2
+
+    @classmethod
+    def mamba_dtype(cls, dtype_str: str) -> torch.dtype:
+        dtype = getattr(torch, dtype_str.removeprefix("torch."), None)
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"unsupported Mamba wire dtype: {dtype_str!r}")
+        return dtype
+
+    @staticmethod
+    def mamba_layout(
+        substate: str, shape: tuple[int, ...], scaling_method: str
+    ) -> tuple[int, int, int, int]:
+        blocks = max(int(shape[1]), 1)
+        tail = shape[2:]
+        head_dim = max(int(tail[-1]) if tail else 1, 1)
+        middle = max(
+            int(np.prod(tail[:-1])) if len(tail) > 1 else 1, 1
+        )
+        if scaling_method == "per_channel":
+            return blocks, middle, head_dim, head_dim
+        if scaling_method == "per_token":
+            # Token-wise grouping uses one scale per logical token slice
+            # across the non-head_dim axes (blocks * middle).
+            return blocks * middle, 1, head_dim, blocks * middle
+        return blocks, middle, head_dim, 1
+
+    def mamba_precond_tensors(
+        self, size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if size <= 0 or size & (size - 1):
+            raise ValueError(f"rh requires a power-of-2 transform length, got {size}")
+        signs, perm = self.get_pd_matrix(size)
+        return (
+            torch.as_tensor(signs, dtype=torch.float32).contiguous(),
+            torch.as_tensor(perm, dtype=torch.int32).contiguous(),
+        )
+
+    def get_pd_matrix(
+        self, hadamard_size: int
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Return cached deterministic or file-backed P/D matrices."""
+        cached = self._pd_cache.get(hadamard_size)
+        if cached is not None:
+            return cached
+        with self._pd_lock:
+            cached = self._pd_cache.get(hadamard_size)
+            if cached is None:
+                cached = (
+                    self._load_pd_from_file(hadamard_size)
+                    if self.precond_path
+                    else self._generate_pd(hadamard_size)
+                )
+                self._pd_cache[hadamard_size] = cached
+        return cached
+
+    def _generate_pd(self, hadamard_size: int) -> tuple[np.ndarray, np.ndarray]:
+        rng = np.random.default_rng(self.precond_seed)
+        signs = rng.choice([-1.0, 1.0], size=hadamard_size).astype(np.float32)
+        perm = rng.permutation(hadamard_size).astype(np.int32)
+        return signs, perm
+
+    def _load_pd_from_file(
+        self, hadamard_size: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self._pd_file is None:
+            self._pd_file = self._read_pd_file(self.precond_path)
+        signs_key = f"signs_{hadamard_size}"
+        perm_key = f"perm_{hadamard_size}"
+        if signs_key not in self._pd_file or perm_key not in self._pd_file:
+            raise KeyError(
+                f"preconditioner has no matrices for hadamard_size={hadamard_size}"
+            )
+        signs = np.asarray(self._pd_file[signs_key], dtype=np.float32).reshape(-1)
+        perm = np.asarray(self._pd_file[perm_key], dtype=np.int32).reshape(-1)
+        return signs, perm
+
+    @staticmethod
+    def _read_pd_file(path: str | None) -> dict[str, object]:
+        if path is None:
+            raise ValueError("precond_path is required")
+        if path.endswith(".npz"):
+            with np.load(path) as data:
+                return {key: data[key] for key in data.files}
+        if path.endswith((".pt", ".pth")):
+            import torch
+
+            data = torch.load(path, map_location="cpu")
+            return {
+                key: value.numpy() if hasattr(value, "numpy") else np.asarray(value)
+                for key, value in data.items()
+            }
+        raise ValueError(f"Unsupported precond_path extension: {path!r}")
