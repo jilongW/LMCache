@@ -149,6 +149,13 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 staged.append(torch.empty(shape, dtype=dtype, device="cpu"))
         return staged
 
+    def _raw_staging_alloc(self):
+        """Raw gather targets fall back to the reusable pinned staging pool."""
+        return self._alloc_pinned_staging
+
+    def _release_raw_staging(self, tensors: list[torch.Tensor]) -> None:
+        self._release_staging(tensors)
+
     def _release_staging(self, chunks: list[torch.Tensor]) -> None:
         """Return staging tensors to the pool for reuse.
 
@@ -422,6 +429,7 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 gather_done: Any | None = None
                 ok = False
                 staged: list[list[torch.Tensor]] = []
+                plans: Any = None
                 try:
                     # Same guard as the single-group path: the prepared slots are
                     # views into context-owned SHM.
@@ -488,6 +496,15 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                 finally:
                     for chunks in staged:
                         self._release_staging(chunks)
+                    # Raw staging is normally released by the commit. If the store
+                    # failed before that, the gather may still be writing into
+                    # it, so wait for it before handing the memory back.
+                    if gather_done is not None:
+                        try:
+                            gather_done.synchronize()
+                        except Exception:
+                            logger.exception("Failed to wait for the gather event")
+                    self._release_plans(plans)
                     with self._inflight_lock:
                         if gather_done is not None:
                             self._inflight_gather_events.discard(gather_done)

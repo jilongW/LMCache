@@ -237,11 +237,17 @@ class _GroupStorePlan:
             out), in increasing order.
         out: Gather targets parallel to ``chunk_indices`` (SHM slots or pinned
             staging), or ``None`` to let gather allocate fresh CPU tensors.
+        raw: For a KVWeave-quantized group, the raw-KV gather targets (its
+            ``out`` slots hold encoded bytes instead): SHM scratch or pinned
+            staging, or ``None`` to gather into fresh CPU tensors.
+        release: Returns ``raw`` to wherever it came from; ``None`` once done.
     """
 
     gid: int
     chunk_indices: list[int]
     out: "list[torch.Tensor] | None"
+    raw: "list[torch.Tensor] | None" = None
+    release: "Callable[[], None] | None" = None
 
 
 def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
@@ -1113,6 +1119,8 @@ class EngineDrivenTransferContext(TransferContext):
         shm_name = ""
         pool_size = 0
         null_block_id = 0
+        scratch_offset = 0
+        scratch_size = 0
         if isinstance(response, RegisterEngineDrivenContextResponse):
             if response.error:
                 raise RuntimeError(
@@ -1122,6 +1130,8 @@ class EngineDrivenTransferContext(TransferContext):
             shm_name = response.shm_name
             pool_size = response.pool_size
             null_block_id = response.null_block_id
+            scratch_offset = response.scratch_offset
+            scratch_size = response.scratch_size
         self._null_block_id = null_block_id
 
         metadata = EngineDrivenContextMetadata(
@@ -1136,6 +1146,8 @@ class EngineDrivenTransferContext(TransferContext):
             mq_timeout,
             shm_name=shm_name,
             pool_size=pool_size,
+            scratch_offset=scratch_offset,
+            scratch_size=scratch_size,
         )
         if self._kvweave_codec is not None and isinstance(
             self._engine_driven_context, EngineDrivenContextInline
@@ -1475,6 +1487,7 @@ class EngineDrivenTransferContext(TransferContext):
                 if out_g:
                     assert chunks_g is not None
                     plans.append(_GroupStorePlan(gid, chunks_g, out_g))
+            self._stage_quantized_raw(ctx, plans)
             return plans
 
         plans = []
@@ -1519,9 +1532,9 @@ class EngineDrivenTransferContext(TransferContext):
                     layout_hints=self._layout_hints,
                     engine_kv_format=state.engine_kv_format,
                     # A quantized group's slots hold encoded bytes, not raw KV:
-                    # gather raw into fresh CPU buffers and encode into the slots
-                    # at commit.
-                    out=None if state.quantized else plan.out,
+                    # gather raw into scratch (or fresh CPU buffers) and encode
+                    # into the slots at commit.
+                    out=plan.raw if state.quantized else plan.out,
                     chunk_indices=plan.chunk_indices,
                     blocks_per_window=state.blocks_per_window,
                     engine_type=self._engine_type,
@@ -1616,6 +1629,71 @@ class EngineDrivenTransferContext(TransferContext):
             for chunk in chunks
         ]
 
+    def _raw_staging_alloc(self) -> "_StagingAlloc | None":
+        """Fallback allocator for raw gather targets when SHM scratch is absent.
+
+        ``None`` means fresh (unpinned) CPU tensors; the async context returns
+        its pinned staging pool.
+        """
+        return None
+
+    def _release_raw_staging(self, tensors: list[torch.Tensor]) -> None:
+        """Return tensors from :meth:`_raw_staging_alloc` (no-op by default)."""
+
+    def _stage_quantized_raw(
+        self, ctx: "EngineDrivenContext", plans: "list[_GroupStorePlan]"
+    ) -> None:
+        """Give each quantized group somewhere to gather its raw KV.
+
+        Order of preference: this worker's SHM scratch partition (already
+        pinned together with the pool, bounded, no extra memory), then the
+        fallback allocator, then nothing -- gather then allocates fresh CPU
+        tensors. A full or absent scratch is never an error.
+        """
+        for plan in plans:
+            state = self._group_states[plan.gid]
+            if not state.quantized or not plan.chunk_indices:
+                continue
+            shape = state.layout_desc.shapes[0]
+            dtype = state.layout_desc.dtypes[0]
+            count = len(plan.chunk_indices)
+            allocate = getattr(ctx, "allocate_scratch_tensors", None)
+            got = allocate(shape, dtype, count) if allocate is not None else None
+            if got is not None:
+                tensors, allocation = got
+                free = ctx.free_scratch  # type: ignore[attr-defined]
+                plan.raw = tensors
+                plan.release = lambda a=allocation, f=free: f(a)
+                continue
+            fallback = self._raw_staging_alloc()
+            if fallback is not None:
+                staged = fallback(shape, dtype, count)
+                plan.raw = staged
+                plan.release = lambda t=staged: self._release_raw_staging(t)
+
+    def _release_plans(
+        self,
+        plans: "list[_GroupStorePlan] | None",
+        sync_device: "torch.device | None" = None,
+    ) -> None:
+        """Return every plan's raw staging; safe to call more than once.
+
+        Args:
+            plans: The store's plans, or ``None`` when preparation never ran.
+            sync_device: Device whose in-flight copies must finish first. Pass it
+                on error paths, where gather may still be writing into the
+                staging; a normal commit has already synchronized.
+        """
+        if not plans or not any(plan.release for plan in plans):
+            return
+        if sync_device is not None:
+            synchronize_device(sync_device)
+        for plan in plans:
+            release, plan.release = plan.release, None
+            plan.raw = None
+            if release is not None:
+                release()
+
     def _commit_multigroup(
         self,
         ctx: "EngineDrivenContext",
@@ -1624,7 +1702,10 @@ class EngineDrivenTransferContext(TransferContext):
         gathered: list[list[torch.Tensor]],
     ) -> bool:
         """Commit a gathered multi-group store; the copies must be complete."""
-        self._encode_quantized_groups(plans, gathered)
+        try:
+            self._encode_quantized_groups(plans, gathered)
+        finally:
+            self._release_plans(plans)
         if not isinstance(ctx, EngineDrivenContextInline):
             return ctx.commit_store(key, self._instance_id, [])
         return ctx.commit_store(
@@ -1652,11 +1733,16 @@ class EngineDrivenTransferContext(TransferContext):
             return False
         if not plans:
             return True
-        gathered = self._gather_multigroup(plans, kv_caches, block_ids)
-        # Gather issues async device->CPU copies (into SHM slots, or into
-        # buffers inline commit serializes at once): complete them first.
-        synchronize_device(device)
-        return self._commit_multigroup(ctx, key, plans, gathered)
+        try:
+            gathered = self._gather_multigroup(plans, kv_caches, block_ids)
+            # Gather issues async device->CPU copies (into SHM slots, or into
+            # buffers inline commit serializes at once): complete them first.
+            synchronize_device(device)
+            return self._commit_multigroup(ctx, key, plans, gathered)
+        finally:
+            # Normally already released by the commit; on an error the copies
+            # may still be in flight, so wait before handing the staging back.
+            self._release_plans(plans, sync_device=device)
 
     def _submit_store_multigroup(
         self,

@@ -17,6 +17,10 @@ from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.scratch_allocator import (
+    ScratchAllocation,
+    ScratchAllocator,
+)
 from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContext,
     EngineDrivenContextMetadata,
@@ -25,6 +29,10 @@ from lmcache.v1.multiprocess.transport.base import RequestClient
 from lmcache.v1.platform import current_device_spec
 
 logger = init_logger(__name__)
+
+
+# Scratch allocations start and are sized on this boundary.
+_SCRATCH_ALIGN = 64
 
 
 @dataclass(frozen=True)
@@ -94,10 +102,26 @@ class EngineDrivenContextShm(EngineDrivenContext):
         mq_timeout: float,
         shm_name: str,
         pool_size: int,
+        scratch_offset: int = 0,
+        scratch_size: int = 0,
     ) -> None:
         super().__init__(metadata, req_client, mq_timeout)
         if not shm_name or pool_size <= 0:
             raise ValueError("shm_name must be non-empty and pool_size must be > 0")
+        if scratch_offset < 0 or scratch_size < 0:
+            raise ValueError("scratch offset and size must be non-negative")
+        if scratch_size and scratch_offset + scratch_size > pool_size:
+            raise ValueError(
+                f"scratch range [{scratch_offset}, {scratch_offset + scratch_size}) "
+                f"exceeds the SHM pool ({pool_size} bytes)"
+            )
+        # This worker's slice of the non-L1 tail behind the L1 pool: the server
+        # hands each instance a disjoint partition and never touches the tail.
+        # Start it on a cache-line boundary so every typed view is aligned.
+        aligned_start = -(-scratch_offset // _SCRATCH_ALIGN) * _SCRATCH_ALIGN
+        usable = max(0, scratch_size - (aligned_start - scratch_offset))
+        self._scratch_allocator = ScratchAllocator(aligned_start, usable)
+        self._scratch_size = usable
 
         self._shm_name = shm_name
         self._pool_size = pool_size
@@ -161,6 +185,68 @@ class EngineDrivenContextShm(EngineDrivenContext):
             )
             for descriptor in descriptors
         ]
+
+    @property
+    def has_scratch(self) -> bool:
+        """Whether this worker was given a scratch partition."""
+        return self._scratch_size > 0
+
+    def allocate_scratch_tensors(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        count: int,
+        *,
+        wait: bool = True,
+        max_retries: int = 3,
+        timeout_s: float = 0.5,
+    ) -> tuple[list[torch.Tensor], ScratchAllocation] | None:
+        """Allocate ``count`` same-shaped tensors from this worker's scratch.
+
+        The views alias the shared SHM tail, which this worker already pinned
+        together with the rest of the pool, so device copies into them are
+        asynchronous without any extra pinned allocation.
+
+        Args:
+            shape: Shape of each tensor.
+            dtype: Dtype of each tensor.
+            count: Number of tensors.
+            wait: Whether to wait for other users to free space.
+            max_retries: Waits before giving up when ``wait`` is set.
+            timeout_s: Total time to wait.
+
+        Returns:
+            ``(tensors, allocation)`` -- hand ``allocation`` to :meth:`free_scratch`
+            -- or ``None`` when there is no scratch or it is too full.
+        """
+        if count <= 0:
+            raise ValueError("count must be positive")
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        chunk_bytes = -(-(int(shape.numel()) * itemsize) // _SCRATCH_ALIGN)
+        chunk_bytes *= _SCRATCH_ALIGN
+        allocation = self._scratch_allocator.allocate(
+            chunk_bytes * count,
+            wait=wait,
+            max_retries=max_retries,
+            timeout_s=timeout_s,
+        )
+        if allocation is None:
+            return None
+        dtype_name = str(dtype).removeprefix("torch.")
+        tensors = [
+            self._make_tensor_view(
+                offset=allocation.offset + index * chunk_bytes,
+                length=int(shape.numel()) * itemsize,
+                shape=list(shape),
+                dtype_str=dtype_name,
+            )
+            for index in range(count)
+        ]
+        return tensors, allocation
+
+    def free_scratch(self, allocation: ScratchAllocation) -> None:
+        """Return a range obtained from :meth:`allocate_scratch_tensors`."""
+        self._scratch_allocator.free(allocation)
 
     def prepare_store(
         self, key: IPCCacheServerKey, instance_id: int
