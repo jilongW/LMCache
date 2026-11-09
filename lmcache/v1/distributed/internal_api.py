@@ -358,6 +358,16 @@ class L1ManagerInterface(Protocol):
         """Describe a registerable L1 buffer, or None when there is none."""
         ...
 
+    def is_variable_size(self) -> bool:
+        """Whether this L1 can allocate chunks of arbitrary byte size.
+
+        ``True`` for byte-granular allocators (DRAM, Device-DAX); ``False``
+        for tiers whose DMA path assumes uniformly sized chunks (GDS).
+        Callers that enable variable-size payloads (quantization) must check
+        this first and fail fast.
+        """
+        ...
+
     def get_memory_tags(self) -> MemoryTags:
         """Return the memory tags of this L1's primary pool."""
         ...

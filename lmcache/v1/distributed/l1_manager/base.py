@@ -1030,6 +1030,14 @@ class BaseL1Manager(L1ManagerInterface):
         """
         return self._memory_manager.get_l1_memory_desc()
 
+    def is_variable_size(self) -> bool:
+        """Whether the underlying memory manager allocates arbitrary-size chunks.
+
+        Returns:
+            ``True`` for DRAM and Device-DAX, ``False`` for GDS.
+        """
+        return self._memory_manager.is_variable_size()
+
     @property
     def config(self) -> L1ManagerConfig:
         """Return this manager's backend and lifetime configuration."""

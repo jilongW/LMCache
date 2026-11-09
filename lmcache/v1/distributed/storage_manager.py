@@ -55,7 +55,7 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
 )
 from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
 from lmcache.v1.distributed.quota_manager import QuotaManager
-from lmcache.v1.distributed.serde import create_serde_processor
+from lmcache.v1.distributed.serde import create_serde_processor, is_lossy_serde_type
 from lmcache.v1.distributed.storage_controllers import (
     L1EvictionController,
     L2AdapterEvictionState,
@@ -174,6 +174,13 @@ class StorageManager:
             self._capacity_publish_lock = threading.Lock()
             # Guards _l2_adapters, _adapter_descriptors and _closing_adapters.
             self._adapters_lock = threading.Lock()
+
+            # Set by mark_l1_kvweave_quant_enabled() once an engine-driven
+            # registration turns L1 KVWeave quantization on. One-way: it stays
+            # on for the process lifetime because L2 adapters may already have
+            # assumed it. Process-wide rather than per-L1, since the write
+            # policy may place a quantized chunk in any L1.
+            self._l1_kvweave_quant_enabled = False
 
             # L2 adapters:
             self._next_adapter_id = 0
@@ -1282,6 +1289,50 @@ class StorageManager:
         for manager in self._l1_managers:
             manager.close()
 
+    def is_l1_variable_size(self) -> bool:
+        """Whether every L1 can allocate chunks of arbitrary byte size.
+
+        A quantized chunk is smaller than the raw one and the write policy may
+        place it in any L1, so one fixed-size L1 (GDS) rules quantization out.
+
+        Returns:
+            ``True`` only if all configured L1 managers are variable-size.
+        """
+        return all(m.is_variable_size() for m in self._l1_managers)
+
+    def is_l1_kvweave_quant_enabled(self) -> bool:
+        """Whether L1 KVWeave quantization has been confirmed for this process."""
+        return self._l1_kvweave_quant_enabled
+
+    def mark_l1_kvweave_quant_enabled(self) -> None:
+        """Record that L1 KVWeave quantization is enabled for this process.
+
+        Called by the engine-driven registration path after it checked
+        :meth:`is_l1_variable_size`. Idempotent. Once set, adding an L2 adapter
+        with a lossy serde is rejected (see ``_build_l2_adapter``).
+
+        Raises:
+            ValueError: An already-configured L2 adapter uses a lossy serde;
+                quantizing L1 as well would compound the error silently.
+        """
+        # Same lock as add_l2_adapter, so a concurrent add cannot slip a lossy
+        # adapter in between this check and the flag being set.
+        with self._lifecycle_lock:
+            with self._adapters_lock:
+                lossy = [
+                    d.type_name
+                    for d in self._adapter_descriptors.values()
+                    if d.config.serde_config is not None
+                    and is_lossy_serde_type(d.config.serde_config.type)
+                ]
+            if lossy:
+                raise ValueError(
+                    "L1 KVWeave quantization cannot be enabled: L2 adapter(s) "
+                    f"{lossy} already use a lossy serde; double lossy "
+                    "quantization is not supported."
+                )
+            self._l1_kvweave_quant_enabled = True
+
     @property
     def is_multi_l1(self) -> bool:
         """Whether more than one L1 is configured.
@@ -1569,9 +1620,25 @@ class StorageManager:
             instance, and ``descriptor`` is its descriptor carrying that id.
 
         Raises:
-            ValueError: If no L1 has the memory tags the adapter wants.
+            ValueError: If no L1 has the memory tags the adapter wants, or
+                ``config.serde_config`` names a lossy serde while L1 KVWeave
+                quantization is already enabled (see
+                ``mark_l1_kvweave_quant_enabled``) -- two lossy layers would
+                silently compound error.
         """
         manager = self._l1_by_tag[resolve_l1_affinity(config, self._l1_by_tag)]
+        if (
+            config.serde_config is not None
+            and is_lossy_serde_type(config.serde_config.type)
+            and self._l1_kvweave_quant_enabled
+        ):
+            # Checked before create_l2_adapter() so a rejected config never
+            # constructs (and leaks) an underlying adapter or connection.
+            raise ValueError(
+                f"L2 adapter uses lossy serde {config.serde_config.type!r} but "
+                "L1 KVWeave quantization is already enabled for this process; "
+                "double lossy quantization is not supported."
+            )
         adapter_id = self._next_adapter_id
         self._next_adapter_id += 1
         adapter: L2AdapterInterface = create_l2_adapter(

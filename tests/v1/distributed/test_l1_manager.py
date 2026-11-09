@@ -1380,6 +1380,27 @@ class TestGetObjectState:
 
 
 # =============================================================================
+# Tests for DramL1Manager.is_variable_size()
+# =============================================================================
+
+
+class TestIsVariableSize:
+    """
+    Tests for DramL1Manager.is_variable_size() method.
+
+    Delegates to the underlying memory manager tier's is_variable_size().
+    """
+
+    def test_delegates_to_cpu_memory_manager(self, basic_l1_config):
+        """The default CPU tier reports variable-size."""
+        manager = DramL1Manager(basic_l1_config)
+
+        assert manager.is_variable_size() is True
+
+        manager.close()
+
+
+# =============================================================================
 # Tests for DramL1Manager.close()
 # =============================================================================
 
