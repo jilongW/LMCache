@@ -48,6 +48,21 @@ from lmcache.v1.multiprocess.transfer_context.kvweave_plan import (
     build_group_transfer_plan,
     local_kvweave_geometry,
 )
+from lmcache.v1.multiprocess.transfer_context.kvweave_route import (
+    GroupKind,
+    QuantDevice,
+    RetrieveRoute,
+    StoreRoute,
+    decide_retrieve_route,
+    decide_store_route,
+    group_kind,
+)
+from lmcache.v1.multiprocess.transfer_context.paged_kv import (
+    PagedFusedSource,
+    paged_block_ids_tensor,
+    paged_fused_rejection_reason,
+    prepare_paged_fused_source,
+)
 from lmcache.v1.multiprocess.transfer_mode import MPTransferMode
 from lmcache.v1.multiprocess.transport.base import RequestClient
 from lmcache.v1.platform import (
@@ -207,6 +222,10 @@ class _GroupState:
             for the group, mirroring the server's prefetch window.
         plan: The group's KVWeave plan (quantized or not), resolved at
             ``register`` time; ``None`` for states built without one.
+        paged_source: Paged-KV description for in-place quantization (XPU,
+            fused-K/V attention), or ``None``.
+        store_route: How this group's chunks are quantized on store.
+        retrieve_route: How this group's chunks land in paged KV on retrieve.
     """
 
     layer_names: list[str]
@@ -216,6 +235,9 @@ class _GroupState:
     layout_desc: MemoryLayoutDesc
     window_chunks: int = -1
     plan: "GroupTransferPlan | None" = None
+    paged_source: "PagedFusedSource | None" = None
+    store_route: StoreRoute = StoreRoute.DIRECT
+    retrieve_route: RetrieveRoute = RetrieveRoute.SCATTER
 
     @property
     def quantized(self) -> bool:
@@ -241,6 +263,9 @@ class _GroupStorePlan:
             ``out`` slots hold encoded bytes instead): SHM scratch or pinned
             staging, or ``None`` to gather into fresh CPU tensors.
         release: Returns ``raw`` to wherever it came from; ``None`` once done.
+        encoded: Set once the group's slots already hold the encoded payload
+            (quantized straight from paged KV), so nothing is left to gather
+            or encode.
     """
 
     gid: int
@@ -248,6 +273,7 @@ class _GroupStorePlan:
     out: "list[torch.Tensor] | None"
     raw: "list[torch.Tensor] | None" = None
     release: "Callable[[], None] | None" = None
+    encoded: bool = False
 
 
 def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
@@ -1076,6 +1102,7 @@ class EngineDrivenTransferContext(TransferContext):
                     group_states,
                     group_layouts,
                     group_facts,
+                    kv_caches,
                 )
             # Group 0's layout doubles as the legacy top-level layout so
             # single-group readers of the payload keep working.
@@ -1171,6 +1198,75 @@ class EngineDrivenTransferContext(TransferContext):
             sum(state.quantized for state in self._group_states),
         )
 
+    def _plan_paged_routes(
+        self,
+        state: "_GroupState",
+        master_on: bool,
+        codec: KVWeaveCodec,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> None:
+        """Decide one group's store/retrieve route, using paged KV when possible.
+
+        A quantized fused-K/V attention group on XPU can be quantized straight
+        from paged KV and dequantized straight into it, skipping the dense gather
+        and scatter. Everything else keeps the staged route. Sliding-window and
+        compressed groups stay staged: the in-place kernels address whole chunks
+        of uncompressed blocks.
+
+        Args:
+            state: The group's state; ``plan`` must be set. Its routes and
+                ``paged_source`` are filled in.
+            master_on: The KVWeave master switch.
+            codec: The codec whose geometry checks gate the paged kernels.
+            kv_caches: The registered KV tensors.
+        """
+        plan = state.plan
+        assert plan is not None
+        device = QuantDevice(codec.device)
+        paged_encode = paged_decode = False
+        if (
+            master_on
+            and device is QuantDevice.XPU
+            and plan.quantized
+            and group_kind(plan) is GroupKind.FUSED_ATTENTION
+        ):
+            tokens_per_block = self._chunk_tokens // state.blocks_in_chunk
+            group_kv = {name: kv_caches[name] for name in state.layer_names}
+            source = prepare_paged_fused_source(group_kv, self._layout_hints)
+            if source is None:
+                logger.info(
+                    "Group stays on the staged route: %s",
+                    paged_fused_rejection_reason(group_kv, self._layout_hints),
+                )
+            elif (
+                state.blocks_per_window != state.blocks_in_chunk
+                or source.block_size != tokens_per_block
+            ):
+                logger.info(
+                    "Group stays on the staged route: sliding-window or compressed "
+                    "blocks (window=%d of %d blocks, %d vs %d tokens per block)",
+                    state.blocks_per_window,
+                    state.blocks_in_chunk,
+                    source.block_size,
+                    tokens_per_block,
+                )
+            else:
+                chunk_tokens = state.blocks_in_chunk * source.block_size
+                paged_encode = codec.supports_paged_fused_encode(
+                    source.hidden, chunk_tokens
+                )
+                paged_decode = codec.supports_paged_fused_decode(
+                    source.hidden, chunk_tokens
+                )
+                if paged_encode or paged_decode:
+                    state.paged_source = source
+        state.store_route = decide_store_route(
+            master_on=master_on, device=device, plan=plan, paged_ok=paged_encode
+        )
+        state.retrieve_route = decide_retrieve_route(
+            master_on=master_on, device=device, plan=plan, paged_ok=paged_decode
+        )
+
     def _plan_kvweave_groups(
         self,
         manager: KVLayerGroupsManager,
@@ -1178,6 +1274,7 @@ class EngineDrivenTransferContext(TransferContext):
         group_states: "list[_GroupState]",
         group_layouts: list[GroupLayout],
         group_facts: "list[tuple[torch.Size, int]]",
+        kv_caches: dict[str, torch.Tensor],
     ) -> None:
         """Decide each group's KVWeave quantization and record it in place.
 
@@ -1194,6 +1291,8 @@ class EngineDrivenTransferContext(TransferContext):
             group_layouts: Registration layouts; quantized groups get an override.
             group_facts: Per kernel group, its stored raw shape and tokens per
                 block.
+            kv_caches: The registered KV tensors, to describe for in-place
+                quantization.
         """
         infos: Sequence[EngineGroupInfo | None] = engine_group_infos or [None]
         kernel_groups = manager.kernel_groups
@@ -1223,16 +1322,19 @@ class EngineDrivenTransferContext(TransferContext):
                 kvweave_config=kvweave_config,
                 codec=codec,
             )
-            group_states[gid].plan = plan
+            state = group_states[gid]
+            state.plan = plan
             if plan.quantized:
                 assert plan.quant_layout_desc is not None
                 group_layouts[gid].layout_override = serialize_memory_layout_desc(
                     plan.quant_layout_desc
                 )
+            self._plan_paged_routes(state, kvweave_config.enabled, codec, kv_caches)
             info = infos[gid]
             logger.info(
                 "KVWeave group %d: engine_group_id=%s category=%s format=%s "
-                "attention_layout=%s raw_shape=%s quantized=%s",
+                "attention_layout=%s raw_shape=%s quantized=%s store_route=%s "
+                "retrieve_route=%s",
                 gid,
                 info.engine_group_id if info is not None else None,
                 info.cache_category if info is not None else "unknown",
@@ -1240,6 +1342,8 @@ class EngineDrivenTransferContext(TransferContext):
                 plan.attention_plane_layout,
                 tuple(shape),
                 plan.quantized,
+                state.store_route.value,
+                state.retrieve_route.value,
             )
         if any(state.quantized for state in group_states):
             self._kvweave_codec = codec
@@ -1524,6 +1628,13 @@ class EngineDrivenTransferContext(TransferContext):
             if not plan.chunk_indices:
                 gathered.append([])
                 continue
+            if state.store_route is StoreRoute.PAGED:
+                # Quantize straight from paged KV into the SHM slots: there is
+                # nothing to gather. The native call blocks until the slot is
+                # written, so the caller's gather-complete point covers it.
+                self._encode_paged_group(plan, kv_caches, block_ids[plan.gid])
+                gathered.append([])
+                continue
             gathered.append(
                 gather_paged_kv_to_cpu(
                     {name: kv_caches[name] for name in state.layer_names},
@@ -1554,6 +1665,134 @@ class EngineDrivenTransferContext(TransferContext):
             tokens_per_block,
         )
 
+    def _check_paged_source(
+        self, state: "_GroupState", kv_caches: dict[str, torch.Tensor]
+    ) -> PagedFusedSource:
+        """Return the group's paged source after checking the tensors are unchanged.
+
+        Raises:
+            RuntimeError: If the group has no paged source, or the engine
+                reallocated its KV tensors since registration -- the cached device
+                pointers would then read freed memory.
+        """
+        source = state.paged_source
+        if source is None or self._kvweave_codec is None:
+            raise RuntimeError("Group has no paged source or KVWeave codec")
+        current = tuple(int(kv_caches[name].data_ptr()) for name in state.layer_names)
+        if current != source.layer_key:
+            raise RuntimeError(
+                "KV cache tensors moved since registration; the in-place "
+                "quantization pointers are stale"
+            )
+        return source
+
+    def _chunk_block_ids(
+        self,
+        source: PagedFusedSource,
+        group_block_ids: list[int],
+        chunk: int,
+        blocks_per_chunk: int,
+    ) -> torch.Tensor:
+        """Upload one chunk's block ids, after checking they are valid ids.
+
+        Raises:
+            ValueError: If the chunk is incomplete or an id is outside the paged
+                tensors.
+        """
+        ids = group_block_ids[chunk * blocks_per_chunk : (chunk + 1) * blocks_per_chunk]
+        if len(ids) != blocks_per_chunk or any(
+            block_id < 0 or block_id >= source.num_blocks for block_id in ids
+        ):
+            raise ValueError(
+                f"block ids {ids} are incomplete or outside [0, {source.num_blocks})"
+            )
+        return paged_block_ids_tensor(list(ids), source.device)
+
+    def _encode_paged_group(
+        self,
+        plan: "_GroupStorePlan",
+        kv_caches: dict[str, torch.Tensor],
+        group_block_ids: list[int],
+    ) -> None:
+        """Quantize a group's chunks straight from paged KV into its SHM slots."""
+        state = self._group_states[plan.gid]
+        source = self._check_paged_source(state, kv_caches)
+        codec = self._kvweave_codec
+        assert codec is not None and plan.out is not None
+        with torch.inference_mode():
+            for chunk, slot in zip(plan.chunk_indices, plan.out, strict=True):
+                codec.serialize_fused_paged(
+                    source.layer_ptrs,
+                    self._chunk_block_ids(
+                        source, group_block_ids, chunk, state.blocks_in_chunk
+                    ),
+                    source.block_size,
+                    source.block_stride_elems,
+                    source.num_blocks,
+                    source.dtype,
+                    source.hidden,
+                    slot.view(torch.uint8).view(-1),
+                )
+        plan.encoded = True
+
+    def _decode_paged_group(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        gid: int,
+        group_block_ids: list[int],
+        chunks: list[torch.Tensor],
+        first_chunk: int,
+        skip_first_n_tokens: int,
+    ) -> None:
+        """Dequantize a group's chunks straight into its paged KV blocks.
+
+        Args:
+            kv_caches: The worker's KV tensors.
+            gid: LMCache group index.
+            group_block_ids: The group's block ids for the whole request.
+            chunks: The retrieved quantized payloads, starting at ``first_chunk``.
+            first_chunk: Chunk position of ``chunks[0]``.
+            skip_first_n_tokens: Block-aligned prefix of the request that already
+                holds valid KV; blocks inside it are left untouched.
+        """
+        state = self._group_states[gid]
+        source = self._check_paged_source(state, kv_caches)
+        codec = self._kvweave_codec
+        assert codec is not None
+        if skip_first_n_tokens % source.block_size:
+            logger.error(
+                "skip_first_n_tokens (%d) is not block-aligned (block_size=%d); "
+                "rounding down",
+                skip_first_n_tokens,
+                source.block_size,
+            )
+        with torch.inference_mode():
+            for offset, payload in enumerate(chunks):
+                chunk = first_chunk + offset
+                skip_blocks = min(
+                    max(
+                        (skip_first_n_tokens - chunk * self._chunk_tokens)
+                        // source.block_size,
+                        0,
+                    ),
+                    state.blocks_in_chunk,
+                )
+                if skip_blocks == state.blocks_in_chunk:
+                    continue
+                codec.deserialize_fused_paged(
+                    payload,
+                    source.layer_ptrs,
+                    self._chunk_block_ids(
+                        source, group_block_ids, chunk, state.blocks_in_chunk
+                    ),
+                    source.block_size,
+                    source.block_stride_elems,
+                    source.num_blocks,
+                    skip_blocks,
+                    source.dtype,
+                    source.hidden,
+                )
+
     def _encode_quantized_groups(
         self,
         plans: "list[_GroupStorePlan]",
@@ -1570,7 +1809,7 @@ class EngineDrivenTransferContext(TransferContext):
         """
         for store_plan, chunks in zip(plans, gathered, strict=True):
             state = self._group_states[store_plan.gid]
-            if not state.quantized or not chunks:
+            if not state.quantized or not chunks or store_plan.encoded:
                 continue
             group_plan = state.plan
             assert group_plan is not None
@@ -1652,7 +1891,11 @@ class EngineDrivenTransferContext(TransferContext):
         """
         for plan in plans:
             state = self._group_states[plan.gid]
-            if not state.quantized or not plan.chunk_indices:
+            if (
+                not state.quantized
+                or not plan.chunk_indices
+                or state.store_route is StoreRoute.PAGED
+            ):
                 continue
             shape = state.layout_desc.shapes[0]
             dtype = state.layout_desc.dtypes[0]
@@ -1916,6 +2159,16 @@ class EngineDrivenTransferContext(TransferContext):
                 for gid, ((src_g, _), (first, _)) in enumerate(
                     zip(per_group, windows, strict=True)
                 ):
+                    if self._group_states[gid].retrieve_route is RetrieveRoute.PAGED:
+                        self._decode_paged_group(
+                            kv_caches,
+                            gid,
+                            block_ids[gid],
+                            src_g,
+                            first,
+                            skip_first_n_tokens,
+                        )
+                        continue
                     self._scatter_group(
                         kv_caches,
                         gid,

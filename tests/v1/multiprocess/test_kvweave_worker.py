@@ -405,3 +405,262 @@ def test_async_context_falls_back_to_the_reusable_pinned_pool():
         assert {t.data_ptr() for t in again} == {t.data_ptr() for t in first}
     finally:
         context.close()
+
+
+# ---------------------------------------------------------------------------
+# In-place (paged) quantization glue. The XPU kernels themselves cannot run
+# here, so a recording codec stands in; these tests pin what the worker asks of
+# it: which block ids, which slots, which prefix to skip, and when it must not.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingPagedCodec:
+    """Codec stand-in that records the paged calls instead of running kernels."""
+
+    device = "xpu"
+
+    def __init__(self, supports: bool = True):
+        self.supports = supports
+        self.encodes: list[dict[str, Any]] = []
+        self.decodes: list[dict[str, Any]] = []
+
+    def supports_paged_fused_encode(self, hidden, tokens):
+        return self.supports
+
+    def supports_paged_fused_decode(self, hidden, tokens):
+        return self.supports
+
+    def serialize_fused_paged(
+        self, layer_ptrs, block_ids, block_size, stride, num_blocks, dtype, hidden, out
+    ):
+        self.encodes.append({"ids": block_ids.tolist(), "out": out, "hidden": hidden})
+        return int(out.numel())
+
+    def deserialize_fused_paged(
+        self, src, layer_ptrs, block_ids, block_size, stride, num_blocks, skip, dtype, hidden
+    ):
+        self.decodes.append({"ids": block_ids.tolist(), "skip": skip, "src": src})
+
+
+def _paged_source(kv_caches):
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.paged_kv import PagedFusedSource
+
+    return PagedFusedSource(
+        layer_ptrs=torch.zeros(NUM_LAYERS, dtype=torch.int64),
+        layer_key=tuple(int(t.data_ptr()) for t in kv_caches.values()),
+        block_size=BLOCK_SIZE,
+        block_stride_elems=BLOCK_SIZE * NUM_HEADS * HEAD_SIZE,
+        num_blocks=NUM_BLOCKS,
+        dtype=torch.float16,
+        hidden=NUM_HEADS * HEAD_SIZE,
+        device=torch.device("cpu"),
+    )
+
+
+def _paged_setup(monkeypatch, supports: bool = True):
+    """A registered context whose only group is switched to the paged routes."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.kvweave_route import (
+        RetrieveRoute,
+        StoreRoute,
+    )
+
+    context, fake, block_ids = _store_roundtrip_setup(
+        monkeypatch, scratch_bytes=4 * _raw_chunk_bytes()
+    )
+    kv_caches = _kv_caches()
+    codec = _RecordingPagedCodec(supports)
+    context._kvweave_codec = codec
+    (state,) = context._group_states
+    state.paged_source = _paged_source(kv_caches)
+    state.store_route = StoreRoute.PAGED
+    state.retrieve_route = RetrieveRoute.PAGED
+    return context, fake, block_ids, kv_caches, codec
+
+
+def test_paged_store_encodes_from_paged_kv_without_gathering(monkeypatch, quant_env):
+    context, fake, block_ids, kv_caches, codec = _paged_setup(monkeypatch)
+    outs = _spy_gather(monkeypatch)
+
+    ok = context.submit_store(
+        "r", MagicMock(), kv_caches, block_ids, None, BLOCKS_IN_CHUNK
+    ).result()
+
+    assert ok
+    # Nothing was gathered and no scratch was asked for: the kernel reads paged KV.
+    assert outs == []
+    assert fake.requested == []
+    # One call per chunk, each with that chunk's own block ids, into its own slot.
+    ids = block_ids[0]
+    assert [call["ids"] for call in codec.encodes] == [
+        ids[:BLOCKS_IN_CHUNK],
+        ids[BLOCKS_IN_CHUNK:],
+    ]
+    for chunk, call in enumerate(codec.encodes):
+        assert call["out"].data_ptr() == fake.stored[(0, chunk)].data_ptr()
+        assert call["hidden"] == NUM_HEADS * HEAD_SIZE
+
+
+def test_paged_retrieve_decodes_into_paged_kv_and_skips_the_valid_prefix(
+    monkeypatch, quant_env
+):
+    context, fake, block_ids, kv_caches, codec = _paged_setup(monkeypatch)
+    context.submit_store(
+        "r", MagicMock(), kv_caches, block_ids, None, BLOCKS_IN_CHUNK
+    ).result()
+    ids = block_ids[0]
+
+    # 20 blocks of the request are already valid: chunk 0 (16 blocks) is skipped
+    # entirely and chunk 1 skips its first 4.
+    ok = context.submit_retrieve(
+        "r",
+        MagicMock(),
+        kv_caches,
+        block_ids,
+        None,
+        BLOCKS_IN_CHUNK,
+        skip_first_n_tokens=20 * BLOCK_SIZE,
+    ).result()
+
+    assert ok
+    assert len(codec.decodes) == 1
+    (call,) = codec.decodes
+    assert call["ids"] == ids[BLOCKS_IN_CHUNK:]
+    assert call["skip"] == 4
+    assert call["src"].data_ptr() == fake.stored[(0, 1)].data_ptr()
+
+
+def test_paged_retrieve_without_a_skip_decodes_every_chunk(monkeypatch, quant_env):
+    context, _, block_ids, kv_caches, codec = _paged_setup(monkeypatch)
+    context.submit_store(
+        "r", MagicMock(), kv_caches, block_ids, None, BLOCKS_IN_CHUNK
+    ).result()
+
+    assert context.submit_retrieve(
+        "r", MagicMock(), kv_caches, block_ids, None, BLOCKS_IN_CHUNK
+    ).result()
+
+    assert [call["skip"] for call in codec.decodes] == [0, 0]
+
+
+def test_paged_store_refuses_stale_pointers(monkeypatch, quant_env):
+    """If the engine reallocated its KV tensors, the cached device pointers would
+    read freed memory: fail loudly instead."""
+    context, fake, block_ids, kv_caches, codec = _paged_setup(monkeypatch)
+    reallocated = _kv_caches()  # same content, different storage
+
+    with pytest.raises(RuntimeError, match="moved since registration"):
+        context.submit_store(
+            "r", MagicMock(), reallocated, block_ids, None, BLOCKS_IN_CHUNK
+        )
+
+    assert codec.encodes == []
+    assert fake.fully_free()
+
+
+def test_paged_store_rejects_out_of_range_block_ids(monkeypatch, quant_env):
+    context, fake, _, kv_caches, codec = _paged_setup(monkeypatch)
+    bad = [list(range(NUM_BLOCKS - BLOCKS_IN_CHUNK + 4, NUM_BLOCKS + 4 + BLOCKS_IN_CHUNK))]
+
+    with pytest.raises(ValueError, match="outside"):
+        context.submit_store("r", MagicMock(), kv_caches, bad, None, BLOCKS_IN_CHUNK)
+
+    assert fake.fully_free()
+
+
+def _fused_state(monkeypatch, codec, source):
+    # Standard
+    import dataclasses
+
+    # First Party
+    from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
+        AttentionPlaneLayout,
+    )
+
+    context, _, _, kv_caches, _ = _paged_setup(monkeypatch)
+    (state,) = context._group_states
+    state.plan = dataclasses.replace(
+        state.plan, attention_plane_layout=AttentionPlaneLayout.FUSED_KV
+    )
+    state.paged_source = None
+    monkeypatch.setattr(
+        worker_transfer, "prepare_paged_fused_source", lambda *_a, **_k: source
+    )
+    return context, state, kv_caches
+
+
+def test_routes_become_paged_for_a_supported_fused_group(monkeypatch, quant_env):
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.kvweave_route import (
+        RetrieveRoute,
+        StoreRoute,
+    )
+
+    kv_caches = _kv_caches()
+    source = _paged_source(kv_caches)
+    context, state, kv_caches = _fused_state(
+        monkeypatch, _RecordingPagedCodec(True), source
+    )
+
+    context._plan_paged_routes(state, True, _RecordingPagedCodec(True), kv_caches)
+
+    assert state.store_route is StoreRoute.PAGED
+    assert state.retrieve_route is RetrieveRoute.PAGED
+    assert state.paged_source is source
+
+
+def test_routes_stay_staged_when_the_codec_rejects_the_geometry(
+    monkeypatch, quant_env
+):
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.kvweave_route import (
+        RetrieveRoute,
+        StoreRoute,
+    )
+
+    kv_caches = _kv_caches()
+    context, state, kv_caches = _fused_state(
+        monkeypatch, _RecordingPagedCodec(False), _paged_source(kv_caches)
+    )
+
+    context._plan_paged_routes(state, True, _RecordingPagedCodec(False), kv_caches)
+
+    assert state.store_route is StoreRoute.STAGED
+    assert state.retrieve_route is RetrieveRoute.SCATTER
+    assert state.paged_source is None
+
+
+def test_routes_stay_staged_when_the_kv_layout_is_ineligible(monkeypatch, quant_env):
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.kvweave_route import StoreRoute
+
+    context, state, kv_caches = _fused_state(
+        monkeypatch, _RecordingPagedCodec(True), None
+    )
+
+    context._plan_paged_routes(state, True, _RecordingPagedCodec(True), kv_caches)
+
+    assert state.store_route is StoreRoute.STAGED
+    assert state.paged_source is None
+
+
+def test_cpu_codec_never_takes_the_paged_routes(monkeypatch, quant_env):
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.kvweave_route import (
+        RetrieveRoute,
+        StoreRoute,
+    )
+
+    kv_caches = _kv_caches()
+    cpu_codec = _RecordingPagedCodec(True)
+    cpu_codec.device = "cpu"
+    context, state, kv_caches = _fused_state(
+        monkeypatch, cpu_codec, _paged_source(kv_caches)
+    )
+
+    context._plan_paged_routes(state, True, cpu_codec, kv_caches)
+
+    assert state.store_route is StoreRoute.STAGED
+    assert state.retrieve_route is RetrieveRoute.SCATTER
+    assert state.paged_source is None
