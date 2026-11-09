@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 # Third Party
+import msgspec
 import pytest
 import torch
 
@@ -660,6 +661,226 @@ def test_cpu_codec_never_takes_the_paged_routes(monkeypatch, quant_env):
     )
 
     context._plan_paged_routes(state, True, cpu_codec, kv_caches)
+
+    assert state.store_route is StoreRoute.STAGED
+    assert state.retrieve_route is RetrieveRoute.SCATTER
+    assert state.paged_source is None
+
+
+# ---------------------------------------------------------------------------
+# Mamba groups: the same in-place routes, with the real conv/ssm byte layout.
+# ---------------------------------------------------------------------------
+
+
+def _mamba_layout():
+    # First Party
+    from lmcache.v1.multiprocess.group_view import MambaSubStateWireLayout
+
+    conv = MambaSubStateWireLayout(
+        byte_offset=0, byte_length=96, dtype_str="torch.float16", shape=(3, 16)
+    )
+    ssm = MambaSubStateWireLayout(
+        byte_offset=96, byte_length=256, dtype_str="torch.float32", shape=(8, 8)
+    )
+    return conv, ssm
+
+
+class _RecordingMambaCodec(_RecordingPagedCodec):
+    """Adds the Mamba in-place entry points to the recording codec."""
+
+    def supports_paged_mamba_encode(self, layout, options, blocks_per_chunk):
+        return self.supports
+
+    def supports_paged_mamba_decode(self, layout, options, blocks_per_chunk):
+        return self.supports
+
+    def serialize_mamba_paged_into(
+        self, layer_ptrs, block_ids, num_blocks, page_stride, layout, options, out
+    ):
+        self.encodes.append(
+            {"ids": block_ids.tolist(), "stride": page_stride, "layout": layout,
+             "options": options, "out": out}
+        )
+        return int(out.numel())
+
+    def deserialize_mamba_paged(
+        self, src, layer_ptrs, block_ids, num_blocks, page_stride, layout, skip
+    ):
+        self.decodes.append(
+            {"ids": block_ids.tolist(), "skip": skip, "stride": page_stride,
+             "layout": layout, "src": src}
+        )
+
+
+def _mamba_paged_source(kv_caches, page_bytes: int = 512):
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.paged_kv import PagedMambaSource
+
+    return PagedMambaSource(
+        layer_ptrs=torch.zeros(NUM_LAYERS, dtype=torch.int64),
+        layer_key=tuple(int(t.data_ptr()) for t in kv_caches.values()),
+        page_stride_bytes=2 * page_bytes,  # pages sit further apart than their size
+        page_bytes=page_bytes,
+        num_blocks=NUM_BLOCKS,
+        device=torch.device("cpu"),
+    )
+
+
+def _mamba_setup(monkeypatch, supports: bool = True):
+    """A registered context whose only group is a Mamba group on the paged routes."""
+    # Standard
+    import dataclasses
+
+    # First Party
+    from lmcache.v1.distributed.serde.kvweave.kvweave_config import MambaCodecOptions
+    from lmcache.v1.multiprocess.transfer_context.kvweave_route import (
+        RetrieveRoute,
+        StoreRoute,
+    )
+
+    context, fake, block_ids = _store_roundtrip_setup(
+        monkeypatch, scratch_bytes=4 * _raw_chunk_bytes()
+    )
+    kv_caches = _kv_caches()
+    codec = _RecordingMambaCodec(supports)
+    context._kvweave_codec = codec
+    (state,) = context._group_states
+    options = MambaCodecOptions(
+        conv_scaling_method="per_token",
+        conv_rh=False,
+        ssm_scaling_method="per_token",
+        ssm_rh=False,
+        asym=False,
+    )
+    state.plan = dataclasses.replace(
+        state.plan,
+        group_info=EngineGroupInfo(
+            engine_group_id=0,
+            layer_indices=tuple(range(NUM_LAYERS)),
+            tokens_per_block=BLOCK_SIZE,
+            cache_category="mamba",
+            mamba_real_layout=_mamba_layout(),
+        ),
+        attention_plane_layout=None,
+        mamba_options=options,
+    )
+    state.paged_source = _mamba_paged_source(kv_caches)
+    state.store_route = StoreRoute.PAGED
+    state.retrieve_route = RetrieveRoute.PAGED
+    return context, fake, block_ids, kv_caches, codec, options
+
+
+def test_mamba_paged_store_passes_the_real_layout_and_page_stride(
+    monkeypatch, quant_env
+):
+    context, fake, block_ids, kv_caches, codec, options = _mamba_setup(monkeypatch)
+    outs = _spy_gather(monkeypatch)
+
+    assert context.submit_store(
+        "r", MagicMock(), kv_caches, block_ids, None, BLOCKS_IN_CHUNK
+    ).result()
+
+    assert outs == [] and fake.requested == []
+    ids = block_ids[0]
+    assert [c["ids"] for c in codec.encodes] == [
+        ids[:BLOCKS_IN_CHUNK],
+        ids[BLOCKS_IN_CHUNK:],
+    ]
+    for chunk, call in enumerate(codec.encodes):
+        # The codec needs the page stride (not the page size) and the byte offsets
+        # of conv and ssm inside a page.
+        assert call["stride"] == 1024
+        assert call["layout"] == _mamba_layout()
+        assert call["options"] is options
+        assert call["out"].data_ptr() == fake.stored[(0, chunk)].data_ptr()
+
+
+def test_mamba_paged_retrieve_skips_the_valid_prefix(monkeypatch, quant_env):
+    context, fake, block_ids, kv_caches, codec, _ = _mamba_setup(monkeypatch)
+    context.submit_store(
+        "r", MagicMock(), kv_caches, block_ids, None, BLOCKS_IN_CHUNK
+    ).result()
+
+    assert context.submit_retrieve(
+        "r",
+        MagicMock(),
+        kv_caches,
+        block_ids,
+        None,
+        BLOCKS_IN_CHUNK,
+        skip_first_n_tokens=20 * BLOCK_SIZE,
+    ).result()
+
+    (call,) = codec.decodes
+    assert call["ids"] == block_ids[0][BLOCKS_IN_CHUNK:]
+    assert call["skip"] == 4
+    assert call["stride"] == 1024
+    assert call["layout"] == _mamba_layout()
+    assert call["src"].data_ptr() == fake.stored[(0, 1)].data_ptr()
+
+
+def _mamba_route_state(monkeypatch, codec, source, layout=None):
+    # Standard
+    import dataclasses
+
+    context, _, _, kv_caches, _, _ = _mamba_setup(monkeypatch)
+    (state,) = context._group_states
+    if layout is not None:
+        info = msgspec.structs.replace(
+            state.plan.group_info, mamba_real_layout=layout
+        )
+        state.plan = dataclasses.replace(state.plan, group_info=info)
+    state.paged_source = None
+    monkeypatch.setattr(
+        worker_transfer, "prepare_paged_mamba_source", lambda *_a, **_k: source
+    )
+    return context, state, kv_caches
+
+
+def test_mamba_group_takes_the_paged_routes_when_everything_fits(
+    monkeypatch, quant_env
+):
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.kvweave_route import (
+        RetrieveRoute,
+        StoreRoute,
+    )
+
+    kv_caches = _kv_caches()
+    source = _mamba_paged_source(kv_caches)
+    codec = _RecordingMambaCodec(True)
+    context, state, kv_caches = _mamba_route_state(monkeypatch, codec, source)
+
+    context._plan_paged_routes(state, True, codec, kv_caches)
+
+    assert state.store_route is StoreRoute.PAGED
+    assert state.retrieve_route is RetrieveRoute.PAGED
+    assert state.paged_source is source
+
+
+@pytest.mark.parametrize("case", ["codec_rejects", "no_source", "layout_overflows"])
+def test_mamba_group_stays_staged_when_in_place_is_not_possible(
+    monkeypatch, quant_env, case
+):
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.kvweave_route import (
+        RetrieveRoute,
+        StoreRoute,
+    )
+
+    kv_caches = _kv_caches()
+    codec = _RecordingMambaCodec(supports=case != "codec_rejects")
+    source = None if case == "no_source" else _mamba_paged_source(kv_caches)
+    layout = None
+    if case == "layout_overflows":
+        conv, ssm = _mamba_layout()
+        # ssm runs past the 512-byte page.
+        layout = (conv, type(ssm)(
+            byte_offset=400, byte_length=256, dtype_str=ssm.dtype_str, shape=ssm.shape
+        ))
+    context, state, kv_caches = _mamba_route_state(monkeypatch, codec, source, layout)
+
+    context._plan_paged_routes(state, True, codec, kv_caches)
 
     assert state.store_route is StoreRoute.STAGED
     assert state.retrieve_route is RetrieveRoute.SCATTER

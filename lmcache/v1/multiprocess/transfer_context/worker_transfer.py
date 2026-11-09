@@ -59,9 +59,11 @@ from lmcache.v1.multiprocess.transfer_context.kvweave_route import (
 )
 from lmcache.v1.multiprocess.transfer_context.paged_kv import (
     PagedFusedSource,
+    PagedMambaSource,
     paged_block_ids_tensor,
     paged_fused_rejection_reason,
     prepare_paged_fused_source,
+    prepare_paged_mamba_source,
 )
 from lmcache.v1.multiprocess.transfer_mode import MPTransferMode
 from lmcache.v1.multiprocess.transport.base import RequestClient
@@ -222,8 +224,8 @@ class _GroupState:
             for the group, mirroring the server's prefetch window.
         plan: The group's KVWeave plan (quantized or not), resolved at
             ``register`` time; ``None`` for states built without one.
-        paged_source: Paged-KV description for in-place quantization (XPU,
-            fused-K/V attention), or ``None``.
+        paged_source: Paged-KV description for in-place quantization (XPU;
+            fused-K/V attention or Mamba), or ``None``.
         store_route: How this group's chunks are quantized on store.
         retrieve_route: How this group's chunks land in paged KV on retrieve.
     """
@@ -235,7 +237,7 @@ class _GroupState:
     layout_desc: MemoryLayoutDesc
     window_chunks: int = -1
     plan: "GroupTransferPlan | None" = None
-    paged_source: "PagedFusedSource | None" = None
+    paged_source: "PagedFusedSource | PagedMambaSource | None" = None
     store_route: StoreRoute = StoreRoute.DIRECT
     retrieve_route: RetrieveRoute = RetrieveRoute.SCATTER
 
@@ -1207,11 +1209,11 @@ class EngineDrivenTransferContext(TransferContext):
     ) -> None:
         """Decide one group's store/retrieve route, using paged KV when possible.
 
-        A quantized fused-K/V attention group on XPU can be quantized straight
-        from paged KV and dequantized straight into it, skipping the dense gather
-        and scatter. Everything else keeps the staged route. Sliding-window and
-        compressed groups stay staged: the in-place kernels address whole chunks
-        of uncompressed blocks.
+        A quantized fused-K/V attention or Mamba group on XPU can be quantized
+        straight from paged KV and dequantized straight into it, skipping the
+        dense gather and scatter. Everything else keeps the staged route.
+        Sliding-window and compressed groups stay staged: the in-place kernels
+        address whole chunks of uncompressed blocks.
 
         Args:
             state: The group's state; ``plan`` must be set. Its routes and
@@ -1223,49 +1225,108 @@ class EngineDrivenTransferContext(TransferContext):
         plan = state.plan
         assert plan is not None
         device = QuantDevice(codec.device)
+        kind = group_kind(plan)
         paged_encode = paged_decode = False
         if (
             master_on
             and device is QuantDevice.XPU
             and plan.quantized
-            and group_kind(plan) is GroupKind.FUSED_ATTENTION
+            and kind in (GroupKind.FUSED_ATTENTION, GroupKind.MAMBA)
         ):
-            tokens_per_block = self._chunk_tokens // state.blocks_in_chunk
             group_kv = {name: kv_caches[name] for name in state.layer_names}
-            source = prepare_paged_fused_source(group_kv, self._layout_hints)
-            if source is None:
+            if state.blocks_per_window != state.blocks_in_chunk:
                 logger.info(
-                    "Group stays on the staged route: %s",
-                    paged_fused_rejection_reason(group_kv, self._layout_hints),
-                )
-            elif (
-                state.blocks_per_window != state.blocks_in_chunk
-                or source.block_size != tokens_per_block
-            ):
-                logger.info(
-                    "Group stays on the staged route: sliding-window or compressed "
-                    "blocks (window=%d of %d blocks, %d vs %d tokens per block)",
+                    "Group stays on the staged route: sliding-window blocks "
+                    "(window=%d of %d blocks)",
                     state.blocks_per_window,
                     state.blocks_in_chunk,
-                    source.block_size,
-                    tokens_per_block,
+                )
+            elif kind is GroupKind.FUSED_ATTENTION:
+                paged_encode, paged_decode = self._describe_fused_group(
+                    state, codec, group_kv
                 )
             else:
-                chunk_tokens = state.blocks_in_chunk * source.block_size
-                paged_encode = codec.supports_paged_fused_encode(
-                    source.hidden, chunk_tokens
+                paged_encode, paged_decode = self._describe_mamba_group(
+                    state, plan, codec, group_kv
                 )
-                paged_decode = codec.supports_paged_fused_decode(
-                    source.hidden, chunk_tokens
-                )
-                if paged_encode or paged_decode:
-                    state.paged_source = source
         state.store_route = decide_store_route(
             master_on=master_on, device=device, plan=plan, paged_ok=paged_encode
         )
         state.retrieve_route = decide_retrieve_route(
             master_on=master_on, device=device, plan=plan, paged_ok=paged_decode
         )
+
+    def _describe_fused_group(
+        self,
+        state: "_GroupState",
+        codec: KVWeaveCodec,
+        group_kv: dict[str, torch.Tensor],
+    ) -> tuple[bool, bool]:
+        """Describe a fused attention group's paged KV and test the codec on it.
+
+        Returns:
+            ``(encode_ok, decode_ok)``. ``state.paged_source`` is set when either
+            holds.
+        """
+        tokens_per_block = self._chunk_tokens // state.blocks_in_chunk
+        source = prepare_paged_fused_source(group_kv, self._layout_hints)
+        if source is None:
+            logger.info(
+                "Group stays on the staged route: %s",
+                paged_fused_rejection_reason(group_kv, self._layout_hints),
+            )
+            return False, False
+        if source.block_size != tokens_per_block:
+            logger.info(
+                "Group stays on the staged route: compressed blocks "
+                "(%d vs %d tokens per block)",
+                source.block_size,
+                tokens_per_block,
+            )
+            return False, False
+        chunk_tokens = state.blocks_in_chunk * source.block_size
+        encode_ok = codec.supports_paged_fused_encode(source.hidden, chunk_tokens)
+        decode_ok = codec.supports_paged_fused_decode(source.hidden, chunk_tokens)
+        if encode_ok or decode_ok:
+            state.paged_source = source
+        return encode_ok, decode_ok
+
+    def _describe_mamba_group(
+        self,
+        state: "_GroupState",
+        plan: GroupTransferPlan,
+        codec: KVWeaveCodec,
+        group_kv: dict[str, torch.Tensor],
+    ) -> tuple[bool, bool]:
+        """Describe a Mamba group's paged pages and test the codec on them.
+
+        Returns:
+            ``(encode_ok, decode_ok)``. ``state.paged_source`` is set when either
+            holds.
+        """
+        info = plan.group_info
+        if info is None or info.mamba_real_layout is None or plan.mamba_options is None:
+            return False, False
+        source = prepare_paged_mamba_source(group_kv, self._layout_hints)
+        if source is None:
+            logger.info("Mamba group stays on the staged route: pages not described")
+            return False, False
+        if any(
+            layout.byte_offset + layout.byte_length > source.page_bytes
+            for layout in info.mamba_real_layout
+        ):
+            logger.info(
+                "Mamba group stays on the staged route: conv/ssm do not fit the "
+                "%d-byte page",
+                source.page_bytes,
+            )
+            return False, False
+        args = (info.mamba_real_layout, plan.mamba_options, state.blocks_in_chunk)
+        encode_ok = codec.supports_paged_mamba_encode(*args)
+        decode_ok = codec.supports_paged_mamba_decode(*args)
+        if encode_ok or decode_ok:
+            state.paged_source = source
+        return encode_ok, decode_ok
 
     def _plan_kvweave_groups(
         self,
@@ -1667,7 +1728,7 @@ class EngineDrivenTransferContext(TransferContext):
 
     def _check_paged_source(
         self, state: "_GroupState", kv_caches: dict[str, torch.Tensor]
-    ) -> PagedFusedSource:
+    ) -> "PagedFusedSource | PagedMambaSource":
         """Return the group's paged source after checking the tensors are unchanged.
 
         Raises:
@@ -1688,7 +1749,7 @@ class EngineDrivenTransferContext(TransferContext):
 
     def _chunk_block_ids(
         self,
-        source: PagedFusedSource,
+        source: "PagedFusedSource | PagedMambaSource",
         group_block_ids: list[int],
         chunk: int,
         blocks_per_chunk: int,
@@ -1721,18 +1782,36 @@ class EngineDrivenTransferContext(TransferContext):
         assert codec is not None and plan.out is not None
         with torch.inference_mode():
             for chunk, slot in zip(plan.chunk_indices, plan.out, strict=True):
-                codec.serialize_fused_paged(
-                    source.layer_ptrs,
-                    self._chunk_block_ids(
-                        source, group_block_ids, chunk, state.blocks_in_chunk
-                    ),
-                    source.block_size,
-                    source.block_stride_elems,
-                    source.num_blocks,
-                    source.dtype,
-                    source.hidden,
-                    slot.view(torch.uint8).view(-1),
+                block_ids = self._chunk_block_ids(
+                    source, group_block_ids, chunk, state.blocks_in_chunk
                 )
+                out = slot.view(torch.uint8).view(-1)
+                if isinstance(source, PagedMambaSource):
+                    group_plan = state.plan
+                    assert group_plan is not None and group_plan.group_info is not None
+                    assert group_plan.mamba_options is not None
+                    layout = group_plan.group_info.mamba_real_layout
+                    assert layout is not None
+                    codec.serialize_mamba_paged_into(
+                        source.layer_ptrs,
+                        block_ids,
+                        source.num_blocks,
+                        source.page_stride_bytes,
+                        layout,
+                        group_plan.mamba_options,
+                        out,
+                    )
+                else:
+                    codec.serialize_fused_paged(
+                        source.layer_ptrs,
+                        block_ids,
+                        source.block_size,
+                        source.block_stride_elems,
+                        source.num_blocks,
+                        source.dtype,
+                        source.hidden,
+                        out,
+                    )
         plan.encoded = True
 
     def _decode_paged_group(
@@ -1759,12 +1838,13 @@ class EngineDrivenTransferContext(TransferContext):
         source = self._check_paged_source(state, kv_caches)
         codec = self._kvweave_codec
         assert codec is not None
-        if skip_first_n_tokens % source.block_size:
+        tokens_per_block = self._chunk_tokens // state.blocks_in_chunk
+        if skip_first_n_tokens % tokens_per_block:
             logger.error(
                 "skip_first_n_tokens (%d) is not block-aligned (block_size=%d); "
                 "rounding down",
                 skip_first_n_tokens,
-                source.block_size,
+                tokens_per_block,
             )
         with torch.inference_mode():
             for offset, payload in enumerate(chunks):
@@ -1772,26 +1852,42 @@ class EngineDrivenTransferContext(TransferContext):
                 skip_blocks = min(
                     max(
                         (skip_first_n_tokens - chunk * self._chunk_tokens)
-                        // source.block_size,
+                        // tokens_per_block,
                         0,
                     ),
                     state.blocks_in_chunk,
                 )
                 if skip_blocks == state.blocks_in_chunk:
                     continue
-                codec.deserialize_fused_paged(
-                    payload,
-                    source.layer_ptrs,
-                    self._chunk_block_ids(
-                        source, group_block_ids, chunk, state.blocks_in_chunk
-                    ),
-                    source.block_size,
-                    source.block_stride_elems,
-                    source.num_blocks,
-                    skip_blocks,
-                    source.dtype,
-                    source.hidden,
+                block_ids = self._chunk_block_ids(
+                    source, group_block_ids, chunk, state.blocks_in_chunk
                 )
+                if isinstance(source, PagedMambaSource):
+                    group_plan = state.plan
+                    assert group_plan is not None and group_plan.group_info is not None
+                    layout = group_plan.group_info.mamba_real_layout
+                    assert layout is not None
+                    codec.deserialize_mamba_paged(
+                        payload,
+                        source.layer_ptrs,
+                        block_ids,
+                        source.num_blocks,
+                        source.page_stride_bytes,
+                        layout,
+                        skip_blocks,
+                    )
+                else:
+                    codec.deserialize_fused_paged(
+                        payload,
+                        source.layer_ptrs,
+                        block_ids,
+                        source.block_size,
+                        source.block_stride_elems,
+                        source.num_blocks,
+                        skip_blocks,
+                        source.dtype,
+                        source.hidden,
+                    )
 
     def _encode_quantized_groups(
         self,

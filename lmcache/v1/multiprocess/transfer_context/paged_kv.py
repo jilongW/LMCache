@@ -62,6 +62,29 @@ class PagedFusedSource:
     device: torch.device
 
 
+@dataclass(frozen=True)
+class PagedMambaSource:
+    """Paged Mamba state pages described for in-place quantization.
+
+    Attributes:
+        layer_ptrs: int64 vector on the accelerator, one base pointer per layer.
+        layer_key: The layers' ``data_ptr()`` values at description time, used to
+            detect that the engine reallocated its KV tensors.
+        page_stride_bytes: Bytes between consecutive pages (blocks). Larger than
+            ``page_bytes`` when the pool is shared with bigger attention pages.
+        page_bytes: Bytes of one page's payload (``conv | ssm | pad``).
+        num_blocks: Pages per layer tensor (valid ids are ``[0, num_blocks)``).
+        device: Accelerator holding the paged state.
+    """
+
+    layer_ptrs: torch.Tensor
+    layer_key: tuple[int, ...]
+    page_stride_bytes: int
+    page_bytes: int
+    num_blocks: int
+    device: torch.device
+
+
 def prepare_paged_fused_source(
     kv_caches: dict[str, torch.Tensor],
     layout_hints: LayoutHints | None = None,
@@ -123,6 +146,73 @@ def prepare_paged_fused_source(
         num_blocks=num_blocks,
         dtype=first.dtype,
         hidden=num_heads * cs,
+        device=first.device,
+    )
+
+
+def prepare_paged_mamba_source(
+    kv_caches: dict[str, torch.Tensor],
+    layout_hints: LayoutHints | None = None,
+) -> PagedMambaSource | None:
+    """Describe a Mamba group's paged state pages, or ``None`` if ineligible.
+
+    LMCache sees each Mamba page as one opaque, blocks-first
+    ``[num_blocks, block_size, heads, width]`` view (the ``mamba-unified-view``
+    edit; ``conv | ssm | pad`` bytes, usually an ``int8`` view). The codec only
+    needs where pages start and how far apart they are, plus the real conv/ssm
+    byte offsets inside a page (the group's ``mamba_real_layout``), so this
+    accepts any such view whose page interior is contiguous and whose layers
+    agree on geometry. Pages may be strided further apart than their size.
+
+    Args:
+        kv_caches: This group's KV tensors keyed by layer name.
+        layout_hints: Optional engine layout hints.
+
+    Returns:
+        The description, or ``None`` when the group cannot be handled in place.
+    """
+    tensors = list(kv_caches.values())
+    if not tensors or tensors[0].device.type != "xpu":
+        return None
+    try:
+        engine_kv_format, normalized = normalize_kv_and_discover_format(
+            tensors, EngineType.VLLM, layout_hints=layout_hints
+        )
+    except (ValueError, RuntimeError, TypeError, IndexError):
+        logger.warning(
+            "Could not describe paged Mamba state for in-place quantization; "
+            "falling back to gather.",
+            exc_info=True,
+        )
+        return None
+    views = list(normalized)
+    first = views[0]
+    if first.dim() != 4:
+        return None
+    num_blocks, block_size, num_heads, width = (int(d) for d in first.shape)
+    itemsize = first.element_size()
+    inner = (num_heads * width, width, 1)
+    page_bytes = block_size * num_heads * width * itemsize
+    page_stride_bytes = int(first.stride(0)) * itemsize
+    if page_stride_bytes < page_bytes or not all(
+        view.shape == first.shape
+        and view.dtype == first.dtype
+        and tuple(view.stride()[1:]) == inner
+        and view.stride(0) == first.stride(0)
+        for view in views
+    ):
+        return None
+    return PagedMambaSource(
+        layer_ptrs=_layer_ptrs_tensor(
+            get_group_data_ptrs(
+                normalized, engine_kv_format, list(range(len(views)))
+            ),
+            first.device,
+        ),
+        layer_key=tuple(int(t.data_ptr()) for t in tensors),
+        page_stride_bytes=page_stride_bytes,
+        page_bytes=page_bytes,
+        num_blocks=num_blocks,
         device=first.device,
     )
 
