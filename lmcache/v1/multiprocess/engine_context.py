@@ -4,7 +4,8 @@
 # Standard
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import TypedDict
+from typing import NotRequired, TypedDict
+import os
 import threading
 
 # First Party
@@ -31,6 +32,78 @@ class ShmPoolInfo(TypedDict):
 
     shm_name: str
     pool_size: int
+    # Present only when a non-L1 scratch tail is reserved behind the L1 pool
+    # (KVWeave quantized engine-driven store); absent keeps the plain shape.
+    scratch_offset: NotRequired[int]
+    scratch_size: NotRequired[int]
+
+
+_SCRATCH_GB_ENV = "LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_GB"
+_KVWEAVE_MASTER_ENV = "LMCACHE_MP_L1_KVWEAVE_QUANT"
+_DEFAULT_SCRATCH_GB = "5"
+
+
+def _engine_driven_scratch_size_bytes(l1_size: int, shm_name: str) -> int:
+    """Return the scratch size to reserve behind an engine-driven SHM pool.
+
+    The scratch tail holds the raw KV a worker gathers before quantizing it into
+    an L1 object. It is only useful when KVWeave quantization is on, so the
+    default follows the KVWeave master switch (5 GiB when on, none when off) and
+    a deployment that does not use KVWeave keeps exactly the upstream pool.
+    ``LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_GB`` overrides either way. The size is
+    capped by what ``/dev/shm`` has left after the L1 pool.
+
+    Args:
+        l1_size: Configured L1 pool size in bytes.
+        shm_name: Normalized SHM segment name; empty means no SHM transport.
+
+    Returns:
+        The scratch size in bytes, or ``0`` for none.
+    """
+    if not shm_name:
+        return 0
+    raw = os.environ.get(_SCRATCH_GB_ENV)
+    if raw is None:
+        master_on = os.environ.get(_KVWEAVE_MASTER_ENV, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        raw = _DEFAULT_SCRATCH_GB if master_on else "0"
+    try:
+        requested_size = int(max(0.0, float(raw)) * (1 << 30))
+    except ValueError:
+        logger.warning("Invalid engine-driven scratch size in GB %r; disabling", raw)
+        return 0
+    if requested_size <= 0:
+        return 0
+
+    try:
+        shm_stats = os.statvfs("/dev/shm")
+        shm_available = shm_stats.f_bavail * shm_stats.f_frsize
+    except OSError as exc:
+        logger.warning(
+            "Failed to read /dev/shm available capacity for engine-driven "
+            "scratch sizing: %s; using requested scratch size %.3f GiB",
+            exc,
+            requested_size / (1 << 30),
+        )
+        return requested_size
+
+    scratch_size = min(requested_size, max(0, shm_available - l1_size))
+    if scratch_size < requested_size:
+        logger.info(
+            "Engine-driven scratch requested %.3f GiB, reduced to %.3f GiB "
+            "because /dev/shm has %.3f GiB available and L1 is configured "
+            "for %.3f GiB",
+            requested_size / (1 << 30),
+            scratch_size / (1 << 30),
+            shm_available / (1 << 30),
+            l1_size / (1 << 30),
+        )
+    return scratch_size
 
 
 @dataclass
@@ -226,6 +299,11 @@ class MPCacheServerContext:
         self.shm_pool_info: ShmPoolInfo = self._compute_shm_pool_info(
             storage_manager_config
         )
+        if self.shm_pool_info.get("scratch_size", 0):
+            # Back the SHM segment with the scratch tail; L1 itself still only
+            # gets ``size_in_bytes`` of it.
+            memory_config = storage_manager_config.l1_manager_config.memory_config
+            memory_config.shm_pool_size_in_bytes = self.shm_pool_info["pool_size"]
         self._storage_manager = StorageManager(storage_manager_config)
         self._token_hasher = TokenHasher(
             chunk_size=chunk_size, hash_algorithm=hash_algorithm
@@ -446,7 +524,17 @@ class MPCacheServerContext:
         bare = shm_name.lstrip("/")
         if not bare.startswith("lmcache_l1_pool_"):
             shm_name = f"lmcache_l1_pool_{bare}"
-        return {"shm_name": shm_name, "pool_size": mem_cfg.size_in_bytes}
+        scratch_size = _engine_driven_scratch_size_bytes(
+            mem_cfg.size_in_bytes, shm_name
+        )
+        if not scratch_size:
+            return {"shm_name": shm_name, "pool_size": mem_cfg.size_in_bytes}
+        return {
+            "shm_name": shm_name,
+            "pool_size": mem_cfg.size_in_bytes + scratch_size,
+            "scratch_offset": mem_cfg.size_in_bytes,
+            "scratch_size": scratch_size,
+        }
 
     def _bind_chunk_size_locked(self, chunk_size: int) -> None:
         """Initialize runtime state that depends on a concrete chunk size."""

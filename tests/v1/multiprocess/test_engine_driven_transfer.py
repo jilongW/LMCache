@@ -2812,3 +2812,212 @@ def test_engine_driven_context_shm_close_is_idempotent() -> None:
     finally:
         shm_munmap(addr, 4096)
         shm_unlink(shm_name)
+
+
+# ---------------------------------------------------------------------------
+# KVWeave registration: layout override, quantization gate, scratch slots
+# ---------------------------------------------------------------------------
+
+
+def _kvweave_payload(
+    *,
+    instance_id: int = 1,
+    world_size: int = 1,
+    enable_quant: bool = False,
+    overrides: "list[Any] | None" = None,
+) -> Any:
+    """Build a two-group registration payload, optionally with layout overrides."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import (
+        GroupLayout,
+        RegisterEngineDrivenContextPayload,
+    )
+
+    overrides = overrides or [None, None]
+    return RegisterEngineDrivenContextPayload(
+        instance_id=instance_id,
+        model_name="m",
+        world_size=world_size,
+        block_size=4,
+        num_layers=2,
+        hidden_dim_size=16,
+        dtype_str="float32",
+        use_mla=False,
+        group_layouts=[
+            GroupLayout(
+                num_layers=1,
+                hidden_dim_size=16,
+                dtype_str="float32",
+                tokens_per_block=4,
+                layout_override=override,
+            )
+            for override in overrides
+        ],
+        enable_l1_kvweave_quant=enable_quant,
+    )
+
+
+def test_register_uses_group_layout_override(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """A group's ``layout_override`` is used verbatim; other groups still derive."""
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import serialize_memory_layout_desc
+
+    module, _, _, ctx = server_module_factory(chunk_size=16)
+    quantized = MemoryLayoutDesc(shapes=[torch.Size([77])], dtypes=[torch.uint8])
+
+    response = module.register_kv_cache_engine_driven_context(
+        _kvweave_payload(overrides=[serialize_memory_layout_desc(quantized), None])
+    )
+
+    assert response.error is None
+    group_descs = ctx.layout_desc_registry.find_group_layout_descs("m", 1)
+    assert group_descs is not None
+    assert group_descs[0] == quantized
+    # The unoverridden group keeps the attention-shaped derivation: K/V planes.
+    assert group_descs[1].shapes[0][0] == 2
+    assert group_descs[1].dtypes[0] == torch.float32
+
+
+def test_register_without_quant_never_touches_quant_state(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    module, mock_storage, _, _ = server_module_factory(chunk_size=16)
+
+    response = module.register_kv_cache_engine_driven_context(_kvweave_payload())
+
+    assert response.error is None
+    mock_storage.is_l1_variable_size.assert_not_called()
+    mock_storage.mark_l1_kvweave_quant_enabled.assert_not_called()
+
+
+def test_register_quant_marks_storage_when_l1_is_variable_size(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    module, mock_storage, _, ctx = server_module_factory(chunk_size=16)
+    mock_storage.is_l1_variable_size.return_value = True
+
+    response = module.register_kv_cache_engine_driven_context(
+        _kvweave_payload(enable_quant=True)
+    )
+
+    assert response.error is None
+    mock_storage.mark_l1_kvweave_quant_enabled.assert_called_once_with()
+    assert ctx.layout_desc_registry.find_group_layout_descs("m", 1) is not None
+
+
+def test_register_quant_rejected_on_fixed_size_l1(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """Quantization needs every L1 to be variable-size; a rejected registration
+    leaves nothing behind."""
+    module, mock_storage, _, ctx = server_module_factory(chunk_size=16)
+    mock_storage.is_l1_variable_size.return_value = False
+
+    response = module.register_kv_cache_engine_driven_context(
+        _kvweave_payload(enable_quant=True)
+    )
+
+    assert response.error is not None
+    assert "variable-size" in response.error
+    assert response.shm_name == ""
+    mock_storage.mark_l1_kvweave_quant_enabled.assert_not_called()
+    assert ctx.layout_desc_registry.find_group_layout_descs("m", 1) is None
+    assert 1 not in module._engine_driven_contexts
+
+
+def test_register_quant_rejected_when_lossy_l2_already_configured(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    module, mock_storage, _, ctx = server_module_factory(chunk_size=16)
+    mock_storage.is_l1_variable_size.return_value = True
+    mock_storage.mark_l1_kvweave_quant_enabled.side_effect = ValueError(
+        "L2 adapter(s) ['fs'] already use a lossy serde"
+    )
+
+    response = module.register_kv_cache_engine_driven_context(
+        _kvweave_payload(enable_quant=True)
+    )
+
+    assert response.error is not None
+    assert "lossy serde" in response.error
+    assert 1 not in module._engine_driven_contexts
+    assert module._scratch_slots == {}
+
+
+_SCRATCH_POOL = {
+    "shm_name": "lmcache_l1_pool_t",
+    "pool_size": 1000,
+    "scratch_offset": 600,
+    "scratch_size": 400,
+}
+
+
+def test_register_without_scratch_tail_reports_none(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    module, _, _, _ = server_module_factory(chunk_size=16)
+
+    response = module.register_kv_cache_engine_driven_context(_kvweave_payload())
+
+    assert (response.scratch_offset, response.scratch_size) == (0, 0)
+
+
+def test_register_assigns_disjoint_scratch_slots_and_recycles_them(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    module, _, _, _ = server_module_factory(chunk_size=16)
+    module._shm_pool_info = dict(_SCRATCH_POOL)  # type: ignore[assignment]
+
+    # world_size=2 splits the 400-byte tail into two 200-byte partitions.
+    first = module.register_kv_cache_engine_driven_context(
+        _kvweave_payload(instance_id=1, world_size=2)
+    )
+    second = module.register_kv_cache_engine_driven_context(
+        _kvweave_payload(instance_id=2, world_size=2)
+    )
+    assert (first.scratch_offset, first.scratch_size) == (600, 200)
+    assert (second.scratch_offset, second.scratch_size) == (800, 200)
+
+    # Re-registering returns the same slot instead of consuming another.
+    again = module.register_kv_cache_engine_driven_context(
+        _kvweave_payload(instance_id=1, world_size=2)
+    )
+    assert (again.scratch_offset, again.scratch_size) == (600, 200)
+
+    # Both partitions are taken, so a third instance runs without scratch.
+    third = module.register_kv_cache_engine_driven_context(
+        _kvweave_payload(instance_id=3, world_size=2)
+    )
+    assert (third.scratch_offset, third.scratch_size) == (0, 0)
+
+    # Unregistering frees the partition for the next registration.
+    module.unregister_kv_cache(1)
+    fourth = module.register_kv_cache_engine_driven_context(
+        _kvweave_payload(instance_id=4, world_size=2)
+    )
+    assert (fourth.scratch_offset, fourth.scratch_size) == (600, 200)
+
+
+def test_scratch_max_instances_env_overrides_world_size(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, _, _, _ = server_module_factory(chunk_size=16)
+    module._shm_pool_info = dict(_SCRATCH_POOL)  # type: ignore[assignment]
+    monkeypatch.setenv("LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_MAX_INSTANCES", "4")
+
+    response = module.register_kv_cache_engine_driven_context(
+        _kvweave_payload(world_size=1)
+    )
+
+    assert (response.scratch_offset, response.scratch_size) == (600, 100)

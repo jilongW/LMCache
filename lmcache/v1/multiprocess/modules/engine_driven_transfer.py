@@ -4,6 +4,7 @@
 # Standard
 from dataclasses import dataclass
 from typing import Any
+import os
 import threading
 import time
 
@@ -20,6 +21,7 @@ from lmcache.v1.distributed.api import (
 )
 from lmcache.v1.mp_observability.event import Event, EventType, next_transfer_key
 from lmcache.v1.multiprocess.custom_types import (
+    deserialize_memory_layout_desc,
     IPCCacheServerKey,
     PrepareRetrieveResponse,
     PrepareStoreResponse,
@@ -114,6 +116,9 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         ] = {}
         self._pending_shm_lock = threading.Lock()
         self._shm_pool_info: ShmPoolInfo = self._ctx.shm_pool_info
+        # (offset, size) of each registered instance's slot in the SHM scratch
+        # tail. Guarded by ``_lock``.
+        self._scratch_slots: dict[int, tuple[int, int]] = {}
         # Values retain the START event and monotonic preparation time.
         # Includes request_id because IPCCacheServerKey equality excludes it.
         self._pending_transfers: dict[
@@ -220,6 +225,7 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             for iid in stale_ids:
                 entry = self._engine_driven_contexts.pop(iid)
                 self._strategies.pop(iid, None)
+                self._scratch_slots.pop(iid, None)
                 reaped.append((iid, entry))
         for iid, entry in reaped:
             self._release_entry(iid, entry)
@@ -293,6 +299,64 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
 
         self._ctx.layout_desc_registry.unregister(entry.model_name, entry.world_size)
 
+    def _allocate_scratch_slot(
+        self, instance_id: int, default_max_instances: int
+    ) -> tuple[int, int]:
+        """Assign one non-overlapping scratch partition to an instance.
+
+        The scratch tail is split into equal partitions, one per expected
+        instance (the registered ``world_size`` unless
+        ``LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_MAX_INSTANCES`` says otherwise).
+        Must be called with ``_lock`` held.
+
+        Args:
+            instance_id: The registering worker instance.
+            default_max_instances: Partition count when the environment does
+                not set one.
+
+        Returns:
+            ``(offset, size)`` of the partition in the SHM pool, or ``(0, 0)``
+            when there is no scratch tail or no free partition; the worker then
+            runs without scratch.
+        """
+        scratch_total = self._shm_pool_info.get("scratch_size", 0)
+        if not scratch_total:
+            return 0, 0
+        scratch_start = self._shm_pool_info.get("scratch_offset", 0)
+        default_max_instances = max(1, default_max_instances)
+        raw_max_instances = os.environ.get(
+            "LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_MAX_INSTANCES"
+        )
+        try:
+            max_instances = max(
+                1,
+                int(raw_max_instances)
+                if raw_max_instances is not None
+                else default_max_instances,
+            )
+        except ValueError:
+            logger.warning(
+                "Invalid LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_MAX_INSTANCES=%r; "
+                "using registered world_size=%d",
+                raw_max_instances,
+                default_max_instances,
+            )
+            max_instances = default_max_instances
+        slot_size = scratch_total // max_instances
+        if slot_size <= 0:
+            return 0, 0
+        used = set(self._scratch_slots.values())
+        for slot_index in range(max_instances):
+            slot = (scratch_start + slot_index * slot_size, slot_size)
+            if slot not in used:
+                self._scratch_slots[instance_id] = slot
+                return slot
+        logger.warning(
+            "No engine-driven scratch partition available for instance %d",
+            instance_id,
+        )
+        return 0, 0
+
     @staticmethod
     def _make_transfer_key(
         key: IPCCacheServerKey, instance_id: int
@@ -356,10 +420,13 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     "Instance %d already registered (non-GPU); refreshing liveness",
                     payload.instance_id,
                 )
+                scratch_slot = self._scratch_slots.get(payload.instance_id, (0, 0))
                 return RegisterEngineDrivenContextResponse(
                     shm_name=shm_name,
                     pool_size=pool_size,
                     null_block_id=self._ctx.null_block_id,
+                    scratch_offset=scratch_slot[0],
+                    scratch_size=scratch_slot[1],
                 )
 
         dtype = getattr(torch, payload.dtype_str, None)
@@ -378,6 +445,18 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         elif num_physical_slots <= 0:
             raise ValueError(
                 f"num_physical_slots must be positive, got {num_physical_slots}"
+            )
+
+        if (
+            payload.enable_l1_kvweave_quant
+            and not self._ctx.storage_manager.is_l1_variable_size()
+        ):
+            return RegisterEngineDrivenContextResponse(
+                error=(
+                    "enable_l1_kvweave_quant=True but at least one L1 backend does "
+                    "not support variable-size chunks (is_l1_variable_size() is "
+                    "False); refusing to register a quantized context"
+                )
             )
 
         shape = (
@@ -411,6 +490,14 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 # beside a one-plane index cache. Legacy workers report 0, so
                 # fall back to the top-level flag they were sized by.
                 g_single_plane = gl.kv_size == 1 if gl.kv_size else payload.use_mla
+                if gl.layout_override is not None:
+                    # The worker's actual transfer layout wins: the encoded
+                    # byte layout of a quantized group, or raw Mamba state the
+                    # attention-shaped derivation below cannot describe.
+                    group_layouts.append(
+                        deserialize_memory_layout_desc(gl.layout_override)
+                    )
+                    continue
                 g_shape = (
                     torch.Size([gl.num_layers, g_slots, gl.hidden_dim_size])
                     if g_single_plane
@@ -456,15 +543,25 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             pending_lock=self._pending_shm_lock,
             transfer_key_factory=self._make_transfer_key,
         )
+        if payload.enable_l1_kvweave_quant:
+            try:
+                self._ctx.storage_manager.mark_l1_kvweave_quant_enabled()
+            except ValueError as exc:
+                return RegisterEngineDrivenContextResponse(error=str(exc))
         with self._lock:
+            scratch_offset, scratch_size = self._allocate_scratch_slot(
+                payload.instance_id, payload.world_size
+            )
             self._engine_driven_contexts[payload.instance_id] = entry
             self._strategies[payload.instance_id] = strategy
 
         logger.info(
-            "Registered non-GPU context for instance %d (model=%s, world_size=%d)",
+            "Registered non-GPU context for instance %d (model=%s, world_size=%d, "
+            "kvweave_quant=%s)",
             payload.instance_id,
             payload.model_name,
             payload.world_size,
+            payload.enable_l1_kvweave_quant,
         )
 
         if group_layouts:
@@ -503,6 +600,8 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             shm_name=shm_name,
             pool_size=pool_size,
             null_block_id=self._ctx.null_block_id,
+            scratch_offset=scratch_offset,
+            scratch_size=scratch_size,
         )
 
     @request_handler(operation="unregister_kv_cache_engine_driven_context")
@@ -516,6 +615,7 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             entry = self._engine_driven_contexts.pop(instance_id, None)
             if entry is not None:
                 self._strategies.pop(instance_id, None)
+                self._scratch_slots.pop(instance_id, None)
         if entry is None:
             logger.warning(
                 "No registered non-GPU context found for instance ID %d",
