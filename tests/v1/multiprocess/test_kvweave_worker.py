@@ -617,6 +617,68 @@ def test_routes_become_paged_for_a_supported_fused_group(monkeypatch, quant_env)
     assert state.paged_source is source
 
 
+def test_sliding_window_group_takes_the_paged_routes(monkeypatch, quant_env):
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.kvweave_route import (
+        RetrieveRoute,
+        StoreRoute,
+    )
+
+    kv_caches = _kv_caches()
+    context, state, kv_caches = _fused_state(
+        monkeypatch, _RecordingPagedCodec(True), _paged_source(kv_caches)
+    )
+    state.blocks_per_window = 4
+
+    context._plan_paged_routes(state, True, _RecordingPagedCodec(True), kv_caches)
+
+    assert state.store_route is StoreRoute.PAGED
+    assert state.retrieve_route is RetrieveRoute.PAGED
+
+
+def test_sliding_window_paged_store_encodes_only_the_trailing_window(
+    monkeypatch, quant_env
+):
+    context, _, block_ids, kv_caches, codec = _paged_setup(monkeypatch)
+    (state,) = context._group_states
+    state.blocks_per_window = 4
+
+    context.submit_store(
+        "r", MagicMock(), kv_caches, block_ids, None, BLOCKS_IN_CHUNK
+    ).result()
+
+    ids = block_ids[0]
+    assert [call["ids"] for call in codec.encodes] == [
+        ids[BLOCKS_IN_CHUNK - 4 : BLOCKS_IN_CHUNK],
+        ids[2 * BLOCKS_IN_CHUNK - 4 : 2 * BLOCKS_IN_CHUNK],
+    ]
+
+
+def test_sliding_window_paged_retrieve_skips_inside_the_window(monkeypatch, quant_env):
+    context, _, block_ids, kv_caches, codec = _paged_setup(monkeypatch)
+    (state,) = context._group_states
+    state.blocks_per_window = 4
+    context.submit_store(
+        "r", MagicMock(), kv_caches, block_ids, None, BLOCKS_IN_CHUNK
+    ).result()
+    ids = block_ids[0]
+
+    # 14 valid blocks: chunk 0 skips its first 14 of 16, which is 2 of its 4 window
+    # blocks; chunk 1 is untouched.
+    context.submit_retrieve(
+        "r",
+        MagicMock(),
+        kv_caches,
+        block_ids,
+        None,
+        BLOCKS_IN_CHUNK,
+        skip_first_n_tokens=14 * BLOCK_SIZE,
+    ).result()
+
+    assert [call["skip"] for call in codec.decodes] == [2, 0]
+    assert codec.decodes[0]["ids"] == ids[BLOCKS_IN_CHUNK - 4 : BLOCKS_IN_CHUNK]
+
+
 def test_routes_stay_staged_when_the_codec_rejects_the_geometry(
     monkeypatch, quant_env
 ):

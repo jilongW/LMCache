@@ -1213,8 +1213,9 @@ class EngineDrivenTransferContext(TransferContext):
         A quantized fused-K/V attention or Mamba group on XPU can be quantized
         straight from paged KV and dequantized straight into it, skipping the
         dense gather and scatter. Everything else keeps the staged route.
-        Sliding-window and compressed groups stay staged: the in-place kernels
-        address whole chunks of uncompressed blocks.
+        Compressed groups stay staged: the in-place kernels address uncompressed
+        blocks. A sliding-window attention group quantizes only the trailing
+        window blocks of each chunk, like the staged gather does.
 
         Args:
             state: The group's state; ``plan`` must be set. Its routes and
@@ -1235,7 +1236,10 @@ class EngineDrivenTransferContext(TransferContext):
             and kind in (GroupKind.FUSED_ATTENTION, GroupKind.MAMBA)
         ):
             group_kv = {name: kv_caches[name] for name in state.layer_names}
-            if state.blocks_per_window != state.blocks_in_chunk:
+            if (
+                state.blocks_per_window != state.blocks_in_chunk
+                and kind is not GroupKind.FUSED_ATTENTION
+            ):
                 logger.info(
                     "Group stays on the staged route: sliding-window blocks "
                     "(window=%d of %d blocks)",
@@ -1285,7 +1289,8 @@ class EngineDrivenTransferContext(TransferContext):
                 tokens_per_block,
             )
             return False, False
-        chunk_tokens = state.blocks_in_chunk * source.block_size
+        # A sliding-window group stores only the trailing window of each chunk.
+        chunk_tokens = state.blocks_per_window * source.block_size
         encode_ok = codec.supports_paged_fused_encode(source.hidden, chunk_tokens)
         decode_ok = codec.supports_paged_fused_decode(source.hidden, chunk_tokens)
         if encode_ok or decode_ok:
@@ -1766,8 +1771,9 @@ class EngineDrivenTransferContext(TransferContext):
         group_block_ids: list[int],
         chunk: int,
         blocks_per_chunk: int,
+        blocks_per_window: int,
     ) -> torch.Tensor:
-        """Upload one chunk's block ids, after checking they are valid ids.
+        """Upload one chunk's trailing window block ids, after checking them.
 
         Raises:
             ValueError: If the chunk is incomplete or an id is outside the paged
@@ -1780,7 +1786,9 @@ class EngineDrivenTransferContext(TransferContext):
             raise ValueError(
                 f"block ids {ids} are incomplete or outside [0, {source.num_blocks})"
             )
-        return paged_block_ids_tensor(list(ids), source.device)
+        # Sliding-window groups keep only the trailing window blocks of a chunk;
+        # for full attention the window is the whole chunk.
+        return paged_block_ids_tensor(list(ids[-blocks_per_window:]), source.device)
 
     def _encode_paged_group(
         self,
@@ -1796,7 +1804,11 @@ class EngineDrivenTransferContext(TransferContext):
         with torch.inference_mode():
             for chunk, slot in zip(plan.chunk_indices, plan.out, strict=True):
                 block_ids = self._chunk_block_ids(
-                    source, group_block_ids, chunk, state.blocks_in_chunk
+                    source,
+                    group_block_ids,
+                    chunk,
+                    state.blocks_in_chunk,
+                    state.blocks_per_window,
                 )
                 out = slot.view(torch.uint8).view(-1)
                 if isinstance(source, PagedMambaSource):
@@ -1873,7 +1885,11 @@ class EngineDrivenTransferContext(TransferContext):
                 if skip_blocks == state.blocks_in_chunk:
                     continue
                 block_ids = self._chunk_block_ids(
-                    source, group_block_ids, chunk, state.blocks_in_chunk
+                    source,
+                    group_block_ids,
+                    chunk,
+                    state.blocks_in_chunk,
+                    state.blocks_per_window,
                 )
                 if isinstance(source, PagedMambaSource):
                     group_plan = state.plan
@@ -1890,6 +1906,12 @@ class EngineDrivenTransferContext(TransferContext):
                         skip_blocks,
                     )
                 else:
+                    # The payload holds only the trailing window blocks, so the
+                    # blocks to skip are re-expressed inside the window.
+                    skip_blocks = max(
+                        0,
+                        skip_blocks - (state.blocks_in_chunk - state.blocks_per_window),
+                    )
                     codec.deserialize_fused_paged(
                         payload,
                         source.layer_ptrs,
