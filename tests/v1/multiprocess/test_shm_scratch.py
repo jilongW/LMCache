@@ -15,24 +15,31 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContextMetadata
 from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
 
-L1_SIZE = 4096
+POOL = 4096
 SCRATCH = 8192
-POOL = L1_SIZE + SCRATCH
 
 
 @pytest.fixture
-def segment():
-    name = f"lmcache_l1_pool_scratch_test_{os.getpid()}"
-    shm = shared_memory.SharedMemory(name=name, create=True, size=POOL)
-    shm.buf[:] = bytes(POOL)
+def segments():
+    """An L1 pool segment and a separate scratch segment, as the server makes."""
+    pool = shared_memory.SharedMemory(
+        name=f"lmcache_l1_pool_scratch_test_{os.getpid()}", create=True, size=POOL
+    )
+    scratch = shared_memory.SharedMemory(
+        name=f"lmcache_l1_scratch_test_{os.getpid()}", create=True, size=SCRATCH
+    )
+    pool.buf[:] = bytes(POOL)
+    scratch.buf[:] = bytes(SCRATCH)
     try:
-        yield shm
+        yield pool, scratch
     finally:
-        shm.close()
-        shm.unlink()
+        for segment in (pool, scratch):
+            segment.close()
+            segment.unlink()
 
 
-def _context(segment, *, offset=L1_SIZE, size=SCRATCH) -> EngineDrivenContextShm:
+def _context(segments, *, size=SCRATCH, named=True) -> EngineDrivenContextShm:
+    pool, scratch = segments
     metadata = EngineDrivenContextMetadata(
         layout_desc=MemoryLayoutDesc(
             shapes=[torch.Size([2, 1, 4, 8])], dtypes=[torch.float16]
@@ -44,15 +51,15 @@ def _context(segment, *, offset=L1_SIZE, size=SCRATCH) -> EngineDrivenContextShm
         metadata,
         MagicMock(),
         1.0,
-        segment.name,
+        pool.name,
         POOL,
-        scratch_offset=offset,
+        scratch_shm_name=scratch.name if named else "",
         scratch_size=size,
     )
 
 
-def test_scratch_views_alias_the_shared_tail(segment):
-    ctx = _context(segment)
+def test_scratch_views_alias_the_scratch_segment_only(segments):
+    ctx = _context(segments)
     try:
         assert ctx.has_scratch
         result = ctx.allocate_scratch_tensors(torch.Size([4, 8]), torch.float16, 2)
@@ -64,13 +71,12 @@ def test_scratch_views_alias_the_shared_tail(segment):
         tensors[0].fill_(1.0)
         tensors[1].fill_(2.0)
 
-        # The writes are visible through the shared segment itself, inside the
-        # scratch range and nowhere in the L1 pool.
-        seen = torch.frombuffer(segment.buf, dtype=torch.float16)
-        assert float(seen[: L1_SIZE // 2].abs().sum()) == 0.0
+        # The writes land in the scratch segment and never in the L1 pool.
+        pool, scratch = segments
+        assert float(torch.frombuffer(pool.buf, dtype=torch.float16).abs().sum()) == 0
+        seen = torch.frombuffer(scratch.buf, dtype=torch.float16)
         assert float(seen.sum()) == 32 * 1.0 + 32 * 2.0
-        assert L1_SIZE <= allocation.offset
-        assert allocation.offset + allocation.size <= POOL
+        assert allocation.offset + allocation.size <= SCRATCH
         # The two tensors do not overlap.
         assert tensors[0].data_ptr() != tensors[1].data_ptr()
         assert abs(tensors[1].data_ptr() - tensors[0].data_ptr()) >= 4 * 8 * 2
@@ -78,23 +84,23 @@ def test_scratch_views_alias_the_shared_tail(segment):
         ctx.close()
 
 
-def test_scratch_start_is_aligned_even_for_an_odd_partition(segment):
-    ctx = _context(segment, offset=L1_SIZE + 3, size=SCRATCH - 3)
+def test_scratch_allocations_are_aligned(segments):
+    ctx = _context(segments)
     try:
         tensors, allocation = ctx.allocate_scratch_tensors(
             torch.Size([5]), torch.float32, 1
         )
         assert allocation.offset % 64 == 0
         assert tensors[0].data_ptr() % 4 == 0
-        assert allocation.offset + allocation.size <= POOL
+        assert allocation.offset + allocation.size <= SCRATCH
     finally:
         ctx.close()
 
 
-def test_exhausted_scratch_returns_none_until_freed(segment):
-    ctx = _context(segment)
+def test_exhausted_scratch_returns_none_until_freed(segments):
+    ctx = _context(segments)
     try:
-        # One float16 element per 64-byte unit => the whole tail in one go.
+        # One float16 element per 2 bytes => the whole segment in one go.
         shape = torch.Size([SCRATCH // 2])
         first = ctx.allocate_scratch_tensors(shape, torch.float16, 1, wait=False)
         assert first is not None
@@ -107,8 +113,8 @@ def test_exhausted_scratch_returns_none_until_freed(segment):
         ctx.close()
 
 
-def test_freed_neighbours_merge_into_one_range(segment):
-    ctx = _context(segment)
+def test_freed_neighbours_merge_into_one_range(segments):
+    ctx = _context(segments)
     try:
         half = torch.Size([SCRATCH // 4])
         a = ctx.allocate_scratch_tensors(half, torch.float16, 1, wait=False)
@@ -125,8 +131,8 @@ def test_freed_neighbours_merge_into_one_range(segment):
         ctx.close()
 
 
-def test_without_a_partition_there_is_no_scratch(segment):
-    ctx = _context(segment, offset=0, size=0)
+def test_without_a_scratch_segment_there_is_no_scratch(segments):
+    ctx = _context(segments, size=0, named=False)
     try:
         assert not ctx.has_scratch
         assert (
@@ -137,6 +143,25 @@ def test_without_a_partition_there_is_no_scratch(segment):
         ctx.close()
 
 
-def test_a_partition_beyond_the_pool_is_rejected(segment):
-    with pytest.raises(ValueError, match="exceeds the SHM pool"):
-        _context(segment, offset=L1_SIZE, size=SCRATCH + 1)
+def test_a_missing_scratch_segment_degrades_to_no_scratch(segments):
+    pool, _ = segments
+    metadata = EngineDrivenContextMetadata(
+        layout_desc=MemoryLayoutDesc(
+            shapes=[torch.Size([2, 1, 4, 8])], dtypes=[torch.float16]
+        ),
+        block_size=4,
+        use_mla=False,
+    )
+    ctx = EngineDrivenContextShm(
+        metadata,
+        MagicMock(),
+        1.0,
+        pool.name,
+        POOL,
+        scratch_shm_name="lmcache_l1_scratch_does_not_exist",
+        scratch_size=SCRATCH,
+    )
+    try:
+        assert not ctx.has_scratch
+    finally:
+        ctx.close()

@@ -140,6 +140,32 @@ def _register(monkeypatch, *, response=None, ctx=None):
     return context, sent
 
 
+def test_register_asks_for_scratch_when_a_quantized_group_is_staged(
+    monkeypatch, quant_env
+):
+    _, sent = _register(monkeypatch)
+
+    assert sent[0].enable_l1_kvweave_quant is True
+    assert sent[0].needs_scratch is True
+
+
+def test_register_asks_for_no_scratch_when_every_group_is_paged(
+    monkeypatch, quant_env
+):
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.kvweave_route import StoreRoute
+
+    def _all_paged(self, state, master_on, codec, kv_caches):
+        state.store_route = StoreRoute.PAGED
+
+    monkeypatch.setattr(EngineDrivenTransferContext, "_plan_paged_routes", _all_paged)
+
+    _, sent = _register(monkeypatch)
+
+    assert sent[0].enable_l1_kvweave_quant is True
+    assert sent[0].needs_scratch is False
+
+
 def test_register_quantizes_a_plain_attention_group(monkeypatch, quant_env):
     context, sent = _register(monkeypatch)
 

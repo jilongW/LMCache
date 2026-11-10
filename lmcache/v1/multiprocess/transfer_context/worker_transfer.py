@@ -1151,6 +1151,12 @@ class EngineDrivenTransferContext(TransferContext):
                     enable_l1_kvweave_quant=any(
                         state.quantized for state in group_states
                     ),
+                    # Only a quantized group that cannot be quantized in place
+                    # gathers raw KV first; a worker without one needs none.
+                    needs_scratch=any(
+                        state.quantized and state.store_route is not StoreRoute.PAGED
+                        for state in group_states
+                    ),
                 )
             )
         )
@@ -1160,7 +1166,7 @@ class EngineDrivenTransferContext(TransferContext):
         shm_name = ""
         pool_size = 0
         null_block_id = 0
-        scratch_offset = 0
+        scratch_shm_name = ""
         scratch_size = 0
         if isinstance(response, RegisterEngineDrivenContextResponse):
             if response.error:
@@ -1171,7 +1177,7 @@ class EngineDrivenTransferContext(TransferContext):
             shm_name = response.shm_name
             pool_size = response.pool_size
             null_block_id = response.null_block_id
-            scratch_offset = response.scratch_offset
+            scratch_shm_name = response.scratch_shm_name
             scratch_size = response.scratch_size
         self._null_block_id = null_block_id
 
@@ -1188,7 +1194,7 @@ class EngineDrivenTransferContext(TransferContext):
             mq_timeout,
             shm_name=shm_name,
             pool_size=pool_size,
-            scratch_offset=scratch_offset,
+            scratch_shm_name=scratch_shm_name,
             scratch_size=scratch_size,
         )
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "inline"
@@ -2015,8 +2021,8 @@ class EngineDrivenTransferContext(TransferContext):
     ) -> None:
         """Give each quantized group somewhere to gather its raw KV.
 
-        Order of preference: this worker's SHM scratch partition (already
-        pinned together with the pool, bounded, no extra memory), then the
+        Order of preference: this worker's SHM scratch partition (its own segment,
+        pinned once, bounded), then the
         fallback allocator, then nothing -- gather then allocates fresh CPU
         tensors. A full or absent scratch is never an error.
         """

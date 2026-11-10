@@ -102,26 +102,22 @@ class EngineDrivenContextShm(EngineDrivenContext):
         mq_timeout: float,
         shm_name: str,
         pool_size: int,
-        scratch_offset: int = 0,
+        scratch_shm_name: str = "",
         scratch_size: int = 0,
     ) -> None:
         super().__init__(metadata, req_client, mq_timeout)
         if not shm_name or pool_size <= 0:
             raise ValueError("shm_name must be non-empty and pool_size must be > 0")
-        if scratch_offset < 0 or scratch_size < 0:
-            raise ValueError("scratch offset and size must be non-negative")
-        if scratch_size and scratch_offset + scratch_size > pool_size:
-            raise ValueError(
-                f"scratch range [{scratch_offset}, {scratch_offset + scratch_size}) "
-                f"exceeds the SHM pool ({pool_size} bytes)"
-            )
-        # This worker's slice of the non-L1 tail behind the L1 pool: the server
-        # hands each instance a disjoint partition and never touches the tail.
-        # Start it on a cache-line boundary so every typed view is aligned.
-        aligned_start = -(-scratch_offset // _SCRATCH_ALIGN) * _SCRATCH_ALIGN
-        usable = max(0, scratch_size - (aligned_start - scratch_offset))
-        self._scratch_allocator = ScratchAllocator(aligned_start, usable)
-        self._scratch_size = usable
+        if scratch_size < 0:
+            raise ValueError("scratch size must be non-negative")
+        # This worker's own scratch segment, created by the server only because
+        # the worker asked for one; mapped and pinned below.
+        self._scratch_shm_name = scratch_shm_name if scratch_size > 0 else ""
+        self._scratch_allocator = ScratchAllocator(0, scratch_size)
+        self._scratch_size = scratch_size
+        self._scratch_shm: shared_memory.SharedMemory | None = None
+        self._scratch_buffer: memoryview | None = None
+        self._scratch_pinned_ptr = 0
 
         self._shm_name = shm_name
         self._pool_size = pool_size
@@ -145,6 +141,8 @@ class EngineDrivenContextShm(EngineDrivenContext):
             # pin memory here is for worker side for fast DMA copy
             self._pin_shm_buffer()
             logger.info("SHM pinned=%s for shm_name=%s", self._pinned, self._shm_name)
+            if self._scratch_shm_name:
+                self._map_scratch_segment()
         except Exception:
             self._shm = None
             self._shm_buffer = None
@@ -156,8 +154,13 @@ class EngineDrivenContextShm(EngineDrivenContext):
         length: int,
         shape: list[int],
         dtype_str: str,
+        buffer: memoryview | None = None,
     ) -> torch.Tensor:
-        """Create a tensor view over a SHM slot via ``torch.frombuffer``."""
+        """Create a tensor view over a SHM slot via ``torch.frombuffer``.
+
+        ``buffer`` selects another mapped segment (the scratch); by default the
+        view is over the L1 pool.
+        """
         dtype = getattr(torch, dtype_str, None)
         if dtype is None or not isinstance(dtype, torch.dtype):
             raise ValueError(f"Invalid torch dtype string: {dtype_str}")
@@ -165,13 +168,12 @@ class EngineDrivenContextShm(EngineDrivenContext):
         if itemsize <= 0:
             raise ValueError(f"Invalid dtype size for {dtype_str}")
         count = length // itemsize
-        if self._shm_buffer is None:
+        target = self._shm_buffer if buffer is None else buffer
+        if target is None:
             raise RuntimeError(
                 f"Shared memory buffer not initialized for shm_name={self._shm_name}"
             )
-        tensor_1d = torch.frombuffer(
-            self._shm_buffer, dtype=dtype, count=count, offset=offset
-        )
+        tensor_1d = torch.frombuffer(target, dtype=dtype, count=count, offset=offset)
         return tensor_1d.view(torch.Size(shape))
 
     def _build_slot_tensors(self, slots: list[dict[str, Any]]) -> list[torch.Tensor]:
@@ -185,6 +187,45 @@ class EngineDrivenContextShm(EngineDrivenContext):
             )
             for descriptor in descriptors
         ]
+
+    def _map_scratch_segment(self) -> None:
+        """Map and pin this worker's scratch segment.
+
+        A failure drops scratch only: the worker then gathers into the fallback
+        buffers, which is slower but correct.
+        """
+        try:
+            segment = shared_memory.SharedMemory(
+                name=self._scratch_shm_name.lstrip("/"), create=False
+            )
+            # The server owns the segment; keep this process's resource tracker
+            # from unlinking it when the worker exits.
+            unregister(f"/{segment.name}", "shared_memory")
+        except Exception as exc:  # noqa: BLE001 - scratch is optional
+            logger.warning(
+                "Could not map scratch segment %s: %r; running without scratch",
+                self._scratch_shm_name,
+                exc,
+            )
+            self._scratch_size = 0
+            return
+        self._scratch_shm = segment
+        self._scratch_buffer = segment.buf
+        try:
+            ptr = ctypes.addressof(ctypes.c_char.from_buffer(segment.buf))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to pin scratch %s: %r", segment.name, exc)
+            return
+        if torch_dev.is_available() and current_device_spec.pin_memory(
+            ptr, self._scratch_size
+        ):
+            self._scratch_pinned_ptr = ptr
+        else:
+            logger.warning(
+                "pin_memory failed for scratch %s; device copies into it will be "
+                "synchronous",
+                segment.name,
+            )
 
     @property
     def has_scratch(self) -> bool:
@@ -203,9 +244,9 @@ class EngineDrivenContextShm(EngineDrivenContext):
     ) -> tuple[list[torch.Tensor], ScratchAllocation] | None:
         """Allocate ``count`` same-shaped tensors from this worker's scratch.
 
-        The views alias the shared SHM tail, which this worker already pinned
-        together with the rest of the pool, so device copies into them are
-        asynchronous without any extra pinned allocation.
+        The views alias this worker's scratch segment, which it pinned once at
+        registration, so device copies into them are asynchronous without any
+        extra pinned allocation.
 
         Args:
             shape: Shape of each tensor.
@@ -239,6 +280,7 @@ class EngineDrivenContextShm(EngineDrivenContext):
                 length=int(shape.numel()) * itemsize,
                 shape=list(shape),
                 dtype_str=dtype_name,
+                buffer=self._scratch_buffer,
             )
             for index in range(count)
         ]
@@ -418,12 +460,22 @@ class EngineDrivenContextShm(EngineDrivenContext):
     def _release_shm(self) -> None:
         """Unpin and unmap the pool. Call only once no transfer is in flight."""
         self._unpin_shm_buffer()
+        if self._scratch_pinned_ptr:
+            current_device_spec.unpin_memory(self._scratch_pinned_ptr)
+            self._scratch_pinned_ptr = 0
         try:
-            if self._shm is not None:
-                self._shm.close()
+            if self._scratch_shm is not None:
+                self._scratch_buffer = None
+                self._scratch_shm.close()
         finally:
-            self._shm = None
-            self._shm_buffer = None
+            self._scratch_shm = None
+            self._scratch_buffer = None
+            try:
+                if self._shm is not None:
+                    self._shm.close()
+            finally:
+                self._shm = None
+                self._shm_buffer = None
 
     def _pin_shm_buffer(self) -> None:
         """Pin the SHM buffer as page-locked host memory via cudaHostRegister.

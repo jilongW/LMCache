@@ -340,6 +340,9 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
             sole authority on whether this is permitted (every L1 must
             support variable-size chunks) and rejects the registration via
             ``RegisterEngineDrivenContextResponse.error`` when it is not.
+        needs_scratch: Whether the worker has a quantized group that cannot be
+            quantized in place and so gathers raw KV into scratch first. The
+            server creates a scratch SHM segment only for a worker that asks.
     """
 
     instance_id: int
@@ -353,6 +356,7 @@ class RegisterEngineDrivenContextPayload(msgspec.Struct):
     num_physical_slots: int | None = None
     group_layouts: list[GroupLayout] = []
     enable_l1_kvweave_quant: bool = False
+    needs_scratch: bool = False
 
 
 @dataclass
@@ -364,9 +368,9 @@ class RegisterEngineDrivenContextResponse:
         pool_size: Size of that pool in bytes.
         null_block_id: Engine block ID the server treats as absent KV data.
             Workers skip storing chunks whose blocks are all this ID.
-        scratch_offset: Byte offset in the SHM pool of this worker's scratch
-            slot (the non-L1 tail behind the L1 pool), or ``0`` without one.
-        scratch_size: Size in bytes of that scratch slot; ``0`` means none.
+        scratch_shm_name: Name of this worker's own scratch SHM segment, or
+            ``""`` when it asked for none or none could be created.
+        scratch_size: Size in bytes of that segment; ``0`` means none.
         error: Human-readable rejection reason when the server declines the
             registration (e.g. quantization requested on a fixed-size L1).
             ``None`` on success. Callers must check it before trusting
@@ -376,7 +380,7 @@ class RegisterEngineDrivenContextResponse:
     shm_name: str = ""
     pool_size: int = 0
     null_block_id: int = 0
-    scratch_offset: int = 0
+    scratch_shm_name: str = ""
     scratch_size: int = 0
     error: str | None = None
 

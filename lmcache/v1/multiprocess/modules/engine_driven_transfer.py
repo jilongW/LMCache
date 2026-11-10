@@ -3,6 +3,7 @@
 
 # Standard
 from dataclasses import dataclass
+from multiprocessing import shared_memory
 from typing import Any
 import os
 import threading
@@ -116,9 +117,9 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         ] = {}
         self._pending_shm_lock = threading.Lock()
         self._shm_pool_info: ShmPoolInfo = self._ctx.shm_pool_info
-        # (offset, size) of each registered instance's slot in the SHM scratch
-        # tail. Guarded by ``_lock``.
-        self._scratch_slots: dict[int, tuple[int, int]] = {}
+        # Per-instance scratch SHM segments, created only for workers that ask
+        # for one at registration. Guarded by ``_lock``.
+        self._scratch_segments: dict[int, shared_memory.SharedMemory] = {}
         # Values retain the START event and monotonic preparation time.
         # Includes request_id because IPCCacheServerKey equality excludes it.
         self._pending_transfers: dict[
@@ -169,6 +170,8 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         with self._lock:
             self._engine_driven_contexts.clear()
             self._strategies.clear()
+            for iid in list(self._scratch_segments):
+                self._drop_scratch_locked(iid)
             pending = list(self._pending_transfers.values())
             self._pending_transfers.clear()
         for event, _ in pending:
@@ -225,7 +228,7 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             for iid in stale_ids:
                 entry = self._engine_driven_contexts.pop(iid)
                 self._strategies.pop(iid, None)
-                self._scratch_slots.pop(iid, None)
+                self._drop_scratch_locked(iid)
                 reaped.append((iid, entry))
         for iid, entry in reaped:
             self._release_entry(iid, entry)
@@ -299,30 +302,54 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
 
         self._ctx.layout_desc_registry.unregister(entry.model_name, entry.world_size)
 
-    def _allocate_scratch_slot(
-        self, instance_id: int, default_max_instances: int
-    ) -> tuple[int, int]:
-        """Assign one non-overlapping scratch partition to an instance.
+    def _drop_scratch_locked(self, instance_id: int) -> None:
+        """Close and unlink an instance's scratch segment, if it has one.
 
-        The scratch tail is split into equal partitions, one per expected
-        instance (the registered ``world_size`` unless
+        Must be called with ``_lock`` held. A worker that still maps the segment
+        keeps its mapping alive until it unmaps; only the name goes away.
+        """
+        segment = self._scratch_segments.pop(instance_id, None)
+        if segment is None:
+            return
+        try:
+            segment.close()
+            segment.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - never block unregister on cleanup
+            logger.warning(
+                "Failed to release scratch segment %s of instance %d: %r",
+                segment.name,
+                instance_id,
+                exc,
+            )
+
+    def _create_scratch_segment(
+        self, instance_id: int, default_max_instances: int, needed: bool
+    ) -> tuple[str, int]:
+        """Create a scratch SHM segment for one instance that asked for it.
+
+        Only a worker that has a quantized group which cannot be quantized in
+        place needs scratch (the raw KV it gathers first); a worker whose
+        groups are all in-place gets none, so nothing is reserved or pinned for
+        it. The configured scratch budget is split evenly between the expected
+        instances (the registered ``world_size`` unless
         ``LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_MAX_INSTANCES`` says otherwise).
         Must be called with ``_lock`` held.
 
         Args:
             instance_id: The registering worker instance.
-            default_max_instances: Partition count when the environment does
+            default_max_instances: Instance count when the environment does
                 not set one.
+            needed: Whether the worker asked for scratch.
 
         Returns:
-            ``(offset, size)`` of the partition in the SHM pool, or ``(0, 0)``
-            when there is no scratch tail or no free partition; the worker then
-            runs without scratch.
+            ``(segment name, size)``, or ``("", 0)`` when the worker did not ask,
+            there is no budget or room; the worker then runs without scratch.
         """
-        scratch_total = self._shm_pool_info.get("scratch_size", 0)
-        if not scratch_total:
-            return 0, 0
-        scratch_start = self._shm_pool_info.get("scratch_offset", 0)
+        budget = self._shm_pool_info.get("scratch_budget", 0)
+        if not needed or not budget:
+            return "", 0
         default_max_instances = max(1, default_max_instances)
         raw_max_instances = os.environ.get(
             "LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_MAX_INSTANCES"
@@ -342,20 +369,33 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 default_max_instances,
             )
             max_instances = default_max_instances
-        slot_size = scratch_total // max_instances
+        slot_size = budget // max_instances
         if slot_size <= 0:
-            return 0, 0
-        used = set(self._scratch_slots.values())
-        for slot_index in range(max_instances):
-            slot = (scratch_start + slot_index * slot_size, slot_size)
-            if slot not in used:
-                self._scratch_slots[instance_id] = slot
-                return slot
-        logger.warning(
-            "No engine-driven scratch partition available for instance %d",
-            instance_id,
-        )
-        return 0, 0
+            return "", 0
+        existing = self._scratch_segments.get(instance_id)
+        if existing is not None:
+            return existing.name, existing.size
+        if len(self._scratch_segments) >= max_instances:
+            logger.warning(
+                "No engine-driven scratch segment available for instance %d",
+                instance_id,
+            )
+            return "", 0
+        name = f"lmcache_l1_scratch_{os.getpid()}_{instance_id}"
+        try:
+            segment = shared_memory.SharedMemory(name=name, create=True, size=slot_size)
+        except (OSError, FileExistsError) as exc:
+            logger.warning(
+                "Could not create scratch segment %s (%d bytes): %r; instance %d "
+                "runs without scratch",
+                name,
+                slot_size,
+                exc,
+                instance_id,
+            )
+            return "", 0
+        self._scratch_segments[instance_id] = segment
+        return segment.name, segment.size
 
     @staticmethod
     def _make_transfer_key(
@@ -420,13 +460,13 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     "Instance %d already registered (non-GPU); refreshing liveness",
                     payload.instance_id,
                 )
-                scratch_slot = self._scratch_slots.get(payload.instance_id, (0, 0))
+                segment = self._scratch_segments.get(payload.instance_id)
                 return RegisterEngineDrivenContextResponse(
                     shm_name=shm_name,
                     pool_size=pool_size,
                     null_block_id=self._ctx.null_block_id,
-                    scratch_offset=scratch_slot[0],
-                    scratch_size=scratch_slot[1],
+                    scratch_shm_name=segment.name if segment else "",
+                    scratch_size=segment.size if segment else 0,
                 )
 
         dtype = getattr(torch, payload.dtype_str, None)
@@ -549,8 +589,8 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             except ValueError as exc:
                 return RegisterEngineDrivenContextResponse(error=str(exc))
         with self._lock:
-            scratch_offset, scratch_size = self._allocate_scratch_slot(
-                payload.instance_id, payload.world_size
+            scratch_shm_name, scratch_size = self._create_scratch_segment(
+                payload.instance_id, payload.world_size, payload.needs_scratch
             )
             self._engine_driven_contexts[payload.instance_id] = entry
             self._strategies[payload.instance_id] = strategy
@@ -600,7 +640,7 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             shm_name=shm_name,
             pool_size=pool_size,
             null_block_id=self._ctx.null_block_id,
-            scratch_offset=scratch_offset,
+            scratch_shm_name=scratch_shm_name,
             scratch_size=scratch_size,
         )
 
@@ -615,7 +655,7 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             entry = self._engine_driven_contexts.pop(instance_id, None)
             if entry is not None:
                 self._strategies.pop(instance_id, None)
-                self._scratch_slots.pop(instance_id, None)
+                self._drop_scratch_locked(instance_id)
         if entry is None:
             logger.warning(
                 "No registered non-GPU context found for instance ID %d",

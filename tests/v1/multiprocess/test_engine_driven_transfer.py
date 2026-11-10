@@ -2824,6 +2824,7 @@ def _kvweave_payload(
     instance_id: int = 1,
     world_size: int = 1,
     enable_quant: bool = False,
+    needs_scratch: bool = False,
     overrides: "list[Any] | None" = None,
 ) -> Any:
     """Build a two-group registration payload, optionally with layout overrides."""
@@ -2854,6 +2855,7 @@ def _kvweave_payload(
             for override in overrides
         ],
         enable_l1_kvweave_quant=enable_quant,
+        needs_scratch=needs_scratch,
     )
 
 
@@ -2951,7 +2953,7 @@ def test_register_quant_is_accepted_without_an_shm_pool(
     )
 
     assert response.error is None
-    assert (response.scratch_offset, response.scratch_size) == (0, 0)
+    assert (response.scratch_shm_name, response.scratch_size) == ("", 0)
     mock_storage.mark_l1_kvweave_quant_enabled.assert_called_once_with()
     assert 1 in module._engine_driven_contexts
 
@@ -2974,76 +2976,126 @@ def test_register_quant_rejected_when_lossy_l2_already_configured(
     assert response.error is not None
     assert "lossy serde" in response.error
     assert 1 not in module._engine_driven_contexts
-    assert module._scratch_slots == {}
+    assert module._scratch_segments == {}
 
 
 _SCRATCH_POOL = {
     "shm_name": "lmcache_l1_pool_t",
     "pool_size": 1000,
-    "scratch_offset": 600,
-    "scratch_size": 400,
+    "scratch_budget": 8192,
 }
 
 
-def test_register_without_scratch_tail_reports_none(
+def _scratch_payload(**kwargs: Any) -> Any:
+    return _kvweave_payload(needs_scratch=True, **kwargs)
+
+
+@pytest.fixture
+def scratch_cleanup():
+    """Unlink whatever scratch segments a test created."""
+    created: list[Any] = []
+    yield created
+    for module in created:
+        module.close()
+
+
+def test_register_without_scratch_budget_reports_none(
     stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
     module, _, _, _ = server_module_factory(chunk_size=16)
 
-    response = module.register_kv_cache_engine_driven_context(_kvweave_payload())
+    response = module.register_kv_cache_engine_driven_context(
+        _scratch_payload()
+    )
 
-    assert (response.scratch_offset, response.scratch_size) == (0, 0)
+    assert (response.scratch_shm_name, response.scratch_size) == ("", 0)
 
 
-def test_register_assigns_disjoint_scratch_slots_and_recycles_them(
+def test_register_creates_no_scratch_for_a_worker_that_does_not_ask(
     stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
     module, _, _, _ = server_module_factory(chunk_size=16)
     module._shm_pool_info = dict(_SCRATCH_POOL)  # type: ignore[assignment]
 
-    # world_size=2 splits the 400-byte tail into two 200-byte partitions.
+    response = module.register_kv_cache_engine_driven_context(_kvweave_payload())
+
+    assert (response.scratch_shm_name, response.scratch_size) == ("", 0)
+    assert module._scratch_segments == {}
+
+
+def test_register_gives_each_asking_worker_its_own_scratch_segment(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+    scratch_cleanup: list[Any],
+) -> None:
+    module, _, _, _ = server_module_factory(chunk_size=16)
+    scratch_cleanup.append(module)
+    module._shm_pool_info = dict(_SCRATCH_POOL)  # type: ignore[assignment]
+
+    # world_size=2 splits the 8192-byte budget into two 4096-byte segments.
     first = module.register_kv_cache_engine_driven_context(
-        _kvweave_payload(instance_id=1, world_size=2)
+        _scratch_payload(instance_id=1, world_size=2)
     )
     second = module.register_kv_cache_engine_driven_context(
-        _kvweave_payload(instance_id=2, world_size=2)
+        _scratch_payload(instance_id=2, world_size=2)
     )
-    assert (first.scratch_offset, first.scratch_size) == (600, 200)
-    assert (second.scratch_offset, second.scratch_size) == (800, 200)
+    assert first.scratch_size == second.scratch_size == 4096
+    assert first.scratch_shm_name and second.scratch_shm_name
+    assert first.scratch_shm_name != second.scratch_shm_name
 
-    # Re-registering returns the same slot instead of consuming another.
+    # Re-registering returns the same segment instead of creating another.
     again = module.register_kv_cache_engine_driven_context(
-        _kvweave_payload(instance_id=1, world_size=2)
+        _scratch_payload(instance_id=1, world_size=2)
     )
-    assert (again.scratch_offset, again.scratch_size) == (600, 200)
+    assert again.scratch_shm_name == first.scratch_shm_name
 
-    # Both partitions are taken, so a third instance runs without scratch.
+    # Both are taken, so a third instance runs without scratch.
     third = module.register_kv_cache_engine_driven_context(
-        _kvweave_payload(instance_id=3, world_size=2)
+        _scratch_payload(instance_id=3, world_size=2)
     )
-    assert (third.scratch_offset, third.scratch_size) == (0, 0)
+    assert (third.scratch_shm_name, third.scratch_size) == ("", 0)
 
-    # Unregistering frees the partition for the next registration.
+    # Unregistering releases the segment (its name goes away) and frees the slot.
     module.unregister_kv_cache(1)
+    assert not os.path.exists(f"/dev/shm/{first.scratch_shm_name}")
     fourth = module.register_kv_cache_engine_driven_context(
-        _kvweave_payload(instance_id=4, world_size=2)
+        _scratch_payload(instance_id=4, world_size=2)
     )
-    assert (fourth.scratch_offset, fourth.scratch_size) == (600, 200)
+    assert fourth.scratch_size == 4096
+    assert os.path.exists(f"/dev/shm/{fourth.scratch_shm_name}")
+
+
+def test_scratch_segments_are_released_on_close(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    module, _, _, _ = server_module_factory(chunk_size=16)
+    module._shm_pool_info = dict(_SCRATCH_POOL)  # type: ignore[assignment]
+    response = module.register_kv_cache_engine_driven_context(
+        _scratch_payload(instance_id=1, world_size=1)
+    )
+    assert os.path.exists(f"/dev/shm/{response.scratch_shm_name}")
+
+    module.close()
+
+    assert not os.path.exists(f"/dev/shm/{response.scratch_shm_name}")
 
 
 def test_scratch_max_instances_env_overrides_world_size(
     stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
     monkeypatch: pytest.MonkeyPatch,
+    scratch_cleanup: list[Any],
 ) -> None:
     module, _, _, _ = server_module_factory(chunk_size=16)
+    scratch_cleanup.append(module)
     module._shm_pool_info = dict(_SCRATCH_POOL)  # type: ignore[assignment]
     monkeypatch.setenv("LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_MAX_INSTANCES", "4")
 
     response = module.register_kv_cache_engine_driven_context(
-        _kvweave_payload(world_size=1)
+        _scratch_payload(world_size=1)
     )
 
-    assert (response.scratch_offset, response.scratch_size) == (600, 100)
+    assert response.scratch_size == 2048

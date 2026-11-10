@@ -96,17 +96,17 @@ def test_pool_info_keeps_upstream_shape_without_scratch(monkeypatch):
     assert info == {"shm_name": "lmcache_l1_pool_t", "pool_size": 5 * GIB}
 
 
-def test_pool_info_reports_scratch_tail(monkeypatch):
+def test_pool_info_reports_the_scratch_budget(monkeypatch):
     _shm_free(monkeypatch, 100 * GIB)
     monkeypatch.setenv("LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_GB", "2")
     info = MPCacheServerContext._compute_shm_pool_info(
         _storage_config(shm_name="lmcache_l1_pool_t")
     )
+    # The pool is just L1; scratch is only a budget, not memory set aside.
     assert info == {
         "shm_name": "lmcache_l1_pool_t",
-        "pool_size": 7 * GIB,
-        "scratch_offset": 5 * GIB,
-        "scratch_size": 2 * GIB,
+        "pool_size": 5 * GIB,
+        "scratch_budget": 2 * GIB,
     }
 
 

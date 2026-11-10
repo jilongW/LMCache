@@ -289,7 +289,7 @@ def create_engine_driven_context(
     mq_timeout: float,
     shm_name: str,
     pool_size: int,
-    scratch_offset: int = 0,
+    scratch_shm_name: str = "",
     scratch_size: int = 0,
 ) -> EngineDrivenContext:
     """Factory that returns the appropriate :class:`EngineDrivenContext` implementation.
@@ -306,9 +306,10 @@ def create_engine_driven_context(
         shm_name: Shared-memory segment name. Empty values force inline mode.
         pool_size: Shared-memory pool size in bytes. Non-positive values force
             inline mode.
-        scratch_offset: Byte offset in the pool of this worker's scratch
-            partition (SHM only; the server assigns it at registration).
-        scratch_size: Size of that partition in bytes; ``0`` means none.
+        scratch_shm_name: Name of this worker's own scratch segment (SHM only;
+            the server creates it at registration when the worker asks), or
+            ``""`` for none.
+        scratch_size: Size of that segment in bytes; ``0`` means none.
     Returns:
         A concrete :class:`EngineDrivenContext` instance.
     """
@@ -328,7 +329,7 @@ def create_engine_driven_context(
                 mq_timeout,
                 shm_name,
                 pool_size,
-                scratch_offset=scratch_offset,
+                scratch_shm_name=scratch_shm_name,
                 scratch_size=scratch_size,
             )
         except Exception:

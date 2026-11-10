@@ -88,7 +88,6 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
                 align_bytes=config.align_bytes,
                 shm_name=shm_name,
                 use_hugepages=config.use_hugepages,
-                backing_size=config.shm_pool_size_in_bytes,
             )
         return MixedMemoryAllocator(
             config.size_in_bytes,

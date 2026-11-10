@@ -32,10 +32,11 @@ class ShmPoolInfo(TypedDict):
 
     shm_name: str
     pool_size: int
-    # Present only when a non-L1 scratch tail is reserved behind the L1 pool
-    # (KVWeave quantized engine-driven store); absent keeps the plain shape.
-    scratch_offset: NotRequired[int]
-    scratch_size: NotRequired[int]
+    # Total scratch budget in bytes, split between the instances that ask for
+    # scratch (KVWeave quantized engine-driven store). Nothing is reserved up
+    # front: each such worker gets its own SHM segment at registration. Absent
+    # keeps the plain shape.
+    scratch_budget: NotRequired[int]
 
 
 _SCRATCH_GB_ENV = "LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_GB"
@@ -44,14 +45,15 @@ _DEFAULT_SCRATCH_GB = "5"
 
 
 def _engine_driven_scratch_size_bytes(l1_size: int, shm_name: str) -> int:
-    """Return the scratch size to reserve behind an engine-driven SHM pool.
+    """Return the total scratch budget for engine-driven quantized stores.
 
-    The scratch tail holds the raw KV a worker gathers before quantizing it into
-    an L1 object. It is only useful when KVWeave quantization is on, so the
-    default follows the KVWeave master switch (5 GiB when on, none when off) and
-    a deployment that does not use KVWeave keeps exactly the upstream pool.
-    ``LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_GB`` overrides either way. The size is
-    capped by what ``/dev/shm`` has left after the L1 pool.
+    Scratch holds the raw KV a worker gathers before quantizing it into an L1
+    object. It is only useful when KVWeave quantization is on, so the default
+    follows the KVWeave master switch (5 GiB when on, none when off).
+    ``LMCACHE_MP_ENGINE_DRIVEN_SCRATCH_GB`` overrides either way. Nothing is
+    allocated from it up front: a worker whose groups are all quantized in place
+    never asks for scratch and costs no memory. The budget is capped by what
+    ``/dev/shm`` has left after the L1 pool.
 
     Args:
         l1_size: Configured L1 pool size in bytes.
@@ -299,11 +301,6 @@ class MPCacheServerContext:
         self.shm_pool_info: ShmPoolInfo = self._compute_shm_pool_info(
             storage_manager_config
         )
-        if self.shm_pool_info.get("scratch_size", 0):
-            # Back the SHM segment with the scratch tail; L1 itself still only
-            # gets ``size_in_bytes`` of it.
-            memory_config = storage_manager_config.l1_manager_config.memory_config
-            memory_config.shm_pool_size_in_bytes = self.shm_pool_info["pool_size"]
         self._storage_manager = StorageManager(storage_manager_config)
         self._token_hasher = TokenHasher(
             chunk_size=chunk_size, hash_algorithm=hash_algorithm
@@ -531,9 +528,8 @@ class MPCacheServerContext:
             return {"shm_name": shm_name, "pool_size": mem_cfg.size_in_bytes}
         return {
             "shm_name": shm_name,
-            "pool_size": mem_cfg.size_in_bytes + scratch_size,
-            "scratch_offset": mem_cfg.size_in_bytes,
-            "scratch_size": scratch_size,
+            "pool_size": mem_cfg.size_in_bytes,
+            "scratch_budget": scratch_size,
         }
 
     def _bind_chunk_size_locked(self, chunk_size: int) -> None:
