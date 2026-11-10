@@ -12,6 +12,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.multiprocess.custom_types import (
     RegisterEngineDrivenContextPayload,
     RegisterEngineDrivenContextResponse,
@@ -22,6 +23,7 @@ from lmcache.v1.multiprocess.transfer_context import (
     EngineDrivenTransferContext,
     worker_transfer,
 )
+from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContextMetadata
 from lmcache.v1.multiprocess.transfer_context.inline import EngineDrivenContextInline
 
 NUM_LAYERS = 4
@@ -175,15 +177,19 @@ def test_register_raises_when_the_server_rejects_quantization(monkeypatch, quant
         _register(monkeypatch, response=rejection)
 
 
-def test_register_refuses_the_inline_fallback_for_quantized_groups(
+def test_register_accepts_inline_transport_for_quantized_groups(
     monkeypatch, quant_env
 ):
+    """Inline transport carries the quantized payload too (in slots of the
+    registered quantized size), so registering over it is fine."""
     inline = MagicMock(spec=EngineDrivenContextInline)
 
-    with pytest.raises(RuntimeError, match="needs the SHM transport"):
-        _register(monkeypatch, ctx=inline)
+    context, sent = _register(monkeypatch, ctx=inline)
 
-    inline.close.assert_called_once_with()
+    assert sent[0].enable_l1_kvweave_quant is True
+    (state,) = context._group_states
+    assert state.quantized
+    inline.close.assert_not_called()
 
 
 def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -885,3 +891,196 @@ def test_mamba_group_stays_staged_when_in_place_is_not_possible(
     assert state.store_route is StoreRoute.STAGED
     assert state.retrieve_route is RetrieveRoute.SCATTER
     assert state.paged_source is None
+
+
+# ---------------------------------------------------------------------------
+# Inline transport: the chunks travel over the wire instead of through SHM, but
+# the server still validates them against the group's registered layout, so a
+# quantized group must send slots of exactly the quantized layout.
+# ---------------------------------------------------------------------------
+
+
+class _FakeInlineContext(EngineDrivenContextInline):
+    """In-memory inline context: remembers what was committed and serves it back."""
+
+    def __init__(self):
+        super().__init__(
+            EngineDrivenContextMetadata(
+                layout_desc=MemoryLayoutDesc(
+                    shapes=[torch.Size([1])], dtypes=[torch.uint8]
+                ),
+                block_size=BLOCK_SIZE,
+                use_mla=False,
+            ),
+            MagicMock(),
+            1.0,
+        )
+        self.committed: list[tuple[list[int], list[torch.Tensor]]] = []
+        self.expected: list[tuple[torch.Size, torch.dtype, int]] = []
+
+    def prepare_store(self, key, instance_id):
+        return None
+
+    def commit_store(self, key, instance_id, chunks):
+        # What the server's inline strategy does first: every tensor must match
+        # the group's registered layout exactly.
+        self.committed = [(list(idx), [t.clone() for t in ts]) for idx, ts in chunks]
+        return True
+
+    def prepare_retrieve_multigroup(self, key, instance_id, expected):
+        self.expected = list(expected)
+        return [(list(idx), [t.clone() for t in ts]) for idx, ts in self.committed]
+
+    def commit_retrieve(self, key, instance_id):
+        return True
+
+    def close(self):
+        pass
+
+
+def _inline_setup(monkeypatch):
+    context, _ = _register(monkeypatch)
+    (state,) = context._group_states
+    fake = _FakeInlineContext()
+    context._engine_driven_context = fake
+    block_ids = [list(range(1, 1 + NUM_CHUNKS * BLOCKS_IN_CHUNK))]
+    return context, state, fake, block_ids
+
+
+def test_inline_store_sends_slots_of_exactly_the_quantized_layout(
+    monkeypatch, quant_env
+):
+    context, state, fake, block_ids = _inline_setup(monkeypatch)
+    layout = state.transfer_layout_desc
+    assert layout.dtypes == [torch.uint8]
+
+    assert context.submit_store(
+        "r", MagicMock(), _kv_caches(), block_ids, None, BLOCKS_IN_CHUNK
+    ).result()
+
+    ((indices, chunks),) = fake.committed
+    assert indices == list(range(NUM_CHUNKS))
+    for chunk in chunks:
+        # The server rejects anything that is not the registered layout.
+        assert chunk.shape == layout.shapes[0]
+        assert chunk.dtype == layout.dtypes[0]
+        assert chunk.abs().sum() > 0
+    # The raw layout is a different, much larger tensor.
+    assert layout.shapes[0].numel() < state.layout_desc.shapes[0].numel() * 2
+
+
+def test_inline_store_then_retrieve_round_trips(monkeypatch, quant_env):
+    context, state, fake, block_ids = _inline_setup(monkeypatch)
+    kv_caches = _kv_caches()
+    original = {n: t.clone() for n, t in kv_caches.items()}
+    context.submit_store(
+        "r", MagicMock(), kv_caches, block_ids, None, BLOCKS_IN_CHUNK
+    ).result()
+
+    used = torch.tensor(block_ids[0])
+    for tensor in kv_caches.values():
+        tensor[:, used] = 0
+    assert context.submit_retrieve(
+        "r", MagicMock(), kv_caches, block_ids, None, BLOCKS_IN_CHUNK
+    ).result()
+
+    # The retrieve asks for the quantized layout, not the raw one.
+    layout = state.transfer_layout_desc
+    assert fake.expected == [(layout.shapes[0], layout.dtypes[0], NUM_CHUNKS)]
+    for name, tensor in kv_caches.items():
+        assert _cosine(tensor[:, used], original[name][:, used]) > 0.95
+    used_set = set(block_ids[0])
+    untouched = torch.tensor([b for b in range(NUM_BLOCKS) if b not in used_set])
+    for name, tensor in kv_caches.items():
+        assert torch.equal(tensor[:, untouched], original[name][:, untouched])
+
+
+def test_inline_store_does_not_recycle_encoded_slots_into_the_staging_pool(
+    monkeypatch, quant_env
+):
+    """Only raw gather targets belong in the reusable pinned pool; the encoded
+    slots are sent once and dropped."""
+    # First Party
+    from lmcache.v1.multiprocess.transfer_context.async_engine_driven import (
+        AsyncEngineDrivenTransferContext,
+    )
+
+    context = AsyncEngineDrivenTransferContext(1, MagicMock())
+    try:
+        # Reuse the registration helper's wiring on the async class.
+        monkeypatch.setattr(
+            worker_transfer, "create_engine_driven_context", lambda *_a, **_k: MagicMock()
+        )
+        future = MagicMock()
+        future.result.return_value = RegisterEngineDrivenContextResponse(
+            shm_name="lmcache_l1_pool_t", pool_size=1 << 20
+        )
+        context._req_client.register_kv_cache_engine_driven_context.return_value = future
+        context.register(
+            kv_caches=_kv_caches(),
+            model_name="m",
+            world_size=1,
+            blocks_in_chunk=BLOCKS_IN_CHUNK,
+            mq_timeout=1.0,
+            engine_group_infos=[_group_info()],
+            layout_hints={"kv_layout": "NHD"},
+        )
+        fake = _FakeInlineContext()
+        context._engine_driven_context = fake
+        block_ids = [list(range(1, 1 + NUM_CHUNKS * BLOCKS_IN_CHUNK))]
+        event = MagicMock()
+
+        ok = context.submit_store(
+            "r", MagicMock(), _kv_caches(), block_ids, event, BLOCKS_IN_CHUNK
+        ).result(timeout=30)
+        pooled = {
+            key: len(tensors) for key, tensors in context._staging_pool.items()
+        }
+    finally:
+        context.close()
+
+    assert ok
+    (state,) = context._group_states
+    quant_key = (
+        tuple(state.transfer_layout_desc.shapes[0]),
+        state.transfer_layout_desc.dtypes[0],
+    )
+    assert quant_key not in pooled
+
+
+class _MarkingPagedCodec(_RecordingPagedCodec):
+    """Writes a recognisable payload where the real kernel would."""
+
+    def serialize_fused_paged(
+        self, layer_ptrs, block_ids, block_size, stride, num_blocks, dtype, hidden, out
+    ):
+        super().serialize_fused_paged(
+            layer_ptrs, block_ids, block_size, stride, num_blocks, dtype, hidden, out
+        )
+        out[:16] = 7
+        return 16
+
+
+def test_inline_paged_store_commits_the_slot_the_kernel_wrote(monkeypatch, quant_env):
+    context, _, block_ids, kv_caches, _ = _paged_setup(monkeypatch)
+    codec = _MarkingPagedCodec()
+    context._kvweave_codec = codec
+    inline = _FakeInlineContext()
+    context._engine_driven_context = inline
+    outs = _spy_gather(monkeypatch)
+    (state,) = context._group_states
+
+    assert context.submit_store(
+        "r", MagicMock(), kv_caches, block_ids, None, BLOCKS_IN_CHUNK
+    ).result()
+
+    # In-place encode: nothing was gathered.
+    assert outs == []
+    ((indices, chunks),) = inline.committed
+    assert indices == list(range(NUM_CHUNKS))
+    layout = state.transfer_layout_desc
+    for chunk in chunks:
+        assert chunk.shape == layout.shapes[0] and chunk.dtype == torch.uint8
+        assert bool((chunk[:16] == 7).all())
+        # Everything after the payload is the zero padding the codec ignores.
+        assert int(chunk[16:].abs().sum()) == 0

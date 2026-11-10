@@ -444,7 +444,15 @@ class AsyncEngineDrivenTransferContext(EngineDrivenTransferContext):
                         if plans is None:
                             return
                         if inline:
-                            staged = [plan.out for plan in plans if plan.out]
+                            # A quantized group's slots are its encoded payload,
+                            # sent once and dropped; only raw gather targets are
+                            # recycled into the staging pool.
+                            staged = [
+                                plan.out
+                                for plan in plans
+                                if plan.out
+                                and not self._group_states[plan.gid].quantized
+                            ]
                         if not plans:
                             # Every chunk already cached or all-null: nothing to do.
                             ok = True

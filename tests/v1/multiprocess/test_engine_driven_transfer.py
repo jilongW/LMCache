@@ -2936,12 +2936,12 @@ def test_register_quant_rejected_on_fixed_size_l1(
     assert 1 not in module._engine_driven_contexts
 
 
-def test_register_quant_rejected_without_shm_transport(
+def test_register_quant_is_accepted_without_an_shm_pool(
     stub_lmcache_native: Any,
     server_module_factory: ServerModuleFactory,
 ) -> None:
-    """Inline transport carries raw chunks only, so a quantized registration is
-    refused up front instead of failing on the first store."""
+    """Quantized chunks travel inline too (in slots of the registered quantized
+    layout), so a server without an SHM pool no longer refuses the registration."""
     module, mock_storage, _, ctx = server_module_factory(chunk_size=16)
     module._shm_pool_info = {"shm_name": "", "pool_size": 0}  # type: ignore[assignment]
     mock_storage.is_l1_variable_size.return_value = True
@@ -2950,10 +2950,10 @@ def test_register_quant_rejected_without_shm_transport(
         _kvweave_payload(enable_quant=True)
     )
 
-    assert response.error is not None
-    assert "SHM" in response.error
-    mock_storage.mark_l1_kvweave_quant_enabled.assert_not_called()
-    assert 1 not in module._engine_driven_contexts
+    assert response.error is None
+    assert (response.scratch_offset, response.scratch_size) == (0, 0)
+    mock_storage.mark_l1_kvweave_quant_enabled.assert_called_once_with()
+    assert 1 in module._engine_driven_contexts
 
 
 def test_register_quant_rejected_when_lossy_l2_already_configured(

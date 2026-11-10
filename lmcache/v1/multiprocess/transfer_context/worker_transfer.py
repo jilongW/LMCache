@@ -246,6 +246,18 @@ class _GroupState:
         """Whether this group's chunks travel KVWeave-quantized."""
         return self.plan is not None and self.plan.quantized
 
+    @property
+    def transfer_layout_desc(self) -> MemoryLayoutDesc:
+        """The layout this group's chunks have on the wire and in L1.
+
+        The quantized byte layout for a quantized group (what the server was
+        told through ``GroupLayout.layout_override``), else the raw layout.
+        """
+        if self.plan is not None and self.plan.quantized:
+            assert self.plan.quant_layout_desc is not None
+            return self.plan.quant_layout_desc
+        return self.layout_desc
+
 
 # Allocates ``count`` CPU gather targets of one shape and dtype.
 _StagingAlloc = Callable[[torch.Size, torch.dtype, int], list[torch.Tensor]]
@@ -1167,7 +1179,8 @@ class EngineDrivenTransferContext(TransferContext):
             layout_desc=layout_desc,
             block_size=block_size,
             use_mla=use_mla_flag,
-            group_layouts=[state.layout_desc for state in group_states] or None,
+            group_layouts=[state.transfer_layout_desc for state in group_states]
+            or None,
         )
         self._engine_driven_context = create_engine_driven_context(
             metadata,
@@ -1178,18 +1191,6 @@ class EngineDrivenTransferContext(TransferContext):
             scratch_offset=scratch_offset,
             scratch_size=scratch_size,
         )
-        if self._kvweave_codec is not None and isinstance(
-            self._engine_driven_context, EngineDrivenContextInline
-        ):
-            # SHM setup failed and the factory fell back to inline, which carries
-            # raw chunks only; storing quantized bytes there would corrupt reads.
-            self._engine_driven_context.close()
-            self._engine_driven_context = None
-            raise RuntimeError(
-                "KVWeave quantization needs the SHM transport, but this worker "
-                "ended up on inline transport (server SHM disabled or the SHM "
-                "segment could not be attached)"
-            )
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "inline"
         logger.info(
             "Worker engine-driven context registered "
@@ -1660,18 +1661,30 @@ class EngineDrivenTransferContext(TransferContext):
             skip = set(skipped[gid])
             num_chunks = len(block_ids[gid]) // state.blocks_in_chunk
             indices = [c for c in range(num_chunks) if c not in skip]
-            out = (
-                alloc(
+            out: "list[torch.Tensor] | None"
+            if state.quantized:
+                # The server validates every chunk against the group's registered
+                # (quantized) layout, so the encoded payload is sent in a slot of
+                # exactly that size. The tail stays zero; the codec ignores it on
+                # decode.
+                layout = state.transfer_layout_desc
+                out = [
+                    torch.zeros(layout.shapes[0], dtype=layout.dtypes[0])
+                    for _ in indices
+                ]
+            elif alloc is not None and indices:
+                out = alloc(
                     state.layout_desc.shapes[0],
                     state.layout_desc.dtypes[0],
                     len(indices),
                 )
-                if alloc is not None and indices
-                else None
-            )
+            else:
+                out = None
             plans.append(_GroupStorePlan(gid, indices, out))
         if not any(plan.chunk_indices for plan in plans):
             return []
+        # A quantized group still gathers its raw KV somewhere before encoding.
+        self._stage_quantized_raw(ctx, plans)
         # Handshake only: the inline strategy reserves nothing at prepare.
         ctx.prepare_store(key, self._instance_id)
         return plans
@@ -2051,7 +2064,10 @@ class EngineDrivenTransferContext(TransferContext):
             key,
             self._instance_id,
             [
-                (plan.chunk_indices, chunks)
+                # A quantized group sends its encoded slots, not the raw gather.
+                (plan.chunk_indices, plan.out or [])
+                if self._group_states[plan.gid].quantized
+                else (plan.chunk_indices, chunks)
                 for plan, chunks in zip(plans, gathered, strict=True)
             ],
         )
@@ -2123,6 +2139,37 @@ class EngineDrivenTransferContext(TransferContext):
             windows.append((first, num_chunks))
         return windows
 
+    def _restore_group(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        gid: int,
+        group_block_ids: list[int],
+        chunks: list[torch.Tensor],
+        first_chunk: int,
+        skip_first_n_tokens: int,
+    ) -> None:
+        """Put one group's retrieved chunks back into paged KV.
+
+        A quantized group on the in-place route is dequantized straight into its
+        blocks; any other group is decoded (when quantized) and scattered. Both
+        transports use this, so a payload is handled the same wherever it came
+        from.
+        """
+        if self._group_states[gid].retrieve_route is RetrieveRoute.PAGED:
+            self._decode_paged_group(
+                kv_caches, gid, group_block_ids, chunks, first_chunk,
+                skip_first_n_tokens,
+            )
+            return
+        self._scatter_group(
+            kv_caches,
+            gid,
+            group_block_ids,
+            self._decode_quantized_chunks(gid, chunks),
+            first_chunk,
+            skip_first_n_tokens,
+        )
+
     def _scatter_group(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -2171,7 +2218,11 @@ class EngineDrivenTransferContext(TransferContext):
         device = _get_kv_device(kv_caches)
         windows = self._group_windows(block_ids)
         expected = [
-            (state.layout_desc.shapes[0], state.layout_desc.dtypes[0], num_chunks)
+            (
+                state.transfer_layout_desc.shapes[0],
+                state.transfer_layout_desc.dtypes[0],
+                num_chunks,
+            )
             for state, (_, num_chunks) in zip(self._group_states, windows, strict=True)
         ]
         groups = ctx.prepare_retrieve_multigroup(key, self._instance_id, expected)
@@ -2198,12 +2249,8 @@ class EngineDrivenTransferContext(TransferContext):
                 for gid, ((_, chunks), (first, _)) in enumerate(
                     zip(groups, windows, strict=True)
                 ):
-                    self._scatter_group(
-                        kv_caches,
-                        gid,
-                        block_ids[gid],
-                        chunks,
-                        first,
+                    self._restore_group(
+                        kv_caches, gid, block_ids[gid], chunks, first,
                         skip_first_n_tokens,
                     )
             except (RuntimeError, ValueError, TypeError, IndexError):
@@ -2255,22 +2302,8 @@ class EngineDrivenTransferContext(TransferContext):
                 for gid, ((src_g, _), (first, _)) in enumerate(
                     zip(per_group, windows, strict=True)
                 ):
-                    if self._group_states[gid].retrieve_route is RetrieveRoute.PAGED:
-                        self._decode_paged_group(
-                            kv_caches,
-                            gid,
-                            block_ids[gid],
-                            src_g,
-                            first,
-                            skip_first_n_tokens,
-                        )
-                        continue
-                    self._scatter_group(
-                        kv_caches,
-                        gid,
-                        block_ids[gid],
-                        self._decode_quantized_chunks(gid, src_g),
-                        first,
+                    self._restore_group(
+                        kv_caches, gid, block_ids[gid], src_g, first,
                         skip_first_n_tokens,
                     )
             except (RuntimeError, ValueError, TypeError, IndexError):
