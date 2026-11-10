@@ -620,125 +620,141 @@ def test_mamba_two_plane_rh_direct_matches_split_path(
     assert torch.equal(actual.ssm.view(torch.uint8), expected.ssm.view(torch.uint8))
 
 
-@pytest.mark.parametrize("async_store", [False, True])
-@pytest.mark.parametrize("scaling,rh", [
-    ("per_channel", False), ("per_token", False), ("per_token", True)
-])
-def test_mamba_store_ring_bypasses_pre_split_for_direct_encode(
-    scaling: str, rh: bool, async_store: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _staged_mamba_worker(context_cls_name: str, raw, layouts, block_size, options):
+    """A worker whose only group is a quantized Mamba group on the staged route.
+
+    The staged route gathers the raw page and encodes it into the SHM slot at
+    commit (``_encode_quantized_groups``); that is the one encode point both the
+    synchronous and the asynchronous context share.
+    """
     from lmcache.v1.distributed.api import MemoryLayoutDesc
     from lmcache.v1.multiprocess.group_view import EngineGroupInfo
     from lmcache.v1.multiprocess.transfer_context.async_engine_driven import (
         AsyncEngineDrivenTransferContext,
     )
-    from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
+    from lmcache.v1.multiprocess.transfer_context.kvweave_plan import (
+        GroupTransferPlan,
+    )
     from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
         EngineDrivenTransferContext,
-        GroupTransferPlan,
-        _BoundedStoreBatch,
+        _GroupState,
     )
 
-    raw, layouts, block_size, qkv = _two_plane_direct_case("qwen35")
-    codec = KVWeaveCodec()
-    options = MambaCodecOptions(
-        conv_scaling_method=scaling,
-        conv_rh=rh,
-        ssm_scaling_method=scaling,
-        ssm_rh=rh,
-        asym=True,
-        conv_qkv_split=qkv,
-    )
-    payload = codec.encode_chunk("mamba", layouts, block_size, options, raw)
+    blocks_per_chunk = int(raw.shape[-2]) // block_size
     plan = GroupTransferPlan(
         group_info=EngineGroupInfo(
-            engine_group_id=0, layer_indices=(0,),
-            tokens_per_block=block_size, cache_category="mamba",
+            engine_group_id=0,
+            layer_indices=tuple(range(int(raw.shape[1]))),
+            tokens_per_block=block_size,
+            cache_category="mamba",
             mamba_real_layout=layouts,
         ),
-        layer_indices=frozenset({0}), blocks_per_chunk=2,
-        chunk_shape=raw.shape, engine_kv_format=None, quantized=True,
+        layer_indices=frozenset(range(int(raw.shape[1]))),
+        blocks_per_chunk=blocks_per_chunk,
+        chunk_shape=raw.shape,
+        engine_kv_format=None,
+        quantized=True,
         raw_layout_desc=MemoryLayoutDesc(shapes=[raw.shape], dtypes=[raw.dtype]),
         mamba_options=options,
     )
-    worker = EngineDrivenTransferContext()
-    worker._kvweave_codec = codec
-    context = MagicMock(spec=EngineDrivenContextShm)
-    context.allocate_scratch_tensors.return_value = (
-        [raw.clone(), torch.empty_like(raw)], MagicMock()
+    cls = (
+        AsyncEngineDrivenTransferContext
+        if context_cls_name == "async"
+        else EngineDrivenTransferContext
     )
-    ring = worker._build_group_scratch_ring(plan, context)
-    assert ring.mamba_split is None
-    assert ring.split_allocation is None
-    context.allocate_scratch_tensor_groups.assert_not_called()
+    worker = cls(1, MagicMock())
+    worker._kvweave_codec = KVWeaveCodec()
+    worker._chunk_tokens = block_size * blocks_per_chunk
+    worker._group_states = [
+        _GroupState(
+            layer_names=[],
+            engine_kv_format=None,
+            blocks_in_chunk=blocks_per_chunk,
+            blocks_per_window=blocks_per_chunk,
+            layout_desc=plan.raw_layout_desc,
+            plan=plan,
+        )
+    ]
+    return worker
+
+
+def _encode_through_worker(worker, raw, payload_len: int) -> torch.Tensor:
+    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
+        _GroupStorePlan,
+    )
+
+    slot = torch.zeros(payload_len, dtype=torch.uint8)
+    worker._encode_quantized_groups(
+        [_GroupStorePlan(gid=0, chunk_indices=[0], out=[slot])], [[raw]]
+    )
+    return slot
+
+
+@pytest.mark.parametrize("context_cls", ["sync", "async"])
+@pytest.mark.parametrize("scaling,rh", [
+    ("per_channel", False), ("per_token", False), ("per_token", True)
+])
+def test_mamba_store_encodes_direct_without_a_pre_split(
+    scaling: str, rh: bool, context_cls: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When conv and ssm can both be quantized in place, the store must not build
+    the Python split of the page, and must still produce a correct payload."""
+    raw, layouts, block_size, qkv = _two_plane_direct_case("qwen35")
+    options = MambaCodecOptions(
+        conv_scaling_method=scaling, conv_rh=rh,
+        ssm_scaling_method=scaling, ssm_rh=rh,
+        asym=True, conv_qkv_split=qkv,
+    )
+    reference = KVWeaveCodec().encode_chunk(
+        "mamba", layouts, block_size, options, raw
+    )
+    worker = _staged_mamba_worker(context_cls, raw, layouts, block_size, options)
+    codec = worker._kvweave_codec
 
     def unexpected_split(*args: object, **kwargs: object) -> None:
-        pytest.fail("direct store must not prepare Python split scratch")
+        pytest.fail("a direct store must not prepare a Python split of the page")
 
-    calls = []
+    direct_calls: list[int] = []
     serialize = codec.native.kvweave_serialize_mamba_page_substate_direct
 
-    def track_serialize(*args, **kwargs):
-        calls.append(1)
+    def counting_serialize(*args, **kwargs):
+        direct_calls.append(1)
         return serialize(*args, **kwargs)
 
     monkeypatch.setattr(codec, "split_mamba_chunk", unexpected_split)
     monkeypatch.setattr(
         codec.native, "kvweave_serialize_mamba_page_substate_direct",
-        track_serialize,
+        counting_serialize,
     )
-    slot = torch.empty(len(payload), dtype=torch.uint8)
-    batch = _BoundedStoreBatch(
-        plan=plan, group_kv_caches={}, group_block_ids=[],
-        group_slots=[slot], group_id=0, start=0, batch_index=0,
-    )
-    if async_store:
-        worker._engine_driven_context = context
-        event = MagicMock()
-        raw_allocation = MagicMock()
-        AsyncEngineDrivenTransferContext._process_shm_quantized_batch(
-            worker, "test-mamba-direct", batch,
-            ([ring.raw_slots[0]], raw_allocation, False, event),
-        )
-        event.synchronize.assert_called_once_with()
-        context.allocate_scratch_tensor_groups.assert_not_called()
-        context.free_scratch.assert_called_once_with(raw_allocation)
-        context.free_scratch.reset_mock()
-    else:
-        worker._bounded_encode_stage(batch, [ring.raw_slots[0]], ring)
-    assert len(calls) == 4
-    restored = codec.decode_chunk(
+    try:
+        slot = _encode_through_worker(worker, raw, len(reference))
+    finally:
+        worker.close()
+
+    # conv's query, key and value plus ssm, each quantized in place.
+    assert len(direct_calls) == 4
+    restored = KVWeaveCodec().decode_chunk(
         "mamba", layouts, block_size, raw.shape, raw.dtype, slot
     )
-    expected = codec.decode_chunk(
+    expected = KVWeaveCodec().decode_chunk(
         "mamba", layouts, block_size, raw.shape, raw.dtype,
-        torch.frombuffer(bytearray(payload), dtype=torch.uint8),
+        torch.frombuffer(bytearray(reference), dtype=torch.uint8),
     )
-    actual_split = KVWeaveCodec.split_mamba_chunk(restored, layouts, block_size)
-    expected_split = KVWeaveCodec.split_mamba_chunk(expected, layouts, block_size)
-    assert torch.equal(actual_split.conv, expected_split.conv)
-    assert torch.equal(actual_split.ssm, expected_split.ssm)
-    ring.close(context)
-    context.free_scratch.assert_called_once_with(ring.raw_allocation)
+    got = KVWeaveCodec.split_mamba_chunk(restored, layouts, block_size)
+    want = KVWeaveCodec.split_mamba_chunk(expected, layouts, block_size)
+    assert torch.equal(got.conv, want.conv)
+    assert torch.equal(got.ssm, want.ssm)
 
 
-@pytest.mark.parametrize("async_store", [False, True])
+@pytest.mark.parametrize("context_cls", ["sync", "async"])
 @pytest.mark.parametrize("fallback", ["disabled", "raw_ssm", "scaling", "layout"])
-def test_mamba_store_keeps_split_when_both_states_cannot_go_direct(
-    fallback: str, async_store: bool,
+def test_mamba_store_falls_back_to_a_split_and_stays_correct(
+    fallback: str, context_cls: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from lmcache.v1.distributed.api import MemoryLayoutDesc
-    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
-    from lmcache.v1.multiprocess.transfer_context.async_engine_driven import (
-        AsyncEngineDrivenTransferContext,
-    )
-    from lmcache.v1.multiprocess.transfer_context.shm import EngineDrivenContextShm
-    from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
-        EngineDrivenTransferContext,
-        GroupTransferPlan,
-        _BoundedStoreBatch,
-    )
-
+    """When a sub-state cannot be quantized in place (conv direct disabled, ssm
+    kept raw, a scaling method the kernels lack, or a layout straddling the page
+    plane), the store splits the page instead -- and the payload must match the
+    codec's own encoding byte for byte."""
     case = "conv_straddling" if fallback == "layout" else "aligned"
     raw, layouts, block_size, qkv = _two_plane_direct_case(case)
     options = MambaCodecOptions(
@@ -752,55 +768,26 @@ def test_mamba_store_keeps_split_when_both_states_cannot_go_direct(
         options = replace(options, ssm_qbit=16)
     elif fallback == "scaling":
         options = replace(options, ssm_scaling_method="per_tensor")
-    plan = GroupTransferPlan(
-        group_info=EngineGroupInfo(
-            engine_group_id=0, layer_indices=(0, 1, 2),
-            tokens_per_block=block_size, cache_category="mamba",
-            mamba_real_layout=layouts,
-        ),
-        layer_indices=frozenset({0, 1, 2}), blocks_per_chunk=3,
-        chunk_shape=raw.shape, engine_kv_format=None, quantized=True,
-        raw_layout_desc=MemoryLayoutDesc(shapes=[raw.shape], dtypes=[raw.dtype]),
-        mamba_options=options,
+    reference = KVWeaveCodec().encode_chunk(
+        "mamba", layouts, block_size, options, raw
     )
-    worker = EngineDrivenTransferContext()
-    worker._kvweave_codec = KVWeaveCodec()
-    assert not worker._mamba_encode_uses_direct(plan, raw)
-    split = KVWeaveCodec.split_mamba_chunk(raw, layouts, block_size)
-    context = MagicMock(spec=EngineDrivenContextShm)
-    context.allocate_scratch_tensors.return_value = (
-        [raw, torch.empty_like(raw)], MagicMock()
-    )
-    context.allocate_scratch_tensor_groups.return_value = (
-        [(split.conv, split.ssm)], MagicMock()
-    )
-    if async_store:
-        worker._engine_driven_context = context
-        worker._encode_group_chunks_into_slots = MagicMock()
-        batch = _BoundedStoreBatch(
-            plan=plan, group_kv_caches={}, group_block_ids=[],
-            group_slots=[torch.empty(1, dtype=torch.uint8)],
-            group_id=0, start=0, batch_index=0,
-        )
-        raw_allocation = MagicMock()
-        event = MagicMock()
-        AsyncEngineDrivenTransferContext._process_shm_quantized_batch(
-            worker, "test-mamba-split", batch,
-            ([raw], raw_allocation, False, event),
-        )
-        event.synchronize.assert_called_once_with()
-        context.allocate_scratch_tensor_groups.assert_called_once()
-        prepared = worker._encode_group_chunks_into_slots.call_args.args[3]
-        assert len(prepared) == 1
-        assert torch.equal(prepared[0].conv, split.conv)
-        assert torch.equal(prepared[0].ssm, split.ssm)
-        assert context.free_scratch.call_count == 2
-        return
-    ring = worker._build_group_scratch_ring(plan, context)
-    assert ring.mamba_split is not None
-    context.allocate_scratch_tensor_groups.assert_called_once()
-    ring.close(context)
-    assert context.free_scratch.call_count == 2
+    worker = _staged_mamba_worker(context_cls, raw, layouts, block_size, options)
+    codec = worker._kvweave_codec
+    split_calls: list[int] = []
+    real_split = codec.split_mamba_chunk
+
+    def counting_split(*args, **kwargs):
+        split_calls.append(1)
+        return real_split(*args, **kwargs)
+
+    monkeypatch.setattr(codec, "split_mamba_chunk", counting_split)
+    try:
+        slot = _encode_through_worker(worker, raw, len(reference))
+    finally:
+        worker.close()
+
+    assert split_calls, "a store that cannot go fully direct must split the page"
+    assert bytes(slot.numpy()) == bytes(reference)
 
 
 @pytest.mark.parametrize("scaling", ["per_channel", "per_token", "per_tensor"])
