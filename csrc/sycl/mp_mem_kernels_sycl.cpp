@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <numeric>
 
 #include "mem_kernels_sycl.h"
 
@@ -81,7 +82,11 @@ BlockLayout resolve_layout(PageBufferShapeDesc d, EngineKVFormat format) {
   return layout;
 }
 
-template <typename Unit, bool ToEngine>
+// Unit is the object-side (host) access width; EngineUnit is the engine-side
+// (device) width and may be narrower when the engine block stride is
+// misaligned. Keeping the host side wide matters: narrow stores over PCIe are
+// ~40x slower than 16-byte ones, while narrow device-local accesses are cheap.
+template <typename Unit, typename EngineUnit, bool ToEngine>
 void submit_blocks(sycl::queue& queue, const uintptr_t* paged_ptrs,
                    std::array<uintptr_t, kObjectsPerLaunch> objects,
                    const int64_t* ids, size_t first_block, size_t end_block,
@@ -139,21 +144,52 @@ void submit_blocks(sycl::queue& queue, const uintptr_t* paged_ptrs,
           }
           uint8_t* engine_addr = engine + engine_i * sizeof(Unit);
           uint8_t* object_addr = object + i * sizeof(Unit);
-          uint8_t* dst = ToEngine ? engine_addr : object_addr;
-          const uint8_t* src = ToEngine ? object_addr : engine_addr;
-          if ((reinterpret_cast<uintptr_t>(dst) |
-               reinterpret_cast<uintptr_t>(src)) %
-                  alignof(Unit) ==
-              0) {
-            *reinterpret_cast<Unit*>(dst) = *reinterpret_cast<const Unit*>(src);
+          constexpr size_t kPieces =
+              sizeof(EngineUnit) >= sizeof(Unit) ? 1
+                                                 : sizeof(Unit) / sizeof(EngineUnit);
+          if constexpr (kPieces == 1) {
+            uint8_t* dst = ToEngine ? engine_addr : object_addr;
+            const uint8_t* src = ToEngine ? object_addr : engine_addr;
+            if ((reinterpret_cast<uintptr_t>(dst) |
+                 reinterpret_cast<uintptr_t>(src)) %
+                    alignof(Unit) ==
+                0) {
+              *reinterpret_cast<Unit*>(dst) =
+                  *reinterpret_cast<const Unit*>(src);
+            } else {
+              for (size_t b = 0; b < sizeof(Unit); ++b) dst[b] = src[b];
+            }
+          } else if (reinterpret_cast<uintptr_t>(engine_addr) %
+                         alignof(EngineUnit) ==
+                     0) {
+            // Wide access on the object side, narrow on the engine side.
+            auto* e = reinterpret_cast<EngineUnit*>(engine_addr);
+            if constexpr (ToEngine) {
+              const Unit v = *reinterpret_cast<const Unit*>(object_addr);
+              const auto* vp = reinterpret_cast<const EngineUnit*>(&v);
+#pragma unroll
+              for (size_t k = 0; k < kPieces; ++k) e[k] = vp[k];
+            } else {
+              Unit v;
+              auto* vp = reinterpret_cast<EngineUnit*>(&v);
+#pragma unroll
+              for (size_t k = 0; k < kPieces; ++k) vp[k] = e[k];
+              *reinterpret_cast<Unit*>(object_addr) = v;
+            }
           } else {
-            for (size_t b = 0; b < sizeof(Unit); ++b) dst[b] = src[b];
+            for (size_t b = 0; b < sizeof(Unit); ++b) {
+              if (ToEngine) {
+                engine_addr[b] = object_addr[b];
+              } else {
+                object_addr[b] = engine_addr[b];
+              }
+            }
           }
         }
       });
 }
 
-template <typename Unit>
+template <typename Unit, typename EngineUnit>
 void launch_blocks(sycl::queue& queue, const torch::Tensor& paged,
                    const std::vector<uintptr_t>& objects,
                    const torch::Tensor& ids, TransferDirection direction,
@@ -170,11 +206,11 @@ void launch_blocks(sycl::queue& queue, const torch::Tensor& paged,
     std::copy_n(objects.begin() + start, count, batch.begin());
     const auto* ptrs = static_cast<const uintptr_t*>(paged.data_ptr());
     if (direction == TransferDirection::H2D) {
-      submit_blocks<Unit, true>(queue, ptrs, batch, ids.data_ptr<int64_t>(),
+      submit_blocks<Unit, EngineUnit, true>(queue, ptrs, batch, ids.data_ptr<int64_t>(),
                                 first, end, start, blocks_per_object, d,
                                 chunk_tokens, layout);
     } else {
-      submit_blocks<Unit, false>(queue, ptrs, batch, ids.data_ptr<int64_t>(),
+      submit_blocks<Unit, EngineUnit, false>(queue, ptrs, batch, ids.data_ptr<int64_t>(),
                                  first, end, start, blocks_per_object, d,
                                  chunk_tokens, layout);
     }
@@ -241,24 +277,59 @@ void multi_layer_block_kv_transfer(
   }
   const size_t head_bytes =
       static_cast<size_t>(shape_desc.hs) * shape_desc.element_size;
-#define LAUNCH(Unit)                                                         \
-  launch_blocks<Unit>(queue, paged_buffer_ptrs_tensor, lmcache_objects_ptrs, \
-                      block_ids, direction, shape_desc, lmcache_chunk_size,  \
-                      layout, skip_prefix_n_blocks)
-  if (layout.blocked_scale) {
-    if (head_bytes % 4 == 0) {
-      LAUNCH(uint32_t);
-    } else {
-      LAUNCH(uint8_t);
-    }
-  } else if (head_bytes % 16 == 0) {
-    LAUNCH(sycl::uint4);
-  } else if (head_bytes % 4 == 0) {
-    LAUNCH(uint32_t);
-  } else if (head_bytes % 2 == 0) {
-    LAUNCH(uint16_t);
-  } else {
-    LAUNCH(uint8_t);
+  // Object side: objects are packed in head-sized rows, so only head_bytes and
+  // the object pointers bound its alignment. Engine side: strides bound it.
+  // Engine base pointers live on the device, so the kernel keeps a per-element
+  // alignment check as a backstop.
+  size_t obj_align = head_bytes;
+  for (uintptr_t ptr : lmcache_objects_ptrs) {
+    obj_align = std::gcd(obj_align, static_cast<size_t>(ptr));
   }
+  size_t eng_align = head_bytes;
+  for (size_t v : {layout.block_stride, layout.layer_stride, layout.kv_stride}) {
+    if (v != 0) eng_align = std::gcd(eng_align, v);
+  }
+  if (layout.blocked_scale) {
+    // The 4-byte scale tail bounds both sides to a common 4-byte unit.
+    obj_align = eng_align =
+        std::gcd(std::gcd(obj_align, eng_align), static_cast<size_t>(4));
+  }
+  if (head_bytes % 16 == 0 && (obj_align % 16 != 0 || eng_align % 16 != 0)) {
+    TORCH_WARN_ONCE(
+        "XPU block transfer: stride or object pointer is not 16-byte aligned "
+        "(object ",
+        obj_align, " B, engine ", eng_align,
+        " B); using narrower copies, transfers will be slower");
+  }
+#define LAUNCH(Unit, EngineUnit)                                            \
+  launch_blocks<Unit, EngineUnit>(                                          \
+      queue, paged_buffer_ptrs_tensor, lmcache_objects_ptrs, block_ids,     \
+      direction, shape_desc, lmcache_chunk_size, layout, skip_prefix_n_blocks)
+#define PICK_ENGINE(Unit)                              \
+  do {                                                 \
+    if (sizeof(Unit) <= 1 || eng_align % 2 != 0) {     \
+      LAUNCH(Unit, uint8_t);                           \
+    } else if (sizeof(Unit) <= 2 || eng_align % 4 != 0) { \
+      LAUNCH(Unit, uint16_t);                          \
+    } else if (sizeof(Unit) <= 4 || eng_align % 8 != 0) { \
+      LAUNCH(Unit, uint32_t);                          \
+    } else if (sizeof(Unit) <= 8 || eng_align % 16 != 0) { \
+      LAUNCH(Unit, uint64_t);                          \
+    } else {                                           \
+      LAUNCH(Unit, Unit);                              \
+    }                                                  \
+  } while (0)
+  if (obj_align % 16 == 0) {
+    PICK_ENGINE(sycl::uint4);
+  } else if (obj_align % 8 == 0) {
+    PICK_ENGINE(uint64_t);
+  } else if (obj_align % 4 == 0) {
+    PICK_ENGINE(uint32_t);
+  } else if (obj_align % 2 == 0) {
+    PICK_ENGINE(uint16_t);
+  } else {
+    PICK_ENGINE(uint8_t);
+  }
+#undef PICK_ENGINE
 #undef LAUNCH
 }
