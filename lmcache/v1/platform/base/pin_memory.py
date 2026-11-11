@@ -39,6 +39,23 @@ class PinMemoryBackend:
         """
         return False
 
+    def is_pinned_range(self, ptr: int, size: int) -> bool:
+        """Whether a host range lies inside a region this backend pinned.
+
+        Some platforms pin memory in a way the framework's own
+        ``tensor.is_pinned()`` cannot see (for example XPU host registration of
+        shared memory), so callers that need to know ask the backend.
+
+        Args:
+            ptr: Raw pointer to the start of the range.
+            size: Size in bytes of the range.
+
+        Returns:
+            True if the whole range is inside one region pinned through
+            :meth:`pin_memory`, False otherwise.
+        """
+        return False
+
     @property
     def is_pin_supported(self) -> bool:
         """Whether the current platform supports memory pinning.

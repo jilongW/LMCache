@@ -282,6 +282,18 @@ class DeviceSpec:
         """
         return self._get_pin_backend().unpin_memory(ptr)
 
+    def is_pinned_range(self, ptr: int, size: int) -> bool:
+        """Whether a host range lies inside a region pinned via :meth:`pin_memory`.
+
+        Args:
+            ptr: Raw pointer to the start of the range.
+            size: Size in bytes of the range.
+
+        Returns:
+            True if the whole range is inside one pinned region.
+        """
+        return self._get_pin_backend().is_pinned_range(ptr, size)
+
     @property
     def is_pin_supported(self) -> bool:
         """Whether the current platform supports memory pinning."""

@@ -4,6 +4,7 @@
 # Standard
 from typing import Protocol, cast
 import importlib
+import threading
 
 # First Party
 from lmcache.logging import init_logger
@@ -56,6 +57,13 @@ class XpuPinMemoryBackend(PinMemoryBackend):
     ``mmap`` regions, that PyTorch's pinned-memory allocator cannot manage.
     """
 
+    # Registered ranges as ``{base pointer: size}``. Registration is a property
+    # of the process, not of one backend instance, and is not visible through
+    # ``tensor.is_pinned()`` or the SYCL pointer type, so the record is shared
+    # by every instance.
+    _registered: dict[int, int] = {}
+    _registered_lock = threading.Lock()
+
     def __init__(self) -> None:
         """Discover the optional native XPU host-registration extension."""
         self._ops = _load_xpu_ops()
@@ -89,12 +97,16 @@ class XpuPinMemoryBackend(PinMemoryBackend):
             return False
 
         try:
-            return ops.xpu_host_register(ptr, size)
+            registered = ops.xpu_host_register(ptr, size)
         except RuntimeError as exc:
             logger.warning(
                 "xpu_host_register failed for ptr=%#x size=%d: %s", ptr, size, exc
             )
             return False
+        if registered:
+            with XpuPinMemoryBackend._registered_lock:
+                XpuPinMemoryBackend._registered[ptr] = size
+        return registered
 
     def unpin_memory(self, ptr: int) -> bool:
         """Release a host-memory range registered by :meth:`pin_memory`.
@@ -110,10 +122,31 @@ class XpuPinMemoryBackend(PinMemoryBackend):
             return False
 
         try:
-            return ops.xpu_host_unregister(ptr)
+            released = ops.xpu_host_unregister(ptr)
         except RuntimeError as exc:
             logger.warning("xpu_host_unregister failed for ptr=%#x: %s", ptr, exc)
             return False
+        if released:
+            with XpuPinMemoryBackend._registered_lock:
+                XpuPinMemoryBackend._registered.pop(ptr, None)
+        return released
+
+    def is_pinned_range(self, ptr: int, size: int) -> bool:
+        """Return whether a host range lies inside one registered region.
+
+        Args:
+            ptr: Raw pointer to the start of the range.
+            size: Size in bytes of the range.
+
+        Returns:
+            ``True`` when ``[ptr, ptr + size)`` is inside a range registered
+            through :meth:`pin_memory`; otherwise ``False``.
+        """
+        with XpuPinMemoryBackend._registered_lock:
+            return any(
+                base <= ptr and ptr + size <= base + length
+                for base, length in XpuPinMemoryBackend._registered.items()
+            )
 
     @property
     def is_pin_supported(self) -> bool:
