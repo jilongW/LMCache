@@ -23,6 +23,10 @@ from lmcache.v1.distributed.api import (
 )
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import MockL2AdapterConfig
 from lmcache.v1.distributed.serde import SerdeConfig
+from lmcache.v1.distributed.serde.group_info import (
+    SerdePartInfo,
+    get_serde_group_info_registry,
+)
 from lmcache.v1.distributed.storage_manager import StorageManager, l1_owners_of
 
 # Test helpers
@@ -85,6 +89,15 @@ def _prefetch(sm: StorageManager, keys, layout, group: int) -> int:
 
 
 def test_mixed_groups_round_trip_through_l2() -> None:
+    registry = get_serde_group_info_registry()
+    registry.clear()
+    registry.register(
+        _MODEL,
+        0,
+        [SerdePartInfo("attention", 64, _HEADS, _HEAD_DIM, False, False)],
+    )
+    registry.register(_MODEL, 1, [SerdePartInfo("attention", 64, 1, 128, True, False)])
+
     adapter = MockL2AdapterConfig(max_size_gb=0.1, mock_bandwidth_gb=10.0)
     adapter.serde_config = SerdeConfig(
         type="kvweave",
@@ -94,17 +107,6 @@ def test_mixed_groups_round_trip_through_l2() -> None:
             "num_threads": 2,
             "num_kv_heads": _HEADS,
             "head_dim": _HEAD_DIM,
-            "groups": {
-                0: [
-                    {
-                        "cache_category": "attention",
-                        "attention_plane_layout": "split_kv",
-                        "num_kv_heads": _HEADS,
-                        "head_dim": _HEAD_DIM,
-                    }
-                ],
-                1: [{"cache_category": "attention", "attention_plane_layout": "mla"}],
-            },
         },
     )
     sm = StorageManager(make_storage_manager_config([adapter]))
@@ -155,3 +157,4 @@ def test_mixed_groups_round_trip_through_l2() -> None:
             sm.finish_read_prefetched(keys)
     finally:
         sm.close()
+        registry.clear()

@@ -4,8 +4,8 @@ Tests for the ``kvweave`` L2 serde.
 
 The serde is driven only through its public surface: the factory-built
 ``SerdeProcessor`` (submit / query / size estimate) and, end to end, the
-``StorageManager`` L1 -> L2 -> L1 path. Per-group facts come from the serde's
-static ``groups`` kwarg.
+``StorageManager`` L1 -> L2 -> L1 path. Engine knowledge arrives the way the
+engine registration delivers it, via the serde group-info registry.
 
 The native kvweave extension is required; CPU is always exercised and XPU is
 added when an XPU device is present.
@@ -16,15 +16,21 @@ from dataclasses import dataclass
 import time
 
 # Third Party
+import msgspec
 import pytest
 import torch
 
 # First Party
+from lmcache.v1.common.group_view import MambaSubStateWireLayout
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.serde import (
     SerdeConfig,
     create_serde_processor,
     get_registered_serde_types,
+)
+from lmcache.v1.distributed.serde.group_info import (
+    SerdePartInfo,
+    get_serde_group_info_registry,
 )
 
 kvweave = pytest.importorskip("kvweave")
@@ -34,6 +40,7 @@ _DEVICES = ["cpu"] + (
 )
 
 _MODEL = "kvweave-test-model"
+_BLOCK = 64
 _HEADS, _HEAD_DIM = 4, 64
 _HIDDEN = _HEADS * _HEAD_DIM
 
@@ -99,20 +106,32 @@ def _round_trip(processor, src: _Obj, group: int) -> tuple[_Obj, _Obj]:
     return stored, out
 
 
-_SPLIT = {
-    "cache_category": "attention",
-    "attention_plane_layout": "split_kv",
-    "num_kv_heads": _HEADS,
-    "head_dim": _HEAD_DIM,
-}
-_FUSED = {**_SPLIT, "attention_plane_layout": "fused_kv"}
-_MLA = {
-    "cache_category": "attention",
-    "attention_plane_layout": "mla",
-    "num_kv_heads": 1,
-    "head_dim": 128,
-}
-_UNKNOWN = {"cache_category": "unknown"}
+def _mamba_page() -> tuple[
+    tuple[MambaSubStateWireLayout, MambaSubStateWireLayout], int
+]:
+    """A Qwen3.5-like page: fp16 conv (3 x 8192), fp32 ssm (32 x 128 x 128), pad."""
+    conv_shape, ssm_shape = (3, 8192), (32, 128, 128)
+    conv_bytes, ssm_bytes = 3 * 8192 * 2, 32 * 128 * 128 * 4
+    hidden = (conv_bytes + ssm_bytes + 4096) // (_BLOCK * 2)
+    layout = (
+        MambaSubStateWireLayout(
+            0,
+            conv_bytes,
+            "torch.float16",
+            conv_shape,
+            channel_segments=(2048, 2048, 4096),
+        ),
+        MambaSubStateWireLayout(conv_bytes, ssm_bytes, "torch.float32", ssm_shape),
+    )
+    return layout, hidden
+
+
+@pytest.fixture
+def registry():
+    reg = get_serde_group_info_registry()
+    reg.clear()
+    yield reg
+    reg.clear()
 
 
 def _processor(device: str, **extra):
@@ -122,6 +141,8 @@ def _processor(device: str, **extra):
         num_threads=2,
         num_kv_heads=_HEADS,
         head_dim=_HEAD_DIM,
+        conv_scaling_method="per_channel",
+        ssm_scaling_method="per_channel",
     )
     kwargs.update(extra)
     return create_serde_processor(SerdeConfig(type="kvweave", kwargs=kwargs))
@@ -133,9 +154,14 @@ def test_kvweave_is_registered() -> None:
 
 @pytest.mark.parametrize("device", _DEVICES)
 @pytest.mark.parametrize("qbit,max_ratio", [(4, 0.30), (8, 0.55)])
-def test_split_attention_round_trip(device, qbit, max_ratio) -> None:
+def test_split_attention_round_trip(registry, device, qbit, max_ratio) -> None:
     """[2, L, T, H] chunks shrink, stay close, and the estimate is exact."""
-    processor = _processor(device, qbit=qbit, groups={0: [_SPLIT]})
+    registry.register(
+        _MODEL,
+        0,
+        [SerdePartInfo("attention", _BLOCK, _HEADS, _HEAD_DIM, False, False)],
+    )
+    processor = _processor(device, qbit=qbit)
     try:
         torch.manual_seed(0)
         x = torch.randn(2, 4, 128, _HIDDEN).half()
@@ -148,9 +174,14 @@ def test_split_attention_round_trip(device, qbit, max_ratio) -> None:
 
 
 @pytest.mark.parametrize("device", _DEVICES)
-def test_fused_attention_round_trip(device) -> None:
+def test_fused_attention_round_trip(registry, device) -> None:
     """[L, T, H] chunks of a fused-packed format use the fused codec."""
-    processor = _processor(device, groups={1: [_FUSED]})
+    registry.register(
+        _MODEL,
+        1,
+        [SerdePartInfo("attention", _BLOCK, _HEADS, _HEAD_DIM, False, True)],
+    )
+    processor = _processor(device)
     try:
         torch.manual_seed(1)
         x = torch.randn(4, 128, 2 * _HIDDEN).half()
@@ -162,10 +193,17 @@ def test_fused_attention_round_trip(device) -> None:
         processor.close()
 
 
-@pytest.mark.parametrize("spec", [_MLA, _UNKNOWN])
-def test_unquantizable_groups_pass_through_bit_exact(spec) -> None:
+@pytest.mark.parametrize(
+    "info",
+    [
+        SerdePartInfo("attention", _BLOCK, 1, 128, True, False),  # MLA latent plane
+        SerdePartInfo("unknown", _BLOCK),  # unclassified group
+    ],
+)
+def test_unquantizable_groups_pass_through_bit_exact(registry, info) -> None:
     """Groups the codec must not touch are stored and restored byte for byte."""
-    processor = _processor("cpu", groups={2: [spec]})
+    registry.register(_MODEL, 2, [info])
+    processor = _processor("cpu")
     try:
         x = torch.randn(4, 128, 128).half()
         stored, out = _round_trip(processor, _Obj([x]), 2)
@@ -175,7 +213,7 @@ def test_unquantizable_groups_pass_through_bit_exact(spec) -> None:
         processor.close()
 
 
-def test_unconfigured_group_without_defaults_passes_through() -> None:
+def test_unregistered_group_without_defaults_passes_through(registry) -> None:
     """With no facts and no head geometry, a chunk is never mis-quantized."""
     processor = create_serde_processor(
         SerdeConfig(type="kvweave", kwargs={"device": "cpu"})
@@ -189,26 +227,113 @@ def test_unconfigured_group_without_defaults_passes_through() -> None:
 
 
 @pytest.mark.parametrize("device", _DEVICES)
-def test_multi_part_object_round_trips_every_part(device) -> None:
+def test_mamba_without_engine_conv_segments_is_stored_raw(registry, device) -> None:
+    """The conv q/k/v split comes only from the engine; a group whose engine did
+    not report it (e.g. a non-GDN Mamba kind) is stored unquantized."""
+    layout, hidden = _mamba_page()
+    conv, ssm = layout
+    registry.register(
+        _MODEL,
+        3,
+        [
+            SerdePartInfo(
+                "mamba",
+                _BLOCK,
+                mamba_real_layout=(
+                    msgspec.structs.replace(conv, channel_segments=()),
+                    ssm,
+                ),
+            )
+        ],
+    )
+    processor = _processor(device)
+    try:
+        desc = MemoryLayoutDesc(
+            shapes=[torch.Size([2, _BLOCK * 2, hidden])], dtypes=[torch.float16]
+        )
+        raw_bytes = 2 * _BLOCK * 2 * hidden * 2
+        assert processor.estimate_serialized_size_for_key(desc, _key(3)) == raw_bytes
+    finally:
+        processor.close()
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_mamba_round_trip_keeps_each_substate_in_its_own_dtype(
+    registry, device
+) -> None:
+    """conv (fp16) and ssm (fp32) are quantized separately and restored in place."""
+    # First Party
+    from lmcache.v1.distributed.serde.kvweave import KVWeaveCodec, MambaChunkSplit
+
+    layout, hidden = _mamba_page()
+    registry.register(
+        _MODEL, 3, [SerdePartInfo("mamba", _BLOCK, mamba_real_layout=layout)]
+    )
+    processor = _processor(device)
+    try:
+        torch.manual_seed(2)
+        layers, blocks = 2, 2
+        split = MambaChunkSplit(
+            torch.randn(layers, blocks, 3, 8192).half(),
+            torch.randn(layers, blocks, 32, 128, 128),
+        )
+        raw = KVWeaveCodec.merge_mamba_chunk(
+            split,
+            layout,
+            _BLOCK,
+            hidden,
+            raw_shape=torch.Size([layers, _BLOCK * blocks, hidden]),
+            raw_dtype=torch.float16,
+        )
+        stored, out = _round_trip(processor, _Obj([raw]), 3)
+        assert stored.used == stored.parts[0].numel()
+        assert stored.used < raw.numel() * 2 * 0.25
+        restored = KVWeaveCodec.split_mamba_chunk(out.tensor, layout, _BLOCK)
+        assert restored.conv.dtype == torch.float16
+        assert restored.ssm.dtype == torch.float32
+        assert (restored.conv.float() - split.conv.float()).abs().max() < 1.0
+        assert (restored.ssm - split.ssm).abs().max() < 1.0
+    finally:
+        processor.close()
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_multi_part_object_round_trips_every_part(registry, device) -> None:
     """An object holding one tensor per kernel group is framed and restored per part."""
-    processor = _processor(device, groups={4: [_SPLIT, _MLA]})
+    layout, hidden = _mamba_page()
+    registry.register(
+        _MODEL,
+        4,
+        [
+            SerdePartInfo("attention", _BLOCK, _HEADS, _HEAD_DIM, False, False),
+            SerdePartInfo("attention", _BLOCK, 1, 128, True, False),
+            SerdePartInfo("mamba", _BLOCK, mamba_real_layout=layout),
+        ],
+    )
+    processor = _processor(device)
     try:
         torch.manual_seed(3)
         parts = [
             torch.randn(2, 2, 128, _HIDDEN).half(),
             torch.randn(2, 128, 128).half(),
+            torch.randn(1, 2 * _BLOCK, hidden).half(),
         ]
         stored, out = _round_trip(processor, _Obj(parts), 4)
         assert stored.used == stored.parts[0].numel()
         assert (out.parts[0].float() - parts[0].float()).abs().mean() < 0.15
         assert torch.equal(out.parts[1].view(torch.uint8), parts[1].view(torch.uint8))
+        assert out.parts[2].shape == parts[2].shape
     finally:
         processor.close()
 
 
-def test_estimate_depends_on_the_objects_group() -> None:
+def test_estimate_depends_on_the_objects_group(registry) -> None:
     """Same shape, different group: the buffer is sized for that key's group."""
-    processor = _processor("cpu", groups={0: [_SPLIT], 1: [_UNKNOWN]})
+    registry.register(
+        _MODEL, 0, [SerdePartInfo("attention", _BLOCK, _HEADS, _HEAD_DIM, False, False)]
+    )
+    registry.register(_MODEL, 1, [SerdePartInfo("unknown", _BLOCK)])
+    processor = _processor("cpu")
     try:
         layout = MemoryLayoutDesc(
             shapes=[torch.Size([2, 4, 128, _HIDDEN])], dtypes=[torch.float16]
@@ -221,9 +346,12 @@ def test_estimate_depends_on_the_objects_group() -> None:
         processor.close()
 
 
-def test_corrupt_payload_fails_instead_of_returning_garbage() -> None:
+def test_corrupt_payload_fails_instead_of_returning_garbage(registry) -> None:
     """A buffer that is not a kvweave payload makes the deserialize task fail."""
-    processor = _processor("cpu", groups={0: [_SPLIT]})
+    registry.register(
+        _MODEL, 0, [SerdePartInfo("attention", _BLOCK, _HEADS, _HEAD_DIM, False, False)]
+    )
+    processor = _processor("cpu")
     try:
         x = torch.randn(2, 4, 128, _HIDDEN).half()
         layout = MemoryLayoutDesc(shapes=[x.shape], dtypes=[x.dtype])

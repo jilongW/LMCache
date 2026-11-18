@@ -10,10 +10,10 @@ of an L2 adapter spec); nothing reads environment variables or a model
 from __future__ import annotations
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from itertools import count
-from typing import ClassVar, Optional
+from typing import Any, ClassVar, Mapping, Optional
 import threading
 
 # Third Party
@@ -47,6 +47,78 @@ class AttentionPlaneLayout(Enum):
     UNKNOWN = "unknown"
 
 
+@dataclass(frozen=True)
+class ConvQKVSplit:
+    """Widths of the Q/K/V segments packed in a Mamba ``conv_state`` row.
+
+    The row is ``[query(key_dim) | key(key_dim) | value(value_dim)]``.
+    """
+
+    key_dim: int
+    value_dim: int
+
+
+@dataclass(frozen=True)
+class MambaCodecOptions:
+    """Resolved per-substate quantization parameters for Mamba groups.
+
+    ``conv``/``ssm`` scaling and randomized-Hadamard (``rh``) settings are
+    independently configurable; ``asym`` is shared by both sub-states.
+    """
+
+    conv_scaling_method: str
+    conv_rh: bool
+    ssm_scaling_method: str
+    ssm_rh: bool
+    asym: bool
+    conv_qbit: int = 4
+    ssm_qbit: int = 4
+    conv_quant_enabled: bool = True
+    ssm_quant_enabled: bool = True
+    ssm_direct_quant_enabled: bool = True
+    conv_direct_quant_enabled: bool = True
+    conv_qkv_split: ConvQKVSplit = field(
+        default_factory=lambda: ConvQKVSplit(key_dim=0, value_dim=0)
+    )
+    """Filled per group from the engine-reported conv channel segments;
+    never read from user configuration."""
+
+    @classmethod
+    def from_kwargs(cls, kwargs: Mapping[str, Any]) -> "MambaCodecOptions":
+        """Build the Mamba conv/ssm options from the serde's JSON kwargs.
+
+        Recognized keys (all optional): ``conv_scaling_method``,
+        ``ssm_scaling_method`` (default ``per_token``), ``conv_rh``,
+        ``ssm_rh`` (default ``False``), ``mamba_asym`` (default ``False``),
+        ``conv_qbit``, ``ssm_qbit`` (default 4), ``conv_quant_enabled``,
+        ``ssm_quant_enabled``, ``ssm_direct_quant``, ``conv_direct_quant``
+        (default ``True``). The conv Q/K/V split is not configurable: it is
+        reported per group by the engine.
+        """
+        valid = {"per_tensor", "per_channel", "per_token"}
+        conv_scaling = str(kwargs.get("conv_scaling_method", "per_token"))
+        ssm_scaling = str(kwargs.get("ssm_scaling_method", "per_token"))
+        for name, value in (
+            ("conv_scaling_method", conv_scaling),
+            ("ssm_scaling_method", ssm_scaling),
+        ):
+            if value not in valid:
+                raise ValueError(f"{name}={value!r} is not one of {sorted(valid)}")
+        return cls(
+            conv_scaling_method=conv_scaling,
+            conv_rh=bool(kwargs.get("conv_rh", False)),
+            ssm_scaling_method=ssm_scaling,
+            ssm_rh=bool(kwargs.get("ssm_rh", False)),
+            asym=bool(kwargs.get("mamba_asym", False)),
+            conv_qbit=int(kwargs.get("conv_qbit", 4)),
+            ssm_qbit=int(kwargs.get("ssm_qbit", 4)),
+            conv_quant_enabled=bool(kwargs.get("conv_quant_enabled", True)),
+            ssm_quant_enabled=bool(kwargs.get("ssm_quant_enabled", True)),
+            ssm_direct_quant_enabled=bool(kwargs.get("ssm_direct_quant", True)),
+            conv_direct_quant_enabled=bool(kwargs.get("conv_direct_quant", True)),
+        )
+
+
 @dataclass
 class KVWeaveCodecConfig:
     """Typed settings shared by the KVWeave codec and preconditioner."""
@@ -64,6 +136,10 @@ class KVWeaveCodecConfig:
     MAGIC_RAW: ClassVar[bytes] = b"KVW0"
     MAGIC_QUANT: ClassVar[bytes] = b"KVW3"
     MAGIC_QUANT_FUSED: ClassVar[bytes] = b"KVW4"
+    MAMBA_MAGIC: ClassVar[bytes] = b"MQ01"
+    MAMBA_QBIT: ClassVar[int] = 4
+    MAMBA_FLAG_RH: ClassVar[int] = 1
+    MAMBA_FLAG_ASYM: ClassVar[int] = 2
     DEFAULT_BLOCK_SIZE: ClassVar[int] = 64
     DTYPE_TO_CODE: ClassVar[dict[torch.dtype, int]] = {
         torch.float16: 0,
@@ -86,6 +162,7 @@ class KVWeaveCodecConfig:
         "per_token": 1,
         "per_channel": 2,
     }
+    SUBSTATE_TO_CODE: ClassVar[dict[str, int]] = {"conv": 0, "ssm": 1}
     SCALE_IDS: ClassVar = count(1)
 
     def __post_init__(self) -> None:
@@ -112,6 +189,29 @@ class KVWeaveCodecConfig:
             if qbit <= 8
             else elements * 2
         )
+
+    @classmethod
+    def mamba_dtype(cls, dtype_str: str) -> torch.dtype:
+        dtype = getattr(torch, dtype_str.removeprefix("torch."), None)
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"unsupported Mamba wire dtype: {dtype_str!r}")
+        return dtype
+
+    @staticmethod
+    def mamba_layout(
+        substate: str, shape: tuple[int, ...], scaling_method: str
+    ) -> tuple[int, int, int, int]:
+        blocks = max(int(shape[1]), 1)
+        tail = shape[2:]
+        head_dim = max(int(tail[-1]) if tail else 1, 1)
+        middle = max(int(np.prod(tail[:-1])) if len(tail) > 1 else 1, 1)
+        if scaling_method == "per_channel":
+            return blocks, middle, head_dim, head_dim
+        if scaling_method == "per_token":
+            # Token-wise grouping uses one scale per logical token slice
+            # across the non-head_dim axes (blocks * middle).
+            return blocks * middle, 1, head_dim, blocks * middle
+        return blocks, middle, head_dim, 1
 
     def mamba_precond_tensors(self, size: int) -> tuple[torch.Tensor, torch.Tensor]:
         if size <= 0 or size & (size - 1):

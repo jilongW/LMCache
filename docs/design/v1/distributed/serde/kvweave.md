@@ -30,7 +30,10 @@ not touch `StorageManager` or the L2 adapter APIs.
 | `device` | `cpu` | `cpu` or `xpu`; XPU must be available |
 | `num_threads` | `4` | OpenMP threads of the CPU kernels |
 | `kv_fp8_dtype` | none | format of an fp8 (uint8) KV cache; fused layout only |
-| `num_kv_heads`, `head_dim` | `1`, `0` | geometry for groups the config does not describe |
+| `num_kv_heads`, `head_dim` | `1`, `0` | geometry for groups the engine did not describe |
+| `conv_*` / `ssm_*` options | see `MambaCodecOptions.from_kwargs` | per-sub-state scaling, RH, bits |
+| (conv Q/K/V split) | engine-reported | not configurable; a Mamba group whose engine reports no `channel_segments` (non-GDN kinds) is stored raw |
+| `linear_max_size_ratio` | `1.2` | quantize a Mamba chunk only if it is not larger than this × raw |
 | `groups`, `default_group` | none | static per-group facts (see below) |
 | `max_workers` | `1` | serde thread-pool size |
 
@@ -43,6 +46,7 @@ by its `object_group_id`:
 |---|---|---|
 | attention, split K/V | `[2, L, T, H]` | quantize both planes |
 | attention, fused-packed K/V | `[L, T, H]` | fused codec |
+| Mamba / linear state | opaque page view | split into `conv` + `ssm`, each in its own dtype |
 | MLA, unclassified, or not smaller | any | bytes copied through unchanged |
 
 An object group's chunk is one memory object holding **one tensor per kernel
@@ -51,11 +55,27 @@ per part; a single-part chunk is the bare payload.
 
 ### Where the facts come from
 
-Quantizing needs the group's category, head geometry and K/V packing. They are
-given statically in the serde config: `groups` maps an `object_group_id` to one
-spec per part (`cache_category`, `attention_plane_layout`, `num_kv_heads`,
-`head_dim`), and `default_group` describes every other group (by default plain
-split-K/V attention using the serde-level `num_kv_heads` / `head_dim`).
+Quantizing needs the group's category, head geometry, K/V packing and (for
+Mamba) the real conv/ssm byte layout. The engine registration publishes them as
+`SerdePartInfo` into the engine-neutral registry
+`lmcache.v1.distributed.serde.group_info`; the serde interprets them, so the
+registration code stays serde-agnostic.
+
+```
+vLLM worker                      server                         serde
+EngineGroupInfo ──register──►  KernelGroupInfo.serde_part_info() ──► SerdeGroupInfoRegistry
+ cache_category                   (heads/head size from the page          │
+ mamba_real_layout                shape, K/V packing from the KV          ▼
+                                  format spec)                     KVWeaveGroupSpec
+```
+
+- *lmcache-driven* registration (the server holds the engine's tensors) builds
+  the facts from its `KVLayerGroupsManager`.
+- *engine-driven* registration (SHM/inline) carries them in
+  `GroupLayout.serde_part`; workers that predate the field publish nothing, so
+  their groups are stored untransformed.
+- `groups` / `default_group` in the serde config give the same facts statically
+  (for tests, or setups without an engine registration).
 
 ## Size contract
 
@@ -67,6 +87,7 @@ is an exact formula, not a margin:
 ```
 split  [2,L,T,H]: 28 + 2*(4 + 12*S + 4*L) + 2*ceil(L*T*H*qbit/8)
 fused  [L,T,H]  : 25 + 12*S + 4*native_layers + ceil(L*T*H*qbit/8)
+Mamba           : framing + per-sub-state payloads (see estimate_mamba_serialized_size)
 ```
 
 `S` is the scale count of the scaling method. The tests assert the estimate
@@ -93,7 +114,8 @@ header to check.
 
 ```
 serde/kvweave/
-  kvweave_config.py   # AttentionPlaneLayout, KVWeaveCodecConfig
-  kvweave_serde.py    # KVWeaveCodec: the native-kernel attention codec
+  kvweave_config.py   # AttentionPlaneLayout, MambaCodecOptions, KVWeaveCodecConfig
+  kvweave_serde.py    # KVWeaveCodec: the native-kernel codec (attention + Mamba)
   kvweave_l2.py       # per-group routing, Serializer/Deserializer, factory registration
+serde/group_info.py   # SerdePartInfo registry shared with the engine registration
 ```

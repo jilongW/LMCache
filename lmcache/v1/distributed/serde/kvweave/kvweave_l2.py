@@ -12,11 +12,14 @@ routed through a per-group :class:`KVWeaveGroupSpec`:
 
 * ``attention`` + ``split_kv``: ``[2, L, T, H]``, K and V as separate planes.
 * ``attention`` + ``fused_kv``: ``[L, T, H]``, K and V packed on the last axis.
+* ``mamba``: an opaque recurrent-state page view holding a ``conv`` and an
+  ``ssm`` sub-state, each quantized in its own dtype.
 * anything else (MLA, unclassified, or not worth quantizing): the bytes are
   copied through unchanged.
 
-Group facts come from the serde's JSON kwargs (``"groups"`` /
-``"default_group"``).
+Group facts come from the engine's registration (published to the neutral
+``serde.group_info`` registry) and/or from the serde's JSON kwargs
+(``"groups"`` / ``"default_group"``).
 
 Example::
 
@@ -29,15 +32,17 @@ Example::
 from __future__ import annotations
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 import threading
 
 # Third Party
+import msgspec
 import torch
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.common.group_view import MambaSubStateWireLayout
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.serde.async_processor import AsyncSerdeProcessor
 from lmcache.v1.distributed.serde.base import (
@@ -46,9 +51,15 @@ from lmcache.v1.distributed.serde.base import (
     Serializer,
 )
 from lmcache.v1.distributed.serde.factory import register_serde_factory
+from lmcache.v1.distributed.serde.group_info import (
+    SerdePartInfo,
+    get_serde_group_info_registry,
+)
 from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
     AttentionPlaneLayout,
+    ConvQKVSplit,
     KVWeaveCodecConfig,
+    MambaCodecOptions,
 )
 from lmcache.v1.distributed.serde.kvweave.kvweave_serde import KVWeaveCodec
 from lmcache.v1.memory_management import MemoryObj
@@ -59,6 +70,10 @@ _SUPPORTED_DTYPES = frozenset(KVWeaveCodecConfig.DTYPE_TO_CODE) | {torch.uint8}
 
 # Length prefix of each part of a multi-part chunk (int32).
 _FRAME_BYTES = 4
+
+# Mamba is quantized only when the quantized chunk is not larger than this
+# multiple of the raw one (mirrors the L1 path's ``linear_max_size_ratio``).
+_DEFAULT_LINEAR_MAX_SIZE_RATIO = 1.20
 
 
 # ============================================================================
@@ -71,9 +86,11 @@ class KVWeaveGroupSpec:
     """What the codec needs to know about one object group.
 
     Attributes:
-        cache_category: ``"attention"`` or ``"unknown"``
+        cache_category: ``"attention"``, ``"mamba"`` or ``"unknown"``
             (``"unknown"`` groups are copied through unquantized).
         attention_plane_layout: K/V plane layout of an attention group.
+        tokens_per_block: Tokens per paged block (Mamba block count).
+        mamba_layout: ``(conv, ssm)`` real byte layout of a Mamba group.
         num_kv_heads: KV heads of an attention group; ``0`` = use the serde
             default.
         head_dim: Per-head width of an attention group; ``0`` = use the serde
@@ -82,22 +99,62 @@ class KVWeaveGroupSpec:
 
     cache_category: str = "unknown"
     attention_plane_layout: AttentionPlaneLayout = AttentionPlaneLayout.UNKNOWN
+    tokens_per_block: int = 0
+    mamba_layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None = None
     num_kv_heads: int = 0
     head_dim: int = 0
+
+    @classmethod
+    def from_part_info(cls, info: SerdePartInfo) -> "KVWeaveGroupSpec":
+        """Interpret engine-published facts as a codec spec."""
+        if info.cache_category == "mamba":
+            return cls(
+                cache_category="mamba",
+                tokens_per_block=info.tokens_per_block,
+                mamba_layout=info.mamba_real_layout,
+            )
+        if info.cache_category != "attention":
+            return cls()
+        if info.is_mla:
+            plane = AttentionPlaneLayout.MLA
+        elif info.is_fused_packed:
+            plane = AttentionPlaneLayout.FUSED_KV
+        else:
+            plane = AttentionPlaneLayout.SPLIT_KV
+        return cls(
+            cache_category="attention",
+            attention_plane_layout=plane,
+            tokens_per_block=info.tokens_per_block,
+            num_kv_heads=info.num_heads,
+            head_dim=info.head_size,
+        )
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "KVWeaveGroupSpec":
         """Build a spec from a JSON-config dict.
 
         Keys: ``cache_category``, ``attention_plane_layout``,
-        ``num_kv_heads`` and ``head_dim``.
+        ``tokens_per_block``, ``num_kv_heads``, ``head_dim`` and
+        ``mamba_layout`` (a ``[conv, ssm]`` pair of
+        ``{byte_offset, byte_length, dtype_str, shape}`` dicts).
         """
+        layout = raw.get("mamba_layout")
+        mamba_layout = None
+        if layout is not None:
+            if len(layout) != 2:
+                raise ValueError("mamba_layout must be a [conv, ssm] pair")
+            mamba_layout = (
+                msgspec.convert(layout[0], MambaSubStateWireLayout),
+                msgspec.convert(layout[1], MambaSubStateWireLayout),
+            )
         category = str(raw.get("cache_category", "unknown"))
         return cls(
             cache_category=category,
             attention_plane_layout=AttentionPlaneLayout(
                 str(raw.get("attention_plane_layout", "unknown"))
             ),
+            tokens_per_block=int(raw.get("tokens_per_block", 0)),
+            mamba_layout=mamba_layout,
             num_kv_heads=int(raw.get("num_kv_heads", 0)),
             head_dim=int(raw.get("head_dim", 0)),
         )
@@ -112,10 +169,11 @@ class KVWeaveGroupSpec:
 class _Plan:
     """How one chunk of a given group/shape/dtype is (de)serialized."""
 
-    mode: str  # "raw" | "split" | "fused"
+    mode: str  # "raw" | "split" | "fused" | "mamba"
     size: int  # exact upper bound of the serialized bytes
     codec: KVWeaveCodec | None = None
     spec: KVWeaveGroupSpec | None = None
+    mamba_options: MambaCodecOptions | None = None
 
 
 def _raw_nbytes(shape: Sequence[int], dtype: torch.dtype) -> int:
@@ -129,6 +187,72 @@ def _transform_length_ok(length: int) -> bool:
     return length > 0 and not length & (length - 1)
 
 
+def _mamba_rh_length(
+    substate: str,
+    sub_shape: tuple[int, ...],
+    layers: int,
+    blocks: int,
+    scaling_method: str,
+) -> int:
+    per_layer = blocks
+    for dim in sub_shape:
+        per_layer *= int(dim)
+    _, _, _, chunks = KVWeaveCodecConfig.mamba_layout(
+        substate, (layers, blocks, *sub_shape), scaling_method
+    )
+    return max(per_layer // chunks, 1)
+
+
+def _engine_conv_split(spec: KVWeaveGroupSpec) -> ConvQKVSplit | None:
+    """The conv q/k/v split the engine reported for this Mamba group, if any."""
+    assert spec.mamba_layout is not None
+    segments = spec.mamba_layout[0].channel_segments
+    if len(segments) != 3:
+        return None
+    return ConvQKVSplit(key_dim=segments[0], value_dim=segments[2])
+
+
+def _resolve_mamba_rh(
+    spec: KVWeaveGroupSpec,
+    shape: tuple[int, ...],
+    options: MambaCodecOptions,
+    split: ConvQKVSplit,
+) -> MambaCodecOptions:
+    """Drop ``conv_rh``/``ssm_rh`` where the transform length is not 2^k.
+
+    The native RH kernel rejects non-power-of-two lengths; turning RH off per
+    sub-state keeps the serialized size unchanged (it never depends on RH).
+    """
+    assert spec.mamba_layout is not None
+    conv_layout, ssm_layout = spec.mamba_layout
+    layers = int(shape[1]) if len(shape) == 4 else int(shape[0])
+    blocks = max(int(shape[-2]) // spec.tokens_per_block, 1)
+    updates: dict[str, bool] = {}
+    if options.conv_rh:
+        for sub_dim in (split.key_dim, split.key_dim, split.value_dim):
+            length = _mamba_rh_length(
+                "conv",
+                (*conv_layout.shape[:-1], sub_dim),
+                layers,
+                blocks,
+                options.conv_scaling_method,
+            )
+            if not _transform_length_ok(length):
+                updates["conv_rh"] = False
+                break
+    if options.ssm_rh:
+        length = _mamba_rh_length(
+            "ssm", tuple(ssm_layout.shape), layers, blocks, options.ssm_scaling_method
+        )
+        if not _transform_length_ok(length):
+            updates["ssm_rh"] = False
+    return replace(
+        options,
+        conv_rh=updates.get("conv_rh", options.conv_rh),
+        ssm_rh=updates.get("ssm_rh", options.ssm_rh),
+    )
+
+
 def _plane_layout(mode: str, spec: KVWeaveGroupSpec) -> AttentionPlaneLayout | None:
     return spec.attention_plane_layout if mode in ("split", "fused") else None
 
@@ -139,7 +263,7 @@ def encode_chunk_into_with_plan(
     """Encode ``raw`` per ``plan`` straight into ``destination``.
 
     Args:
-        plan: A quantizing plan (``split`` or ``fused``).
+        plan: A quantizing plan (``split``, ``fused`` or ``mamba``).
         raw: The CPU chunk tensor.
         destination: Flat contiguous ``uint8`` buffer of at least ``plan.size``.
 
@@ -148,6 +272,10 @@ def encode_chunk_into_with_plan(
     """
     assert plan.codec is not None and plan.spec is not None
     return plan.codec.encode_chunk_into(
+        "mamba" if plan.mode == "mamba" else "attention",
+        plan.spec.mamba_layout if plan.mode == "mamba" else None,
+        plan.spec.tokens_per_block,
+        plan.mamba_options,
         raw,
         destination,
         attention_plane_layout=_plane_layout(plan.mode, plan.spec),
@@ -159,9 +287,15 @@ class _PlanResolver:
 
     def __init__(self, kwargs: Mapping[str, Any]) -> None:
         self._codec_kwargs = self._build_codec_kwargs(kwargs)
+        self._mamba_options = MambaCodecOptions.from_kwargs(kwargs)
+        self._ratio = float(
+            kwargs.get("linear_max_size_ratio", _DEFAULT_LINEAR_MAX_SIZE_RATIO)
+        )
         self._attention_enabled = bool(kwargs.get("attention_quant_enabled", True))
         self._split_enabled = bool(kwargs.get("split_attention_quant_enabled", True))
         self._fused_enabled = bool(kwargs.get("fused_attention_quant_enabled", True))
+        self._linear_enabled = bool(kwargs.get("linear_quant_enabled", True))
+        self._registry = get_serde_group_info_registry()
         # Static groups from the JSON config: ``object_group_id -> spec`` or
         # ``-> [spec per part]``.
         self._static: dict[int, tuple[KVWeaveGroupSpec, ...]] = {
@@ -241,6 +375,9 @@ class _PlanResolver:
         """
         if key is None:
             return self._default_spec
+        info = self._registry.lookup(key.model_name, key.object_group_id, part)
+        if info is not None:
+            return KVWeaveGroupSpec.from_part_info(info)
         static = self._static.get(key.object_group_id)
         if static is not None and part < len(static):
             return static[part]
@@ -279,6 +416,12 @@ class _PlanResolver:
     def _build_plan(
         self, spec: KVWeaveGroupSpec, shape: tuple[int, ...], dtype: torch.dtype
     ) -> _Plan:
+        if spec.cache_category == "mamba" and self._linear_enabled:
+            # vLLM exposes recurrent pages as opaque int8 byte views; the
+            # Mamba codec reinterprets them through ``mamba_layout``.
+            if dtype not in _SUPPORTED_DTYPES and dtype != torch.int8:
+                return self._raw(shape, dtype, f"unsupported dtype {dtype}")
+            return self._build_mamba_plan(spec, shape, dtype)
         if dtype not in _SUPPORTED_DTYPES:
             return self._raw(shape, dtype, f"unsupported dtype {dtype}")
         if spec.cache_category == "attention" and self._attention_enabled:
@@ -345,6 +488,10 @@ class _PlanResolver:
         probe = torch.zeros(shape, dtype=dtype)
         try:
             codec.encode_chunk(
+                "mamba" if mode == "mamba" else "attention",
+                spec.mamba_layout if mode == "mamba" else None,
+                spec.tokens_per_block,
+                None,
                 probe,
                 attention_plane_layout=_plane_layout(mode, spec),
             )
@@ -358,6 +505,40 @@ class _PlanResolver:
             shape,
         )
         return self._codec(heads, head_dim, False)
+
+    def _build_mamba_plan(
+        self, spec: KVWeaveGroupSpec, shape: tuple[int, ...], dtype: torch.dtype
+    ) -> _Plan:
+        if spec.mamba_layout is None or spec.tokens_per_block <= 0:
+            return self._raw(shape, dtype, "mamba group has no real layout")
+        if len(shape) not in (3, 4):
+            return self._raw(shape, dtype, "mamba chunk is not [L,T,H] / [2,L,T,H]")
+        split = _engine_conv_split(spec)
+        if split is None:
+            return self._raw(shape, dtype, "engine reported no conv q/k/v split")
+        options = replace(self._mamba_options, conv_qkv_split=split)
+        try:
+            options = _resolve_mamba_rh(spec, shape, options, split)
+            size = KVWeaveCodec.estimate_mamba_serialized_size(
+                MemoryLayoutDesc(shapes=[torch.Size(shape)], dtypes=[dtype]),
+                spec.mamba_layout,
+                spec.tokens_per_block,
+                conv_qkv_split=split,
+                scaling_methods=(
+                    options.conv_scaling_method,
+                    options.ssm_scaling_method,
+                ),
+                qbits=(options.conv_qbit, options.ssm_qbit),
+                quant_enabled=(options.conv_quant_enabled, options.ssm_quant_enabled),
+            )
+        except ValueError as exc:
+            return self._raw(shape, dtype, f"mamba size estimate rejected: {exc}")
+        if size > _raw_nbytes(shape, dtype) * self._ratio:
+            return self._raw(shape, dtype, "quantized mamba chunk is not smaller")
+        codec = self._codec(1, 0, False)
+        return _Plan(
+            mode="mamba", size=size, codec=codec, spec=spec, mamba_options=options
+        )
 
 
 # ============================================================================
@@ -471,6 +652,9 @@ class KVWeaveDeserializer(Deserializer):
         spec = plan.spec
         plane = spec.attention_plane_layout if plan.mode in ("split", "fused") else None
         plan.codec.decode_chunk(
+            "mamba" if plan.mode == "mamba" else "attention",
+            spec.mamba_layout if plan.mode == "mamba" else None,
+            spec.tokens_per_block,
             out.shape,
             out.dtype,
             payload,
