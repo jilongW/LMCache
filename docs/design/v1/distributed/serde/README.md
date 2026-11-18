@@ -40,6 +40,7 @@ lmcache/v1/distributed/serde/
   multi.py            # MultiSerializer / MultiDeserializer (tuple-shaped
                       # extension; see "Multi-output extension" below)
   utils.py            # serialized_layout_desc, make_temp_key
+  group_info.py       # SerdePartInfo registry: what each object group holds
   kvweave/            # KVWeave 4/8-bit quantization (see kvweave.md)
 ```
 

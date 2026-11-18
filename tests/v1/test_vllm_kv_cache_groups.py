@@ -806,3 +806,81 @@ def test_conversion_pure_mla_model_replicates_every_group():
     )
 
     assert [(group.tp_replicas, group.dcp_shards) for group in infos] == [(8, 2)]
+
+
+@dataclass
+class _MambaStateSpec(MambaSpec):
+    """A Mamba spec that declares its sub-states, as vLLM's ``MambaSpec`` does."""
+
+    shapes: tuple = ((3, 8192), (32, 128, 128))
+    dtypes: tuple = (torch.float16, torch.float32)
+    page_size_bytes: int = 3 * 8192 * 2 + 32 * 128 * 128 * 4 + 4096
+    mamba_type: object = field(default_factory=lambda: SimpleNamespace(name="MAMBA2"))
+
+
+def test_conversion_reports_gdn_conv_channel_segments() -> None:
+    """A gated-delta-net conv state is ``q | k | v``: the engine reports the
+    channel widths so a quantizer need not be told the model's head dims."""
+    gdn = _MambaStateSpec(block_size=16, mamba_type=SimpleNamespace(name="GDN_ATTN"))
+    infos = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["layer.0"], gdn),
+                MockKVCacheGroup(["layer.1"], _MambaStateSpec(block_size=16)),
+            ]
+        ),
+        _same_shape_caches(["layer.0", "layer.1"]),
+    )
+
+    gdn_conv, gdn_ssm = infos[0].mamba_real_layout
+    assert gdn_conv.channel_segments == (2048, 2048, 4096)
+    assert gdn_ssm.channel_segments == ()
+    # Other Mamba kinds do not share the q|k|v channel order.
+    assert infos[1].mamba_real_layout[0].channel_segments == ()
+
+
+def test_conversion_reports_cache_category_and_mamba_real_layout() -> None:
+    """A quantizing serde needs each group's category and the real byte layout of
+    a Mamba page, whose sub-states differ in dtype (fp16 conv, fp32 ssm)."""
+    infos = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["layer.0"], FullAttentionSpec(block_size=16)),
+                MockKVCacheGroup(["layer.1"], _MambaStateSpec(block_size=16)),
+            ]
+        ),
+        _same_shape_caches(["layer.0", "layer.1"]),
+    )
+
+    assert [info.cache_category for info in infos] == ["attention", "mamba"]
+    assert infos[0].mamba_real_layout is None
+    conv, ssm = infos[1].mamba_real_layout
+    assert (conv.byte_offset, conv.byte_length) == (0, 3 * 8192 * 2)
+    assert (ssm.byte_offset, ssm.byte_length) == (conv.byte_length, 32 * 128 * 128 * 4)
+    assert (conv.dtype_str, ssm.dtype_str) == ("torch.float16", "torch.float32")
+    assert (conv.shape, ssm.shape) == ((3, 8192), (32, 128, 128))
+
+
+def test_conversion_mamba_without_declared_states_has_no_real_layout() -> None:
+    """A spec that does not declare sub-states is still classified, but offers no
+    layout, so a serde falls back to storing it untransformed."""
+    (info,) = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[MockKVCacheGroup(["layer.0"], MambaSpec(block_size=16))]
+        ),
+        _same_shape_caches(["layer.0"]),
+    )
+
+    assert info.cache_category == "mamba"
+    assert info.mamba_real_layout is None
+
+
+def test_conversion_rejects_mamba_with_other_than_two_sub_states() -> None:
+    spec = _MambaStateSpec(
+        block_size=16, shapes=((4,), (4,), (4,)), dtypes=(torch.float16,) * 3
+    )
+    with pytest.raises(ValueError, match="exactly 2 sub-states"):
+        create_engine_group_infos_from_vllm(
+            MockKVCacheConfig(kv_cache_groups=[MockKVCacheGroup(["layer.0"], spec)]),
+            _same_shape_caches(["layer.0"]),
+        )

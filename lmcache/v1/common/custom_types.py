@@ -8,6 +8,7 @@ from typing import Any
 import msgspec
 
 # First Party
+from lmcache.v1.common.group_view import SerdePartInfo
 from lmcache.v1.common.token_codec import (
     TOKEN_STRIDE,
     num_packed_tokens,
@@ -201,6 +202,9 @@ class GroupLayout(msgspec.Struct):
         num_physical_slots: Physical slots stored per chunk, after windowing
             and slot compression. ``None`` retains the legacy one-slot-per-token
             layout derived from ``window_tokens``.
+        serde_part: What the group's chunk tensor holds, for serdes that
+            transform KV data (e.g. quantization). ``None`` from workers that
+            predate it; such groups are stored untransformed.
     """
 
     num_layers: int
@@ -212,6 +216,7 @@ class GroupLayout(msgspec.Struct):
     window_chunks: int = 0
     recurrent: bool = False
     num_physical_slots: int | None = None
+    serde_part: SerdePartInfo | None = None
 
 
 class RegisterEngineDrivenContextPayload(msgspec.Struct):

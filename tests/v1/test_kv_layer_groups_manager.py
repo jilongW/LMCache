@@ -166,6 +166,49 @@ class TestKVLayerGroupsManager:
         assert groups_by_engine_group_idx[0].layer_indices == [0, 2]
         assert groups_by_engine_group_idx[1].layer_indices == [1, 3]
 
+    def test_serde_part_info_describes_what_the_group_chunk_holds(self):
+        """A data-transforming serde is told the group's category, head geometry and
+        K/V packing, plus a Mamba group's real conv/ssm layout."""
+        # First Party
+        from lmcache.v1.common.group_view import MambaSubStateWireLayout
+
+        layout = (
+            MambaSubStateWireLayout(0, 16, "torch.float16", (2, 4)),
+            MambaSubStateWireLayout(16, 32, "torch.float32", (2, 4)),
+        )
+        tensors = [
+            torch.randn(2, 32, 256, 8, 64, dtype=torch.float16) for _ in range(2)
+        ]
+        manager = _build_manager(
+            tensors,
+            engine_group_infos=[
+                EngineGroupInfo(
+                    0, (0,), tokens_per_block=256, cache_category="attention"
+                ),
+                EngineGroupInfo(
+                    1,
+                    (1,),
+                    tokens_per_block=256,
+                    cache_category="mamba",
+                    mamba_real_layout=layout,
+                ),
+            ],
+        )
+
+        attention, mamba = (g.serde_part_info() for g in manager.kernel_groups)
+        assert attention.cache_category == "attention"
+        assert (attention.num_heads, attention.head_size) == (8, 64)
+        assert attention.tokens_per_block == 256
+        assert not attention.is_mla and not attention.is_fused_packed
+        assert attention.mamba_real_layout is None
+        assert mamba.cache_category == "mamba"
+        assert mamba.mamba_real_layout == layout
+
+    def test_serde_part_info_is_unknown_without_engine_group_infos(self):
+        manager = _build_manager([torch.randn(2, 32, 256, 8, 64, dtype=torch.float16)])
+
+        assert manager.kernel_groups[0].serde_part_info().cache_category == "unknown"
+
     def test_build_rejects_bad_engine_group_infos(self):
         tensors = [
             torch.randn(2, 32, 256, 8, 64, dtype=torch.float16) for _ in range(2)

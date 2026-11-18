@@ -23,6 +23,7 @@ from lmcache.v1.common.custom_types import (
     RegisterEngineDrivenContextResponse,
 )
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey, get_request_tags
+from lmcache.v1.distributed.serde.group_info import get_serde_group_info_registry
 from lmcache.v1.mp_observability.event import Event, EventType, next_transfer_key
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext, ShmPoolInfo
 from lmcache.v1.multiprocess.engine_module import (
@@ -460,6 +461,17 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         )
 
         if group_layouts:
+            # A group's chunk is one tensor here, so each group is one object
+            # group with a single part. Workers that predate ``serde_part``
+            # leave it out and their groups pass through serdes untransformed.
+            get_serde_group_info_registry().register_all(
+                payload.model_name,
+                {
+                    gid: [gl.serde_part]
+                    for gid, gl in enumerate(payload.group_layouts)
+                    if gl.serde_part is not None
+                },
+            )
             # The lookup/prefetch path fans its object-group lookups out over
             # the registered AttnWindowDesc's group count. A hybrid-KV worker
             # stores and retrieves ``len(group_layouts)`` object groups, but the

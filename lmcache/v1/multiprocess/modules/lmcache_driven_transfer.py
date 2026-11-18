@@ -27,8 +27,12 @@ from lmcache.v1.distributed.api import (
     ObjectKey,
     ShardReplicationDesc,
 )
+from lmcache.v1.distributed.serde.group_info import (
+    SerdePartInfo,
+    get_serde_group_info_registry,
+)
 from lmcache.v1.distributed.storage_manager import L1WriteCompletion, l1_owners_of
-from lmcache.v1.kv_layer_groups import ObjectGroupInfo
+from lmcache.v1.kv_layer_groups import KVLayerGroupsManager, ObjectGroupInfo
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType, next_transfer_key
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
@@ -101,6 +105,28 @@ def get_layout_desc(
     ]
     shapes, dtypes = zip(*shapes_and_dtypes, strict=False)
     return MemoryLayoutDesc(shapes=list(shapes), dtypes=list(dtypes))
+
+
+def build_serde_part_infos(
+    kv_groups_manager: KVLayerGroupsManager,
+) -> dict[int, list[SerdePartInfo]]:
+    """Describe, per object group, what each tensor of its chunk holds.
+
+    Serdes that transform KV data (e.g. quantization) need this to tell
+    attention K/V from recurrent state and to know the head geometry.
+
+    Args:
+        kv_groups_manager: The registration's kernel/object group partition.
+
+    Returns:
+        ``object_group_id -> [SerdePartInfo per kernel group]`` in the order of
+        the object's tensors (see :func:`get_layout_desc`).
+    """
+    kernel_groups = kv_groups_manager.kernel_groups
+    return {
+        gid: [kernel_groups[idx].serde_part_info() for idx in og.kernel_group_indices]
+        for gid, og in enumerate(kv_groups_manager.object_groups)
+    }
 
 
 def all_null_chunk_masks(
@@ -597,6 +623,10 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             shard_replication_desc=_fold_shard_replication_desc(
                 kv_groups_manager.object_groups, engine_group_infos
             ),
+        )
+
+        get_serde_group_info_registry().register_all(
+            model_name, build_serde_part_infos(kv_groups_manager)
         )
 
         with self._lock:

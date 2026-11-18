@@ -29,6 +29,11 @@ class _FakeKVLayerGroupsManager:
         """Nothing replicated: no object groups to fold."""
         return []
 
+    @property
+    def kernel_groups(self) -> list[Any]:
+        """No kernel groups: nothing for a serde to describe."""
+        return []
+
 
 class _FakeGPUContext:
     """Small stand-in for GPUCacheContext used by registration tests."""

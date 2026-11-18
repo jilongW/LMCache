@@ -23,6 +23,69 @@ from typing import cast
 import msgspec
 
 
+class MambaSubStateWireLayout(msgspec.Struct, frozen=True):
+    """Wire-safe byte layout of one Mamba sub-state (``conv`` or ``ssm``).
+
+    Mirrors the engine integration's per-sub-state layout in msgspec-friendly
+    form (``dtype`` as its ``str()``) so it can travel inside
+    :class:`EngineGroupInfo` over the ``REGISTER_KV_CACHE`` IPC payload.
+    """
+
+    byte_offset: int
+    """Offset of this sub-state's real data from the page base, in bytes.
+    Identical for every block (all blocks share one page layout)."""
+
+    byte_length: int
+    """Length of this sub-state's real per-block data, in bytes."""
+
+    dtype_str: str
+    """This sub-state's own dtype, as ``str(torch.dtype)`` (e.g.
+    ``"torch.float32"``), independent of the other sub-state in the page."""
+
+    shape: tuple[int, ...]
+    """This sub-state's real per-block shape (e.g. ``(num_heads, head_dim)``
+    for ``ssm_state``)."""
+
+    channel_segments: tuple[int, ...] = ()
+    """Widths of the contiguous channel segments along this sub-state's
+    channel axis, in order, when the engine knows them (a gated-delta-net
+    ``conv_state`` carries ``(key_dim, key_dim, value_dim)`` for its q, k, v
+    channels). Empty when unknown. Defaulted field: wire-compatible."""
+
+
+class SerdePartInfo(msgspec.Struct, frozen=True):
+    """What one tensor (kernel group) of an object group's chunk holds.
+
+    Published by the engine registration so a serde that transforms KV data
+    (e.g. quantization) knows what it is transforming, without the
+    registration knowing about any particular serde.
+    """
+
+    cache_category: str = "unknown"
+    """``"attention"``, ``"mamba"`` or ``"unknown"``."""
+
+    tokens_per_block: int = 0
+    """Logical tokens per paged block."""
+
+    num_heads: int = 0
+    """KV heads held by this worker (``0`` = unknown)."""
+
+    head_size: int = 0
+    """Per-head width as the engine pages it; for a fused-packed format this
+    already spans K and V (``0`` = unknown)."""
+
+    is_mla: bool = False
+    """The format is a single latent plane (MLA), not per-head K/V."""
+
+    is_fused_packed: bool = False
+    """K and V are packed into one trailing axis."""
+
+    mamba_real_layout: (
+        tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None
+    ) = None
+    """``(conv, ssm)`` byte layout of a ``"mamba"`` page."""
+
+
 class EngineGroupInfo(msgspec.Struct, frozen=True):
     """One LMCache KV group: layers of one engine group that share a copy kernel.
 
@@ -78,6 +141,20 @@ class EngineGroupInfo(msgspec.Struct, frozen=True):
     (decode context parallelism): rank ``w`` holds shard ``w % dcp_shards``,
     shared by ``tp_replicas // dcp_shards`` ranks. ``1`` without DCP.
     Defaulted field: wire-compatible."""
+
+    cache_category: str = "unknown"
+    """Original engine cache category of this group: ``"attention"``,
+    ``"mamba"`` or ``"unknown"``. Lets a quantizing serde tell Mamba groups
+    from attention groups even when the registered page layout looks
+    attention-shaped. Distinct from ``recurrent_state`` (a two-state flag used
+    for null-chunk masking). Defaulted field: wire-compatible."""
+
+    mamba_real_layout: (
+        tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None
+    ) = None
+    """``(conv, ssm)`` real byte layout for a ``"mamba"`` group, or ``None``.
+    Lets a codec read each sub-state's bytes in its own dtype rather than the
+    single addressing dtype of the page view. Defaulted field: wire-compatible."""
 
 
 def num_engine_groups(groups: Sequence[EngineGroupInfo]) -> int:

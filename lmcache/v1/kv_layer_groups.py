@@ -22,7 +22,11 @@ import lmcache.lmcache_native as lmcache_native
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.v1.common.group_view import EngineGroupInfo
+    from lmcache.v1.common.group_view import (
+        EngineGroupInfo,
+        MambaSubStateWireLayout,
+        SerdePartInfo,
+    )
     from lmcache.v1.common.utils import DiscoverableKVCache
 
 logger = init_logger(__name__)
@@ -220,6 +224,37 @@ class KernelGroupInfo:
     """Whether this group's pages hold recurrent state snapshots (Mamba/GDN)
     rather than per-token attention KV. The window reflects restore
     semantics, so ``full_sw_kv`` forcing must not widen it."""
+    cache_category: str = "unknown"
+    """Engine cache category (``"attention"``, ``"mamba"`` or ``"unknown"``),
+    from ``EngineGroupInfo.cache_category``."""
+    mamba_real_layout: (
+        tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None
+    ) = None
+    """``(conv, ssm)`` byte layout of a Mamba group, from
+    ``EngineGroupInfo.mamba_real_layout``."""
+
+    def serde_part_info(self) -> "SerdePartInfo":
+        """Describe this group's chunk tensor for a data-transforming serde.
+
+        Returns:
+            The group's category, head geometry, KV-format facts and Mamba
+            layout.
+        """
+        # First Party
+        from lmcache.v1.common.group_view import SerdePartInfo
+        from lmcache.v1.common.kv_format import get_spec_class
+
+        assert self.engine_kv_format is not None
+        spec = get_spec_class(self.engine_kv_format)
+        return SerdePartInfo(
+            cache_category=self.cache_category,
+            tokens_per_block=self.tokens_per_block,
+            num_heads=self.shape_desc.nh,
+            head_size=self.shape_desc.hs,
+            is_mla=spec.is_mla,
+            is_fused_packed=spec.is_fused_packed,
+            mamba_real_layout=self.mamba_real_layout,
+        )
 
     def __repr__(self) -> str:
         if not self.layer_indices:
@@ -462,6 +497,12 @@ class KVLayerGroupsManager:
                     ),
                     recurrent_state=(
                         info.recurrent_state if info is not None else False
+                    ),
+                    cache_category=info.cache_category
+                    if info is not None
+                    else "unknown",
+                    mamba_real_layout=(
+                        info.mamba_real_layout if info is not None else None
                     ),
                 )
             )

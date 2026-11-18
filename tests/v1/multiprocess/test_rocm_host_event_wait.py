@@ -164,6 +164,7 @@ def _build(
                 num_object_groups=1,
                 num_kernel_groups=1,
                 object_groups=[SimpleNamespace(kernel_group_indices=[0])],
+                kernel_groups=[SimpleNamespace(serde_part_info=lambda: None)],
                 get_attn_desc=lambda: SimpleNamespace(
                     num_chunks_in_sw=[-1], group_kinds=()
                 ),

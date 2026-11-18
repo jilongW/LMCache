@@ -4,6 +4,7 @@
 # First Party
 from lmcache.v1.common.group_view import (
     EngineGroupInfo,
+    MambaSubStateWireLayout,
     engine_group_layer_indices,
     expand_engine_block_ids,
     get_engine_group_indices,
@@ -15,6 +16,7 @@ from lmcache.v1.common.group_view import (
 
 __all__ = [
     "EngineGroupInfo",
+    "MambaSubStateWireLayout",
     "engine_group_layer_indices",
     "expand_engine_block_ids",
     "get_engine_group_indices",

@@ -1846,6 +1846,56 @@ def test_register_multigroup_registers_group_windows_and_kinds(
     assert response.null_block_id == 7
 
 
+def test_register_publishes_serde_part_of_each_group(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """A group that reports what its chunk holds is published for data-transforming
+    serdes under its group index; a worker that predates the field publishes
+    nothing, so its group is stored untransformed."""
+    # First Party
+    from lmcache.v1.common.custom_types import (
+        GroupLayout,
+        RegisterEngineDrivenContextPayload,
+    )
+    from lmcache.v1.common.group_view import SerdePartInfo
+    from lmcache.v1.distributed.serde.group_info import get_serde_group_info_registry
+
+    registry = get_serde_group_info_registry()
+    registry.clear()
+    part = SerdePartInfo("attention", 4, num_heads=2, head_size=8)
+
+    def _group(serde_part: SerdePartInfo | None) -> GroupLayout:
+        return GroupLayout(
+            num_layers=1,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            tokens_per_block=4,
+            serde_part=serde_part,
+        )
+
+    module, _, _, _ = server_module_factory(chunk_size=16)
+    module.register_kv_cache_engine_driven_context(
+        RegisterEngineDrivenContextPayload(
+            instance_id=1,
+            model_name="serde-model",
+            world_size=1,
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+            group_layouts=[_group(part), _group(None)],
+        )
+    )
+
+    try:
+        assert registry.lookup("serde-model", 0, 0) == part
+        assert registry.lookup("serde-model", 1, 0) is None
+    finally:
+        registry.clear()
+
+
 @pytest.mark.parametrize(
     ("use_mla", "kv_sizes", "expected_planes"),
     [

@@ -7,14 +7,18 @@ from __future__ import annotations
 # Standard
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
+import math
 
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.common.utils import LayoutHints
 
+# Third Party
+import torch
+
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.common.group_view import EngineGroupInfo
+from lmcache.v1.common.group_view import EngineGroupInfo, MambaSubStateWireLayout
 
 logger = init_logger(__name__)
 
@@ -397,6 +401,186 @@ def _resolve_per_layer_tp_replicated(
     return per_layer_tp_replicated
 
 
+def _cache_spec_category(spec: Any) -> str:
+    """Classify a vLLM KV cache spec as ``"mamba"``, ``"attention"`` or ``"unknown"``.
+
+    A quantizing serde dispatches on this, so a layer it cannot classify is
+    ``"unknown"`` (never quantized) rather than defaulting to attention.
+    """
+    if spec is None:
+        return "unknown"
+    if _is_mamba_spec(spec):
+        return "mamba"
+    return "attention"
+
+
+def _mamba_real_layout_wire(
+    spec: Any,
+) -> tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None:
+    """Return a Mamba spec's real ``(conv, ssm)`` byte layout.
+
+    vLLM declares ``conv_state`` and ``ssm_state`` independently and may give
+    them different dtypes (e.g. fp16 conv and fp32 ssm), so a codec has to read
+    each region with its own dtype rather than the single addressing dtype of
+    the flattened page view.
+
+    Args:
+        spec: A vLLM ``MambaSpec``.
+
+    Returns:
+        The wire-encoded layout, or ``None`` when ``spec`` declares no
+        ``shapes``/``dtypes`` (a spec kind reusing the Mamba category).
+
+    Raises:
+        ValueError: If the spec declares other than two sub-states, or their
+            real bytes exceed the page size.
+    """
+    shapes = getattr(spec, "shapes", None)
+    dtypes = getattr(spec, "dtypes", None)
+    if shapes is None or dtypes is None:
+        return None
+    if len(shapes) != 2 or len(dtypes) != 2:
+        raise ValueError(
+            f"expected a Mamba spec with exactly 2 sub-states (conv_state, "
+            f"ssm_state), got {len(shapes)} shapes and {len(dtypes)} dtypes"
+        )
+    sizes = [
+        math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        for shape, dtype in zip(shapes, dtypes, strict=True)
+    ]
+    if sum(sizes) > spec.page_size_bytes:
+        raise ValueError(
+            f"Mamba conv_state + ssm_state real bytes ({sum(sizes)}) exceed the "
+            f"page size ({spec.page_size_bytes} bytes)"
+        )
+    offsets = (0, sizes[0])
+    segments = (_gdn_conv_channel_segments(spec), ())
+    conv, ssm = (
+        MambaSubStateWireLayout(
+            byte_offset=offsets[i],
+            byte_length=sizes[i],
+            dtype_str=str(dtypes[i]),
+            shape=tuple(shapes[i]),
+            channel_segments=segments[i],
+        )
+        for i in range(2)
+    )
+    return conv, ssm
+
+
+def _gdn_conv_channel_segments(spec: Any) -> tuple[int, ...]:
+    """Return the ``(key, key, value)`` channel widths of a GDN ``conv_state``.
+
+    vLLM lays a gated-delta-net conv state out as ``q | k | v`` channels with
+    ``conv_dim = 2 * key_dim + value_dim``, and the ``ssm_state`` as
+    ``(num_v_heads, head_v_dim, head_k_dim)``, so ``value_dim`` is
+    ``num_v_heads * head_v_dim`` and ``key_dim`` is the rest of ``conv_dim``.
+
+    Args:
+        spec: A vLLM ``MambaSpec``.
+
+    Returns:
+        ``(key_dim, key_dim, value_dim)``, or ``()`` for any other Mamba kind.
+
+    Raises:
+        ValueError: If a GDN spec's shapes do not satisfy the layout above.
+    """
+    if getattr(spec.mamba_type, "name", None) != "GDN_ATTN":
+        return ()
+    conv_shape, ssm_shape = spec.shapes
+    conv_dim = max(conv_shape)
+    value_dim = ssm_shape[0] * ssm_shape[1]
+    key_dim, remainder = divmod(conv_dim - value_dim, 2)
+    if len(ssm_shape) != 3 or key_dim <= 0 or remainder:
+        raise ValueError(
+            f"GDN conv_state {tuple(conv_shape)} / ssm_state {tuple(ssm_shape)} "
+            "do not match conv_dim = 2 * key_dim + num_v_heads * head_v_dim"
+        )
+    return (key_dim, key_dim, value_dim)
+
+
+def _resolve_per_layer_cache_categories(
+    vllm_groups: Sequence[Any],
+    layer_to_idx: Mapping[str, int],
+    num_layers: int,
+) -> list[str]:
+    """Resolve each registered KV tensor's cache category.
+
+    Args:
+        vllm_groups: vLLM KV cache groups.
+        layer_to_idx: Layer name to registered tensor index mapping.
+        num_layers: Number of registered KV tensors.
+
+    Returns:
+        A list of length ``num_layers`` of ``"mamba"``, ``"attention"`` or
+        ``"unknown"`` (layers no group references).
+    """
+    categories = ["unknown"] * num_layers
+    for group in vllm_groups:
+        for name, layer_spec in group_layer_specs(group).items():
+            categories[layer_to_idx[name]] = _cache_spec_category(layer_spec)
+    return categories
+
+
+def _resolve_per_layer_mamba_real_layouts(
+    vllm_groups: Sequence[Any],
+    layer_to_idx: Mapping[str, int],
+    num_layers: int,
+) -> list[tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None]:
+    """Resolve each registered KV tensor's Mamba ``(conv, ssm)`` layout.
+
+    Args:
+        vllm_groups: vLLM KV cache groups.
+        layer_to_idx: Layer name to registered tensor index mapping.
+        num_layers: Number of registered KV tensors.
+
+    Returns:
+        A list of length ``num_layers``: the layout for Mamba layers, ``None``
+        for every other layer.
+    """
+    layouts: list[tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None] = [
+        None
+    ] * num_layers
+    for group in vllm_groups:
+        for name, layer_spec in group_layer_specs(group).items():
+            if _cache_spec_category(layer_spec) == "mamba":
+                layouts[layer_to_idx[name]] = _mamba_real_layout_wire(layer_spec)
+    return layouts
+
+
+def _merge_layer_cache_categories(categories: list[str], indices: list[int]) -> str:
+    """Return the cache category shared by one LMCache group's layers.
+
+    Raises:
+        ValueError: If the layers disagree.
+    """
+    merged = {categories[idx] for idx in indices}
+    if len(merged) != 1:
+        raise ValueError(
+            f"Layers with indices {indices} have different cache categories "
+            f"{merged}, but they are in the same group."
+        )
+    return merged.pop()
+
+
+def _merge_layer_mamba_real_layouts(
+    layouts: list[tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None],
+    indices: list[int],
+) -> tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None:
+    """Return the Mamba layout shared by one LMCache group's layers.
+
+    Raises:
+        ValueError: If the layers disagree.
+    """
+    merged = {layouts[idx] for idx in indices}
+    if len(merged) != 1:
+        raise ValueError(
+            f"Layers with indices {indices} have different Mamba real layouts, "
+            "but they are in the same group."
+        )
+    return merged.pop()
+
+
 def _merge_layer_recurrent(per_layer_recurrent: list[bool], indices: list[int]) -> bool:
     """Merge the per-layer recurrent-state flags of one LMCache group.
 
@@ -544,6 +728,10 @@ def create_engine_group_infos_from_vllm(
     per_layer_sw_size = [-1] * num_layers
     per_layer_recurrent = [False] * num_layers
     per_layer_tp_replicated = [False] * num_layers
+    per_layer_cache_category = ["unknown"] * num_layers
+    per_layer_mamba_real_layout: list[
+        tuple[MambaSubStateWireLayout, MambaSubStateWireLayout] | None
+    ] = [None] * num_layers
     if vllm_groups:
         per_layer_group_idx = [EXCLUDED_ENGINE_GROUP] * num_layers
         for engine_group_id, group in enumerate(vllm_groups):
@@ -565,6 +753,12 @@ def create_engine_group_infos_from_vllm(
             vllm_groups, layer_to_idx, num_layers
         )
         per_layer_tp_replicated = _resolve_per_layer_tp_replicated(
+            vllm_groups, layer_to_idx, num_layers
+        )
+        per_layer_cache_category = _resolve_per_layer_cache_categories(
+            vllm_groups, layer_to_idx, num_layers
+        )
+        per_layer_mamba_real_layout = _resolve_per_layer_mamba_real_layouts(
             vllm_groups, layer_to_idx, num_layers
         )
 
@@ -619,6 +813,12 @@ def create_engine_group_infos_from_vllm(
                 # --separate-object-groups, after the regular groups.
                 extra_object_group_tag=aux_group_tags.get(identity.engine_group_idx, 0),
                 recurrent_state=_merge_layer_recurrent(per_layer_recurrent, indices),
+                cache_category=_merge_layer_cache_categories(
+                    per_layer_cache_category, indices
+                ),
+                mamba_real_layout=_merge_layer_mamba_real_layouts(
+                    per_layer_mamba_real_layout, indices
+                ),
                 tp_replicas=kv_tp_size if replicated else 1,
                 # DCP splits a replicated group's tokens across its replicas.
                 dcp_shards=dcp_size if replicated else 1,
