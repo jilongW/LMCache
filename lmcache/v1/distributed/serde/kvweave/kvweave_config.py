@@ -182,6 +182,44 @@ def _env_num_threads(num_groups: int) -> int:
 
 
 @dataclass(frozen=True)
+class SvdOptions:
+    """Parameters of the spectral (SVD) ssm codec, ``LMCACHE_MP_KVWEAVE_SSM_SVD_*`` (see ``env_vars.md``).
+
+    Implemented by ``kvweave.gdn`` (XPU kernels); only used when ``MambaCodecOptions.ssm_codec == "svd"``.
+    """
+
+    budget_bits: float = 3.15
+    r_max: int = 96
+    weights: str = "diag"
+    weights_path: str = ""
+    eps_abs: float = 1e-9
+    max_sweeps: int = 20
+
+    @classmethod
+    def from_env(cls) -> "SvdOptions":
+        prefix = "LMCACHE_MP_KVWEAVE_SSM_SVD_"
+        opts = cls(
+            budget_bits=float(os.environ.get(prefix + "BUDGET_BITS", "3.15")),
+            r_max=int(os.environ.get(prefix + "R_MAX", "96")),
+            weights=os.environ.get(prefix + "WEIGHTS", "diag"),
+            weights_path=os.environ.get(prefix + "WEIGHTS_PATH", ""),
+            eps_abs=float(os.environ.get(prefix + "EPS_ABS", "1e-9")),
+            max_sweeps=int(os.environ.get(prefix + "MAX_SWEEPS", "20")),
+        )
+        if opts.weights not in {"none", "diag"}:
+            raise ValueError(f"{prefix}WEIGHTS={opts.weights!r} is not one of ['diag', 'none']")
+        return opts
+
+
+def model_layer_types() -> list[str]:
+    """Per-layer type list (``linear_attention`` / ``full_attention``) from ``{MODEL_PATH}/{MODEL}/config.json``."""
+    config_path = os.path.join(os.environ.get("MODEL_PATH", ""), os.environ.get("MODEL", ""), "config.json")
+    with open(config_path) as f:
+        config = json.load(f)
+    return list(config.get("text_config", config)["layer_types"])
+
+
+@dataclass(frozen=True)
 class MambaCodecOptions:
     """Resolved per-substate quantization parameters for Mamba groups.
 
@@ -204,6 +242,12 @@ class MambaCodecOptions:
     conv_qkv_split: ConvQKVSplit = field(
         default_factory=lambda: ConvQKVSplit(key_dim=2048, value_dim=4096)
     )
+    # ssm encoding: "q4" (the native per-substate quantization above) or "svd" (spectral mixed-precision, ``ssm_svd``).
+    # ``ssm_layer_ids`` (the weight tables' layer index of every layer of one group's chunk) is resolved per group at
+    # register() time, only for "svd".
+    ssm_codec: str = "default"
+    ssm_svd: SvdOptions | None = None
+    ssm_layer_ids: tuple[int, ...] | None = None
 
     @classmethod
     def from_env(cls) -> "MambaCodecOptions":
@@ -257,6 +301,9 @@ class MambaCodecOptions:
             "LMCACHE_MP_KVWEAVE_CONV_SCALING_METHOD", "per_token"
         )
         conv_rh = _env_flag("LMCACHE_MP_KVWEAVE_CONV_RH", linear_rh)
+        ssm_codec = os.environ.get("LMCACHE_MP_KVWEAVE_SSM_CODEC", "default")
+        if ssm_codec not in {"default", "svd"}:
+            raise ValueError(f"LMCACHE_MP_KVWEAVE_SSM_CODEC={ssm_codec!r} is not one of ['default', 'svd']")
         text_config = _load_model_text_config()
         conv_qkv_split = ConvQKVSplit(
             key_dim=text_config["linear_key_head_dim"]
@@ -287,6 +334,8 @@ class MambaCodecOptions:
                 "LMCACHE_MP_KVWEAVE_CONV_DIRECT_QUANT", True
             ),
             conv_qkv_split=conv_qkv_split,
+            ssm_codec=ssm_codec,
+            ssm_svd=SvdOptions.from_env() if ssm_codec == "svd" else None,
         )
 
 

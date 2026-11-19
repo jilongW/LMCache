@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import struct
+import threading
 from typing import Optional
 
 import numpy as np
@@ -16,6 +17,7 @@ from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
     ConvQKVSplit,
     KVWeaveCodecConfig,
     MambaCodecOptions,
+    SvdOptions,
 )
 from lmcache.v1.multiprocess.group_view import MambaSubStateWireLayout
 
@@ -77,6 +79,32 @@ class _KVShape:
 class MambaChunkSplit:
     conv: torch.Tensor
     ssm: torch.Tensor
+
+
+_SVD_CODECS: dict = {}
+_SVD_CODECS_LOCK = threading.Lock()
+_SVD_LAST_OPTIONS: list = []   # options of the last codec built: decode (a static path without options) reuses their weights
+
+
+def _svd_codec(options):
+    """The ``kvweave.gdn`` spectral ssm codec for ``options`` (SvdOptions); built once per option set (the weight tables
+    stay resident on the device).  Needs the kvweave spectral XPU kernels."""
+    with _SVD_CODECS_LOCK:
+        codec = _SVD_CODECS.get(options)
+        if codec is None:
+            from kvweave.gdn import xpu
+
+            if not xpu.available():
+                raise RuntimeError(
+                    "LMCACHE_MP_KVWEAVE_SSM_CODEC=svd needs the kvweave spectral XPU kernels "
+                    "(kvweave_quant_xpu.spectral_encode_chunk) and an XPU device"
+                )
+            _SVD_LAST_OPTIONS[:] = [options]
+            codec = _SVD_CODECS[options] = xpu.XpuSpectralCodec.from_options(
+                options.weights, options.weights_path or None, options.budget_bits, options.r_max,
+                options.eps_abs, options.max_sweeps,
+            )
+        return codec
 
 
 class _KVWeaveCodec:
@@ -333,22 +361,35 @@ class _KVWeaveCodec:
         mamba_layout: tuple[MambaSubStateWireLayout, MambaSubStateWireLayout],
         mamba_options: MambaCodecOptions,
         blocks_per_chunk: int,
+        for_decode: bool = False,
     ) -> bool:
         """Whether Mamba quant / dequant can read or write paged pages in place.
 
         Needs XPU, both sub-states quantized (and ssm not in the raw-fp16
         fallback), per_token or per_channel scaling, element-aligned sub-state
         offsets, and every sub-state's quantization chunk to fit the kernel's SLM
-        path (or the tiny-chunk kernels).
+        path (or the tiny-chunk kernels).  The spectral (svd) ssm codec is encoded
+        and decoded in place too (``spectral_encode_chunk_paged`` /
+        ``spectral_decode_chunk_paged``: 128 x 128 heads, element-aligned offset).
         """
+        svd = mamba_options.ssm_codec == "svd"
         if (
             self.device != "xpu"
             or not hasattr(self.native, "kvweave_paged_state_supported")
             or not (mamba_options.conv_quant_enabled and mamba_options.ssm_quant_enabled)
-            or mamba_options.ssm_qbit == 16
+            or (mamba_options.ssm_qbit == 16 and not svd)
         ):
             return False
         conv_layout, ssm_layout = mamba_layout
+        if svd and (
+            not hasattr(
+                self.native,
+                "spectral_decode_chunk_paged" if for_decode else "spectral_encode_chunk_paged",
+            )
+            or tuple(ssm_layout.shape[1:]) != (128, 128)
+            or ssm_layout.byte_offset % KVWeaveCodecConfig.mamba_dtype(ssm_layout.dtype_str).itemsize
+        ):
+            return False
         split = mamba_options.conv_qkv_split
         # (layout, scaling method, row widths): conv is quantized as three Q/K/V
         # segments, each its own row width; ssm is a single state.
@@ -361,6 +402,8 @@ class _KVWeaveCodec:
             (ssm_layout, mamba_options.ssm_scaling_method, (int(ssm_layout.shape[-1]),)),
         )
         for layout, method, widths in states:
+            if svd and layout is ssm_layout:
+                continue  # the spectral kernel gathers the ssm itself; no quantization-chunk geometry applies
             if method not in {"per_token", "per_channel"}:
                 return False
             itemsize = KVWeaveCodecConfig.mamba_dtype(layout.dtype_str).itemsize
@@ -404,7 +447,9 @@ class _KVWeaveCodec:
         return (
             self.paged_direct_decode
             and hasattr(self.native, "kvweave_dequantize_mamba_state_paged")
-            and self._paged_mamba_geometry_ok(mamba_layout, mamba_options, blocks_per_chunk)
+            and self._paged_mamba_geometry_ok(
+                mamba_layout, mamba_options, blocks_per_chunk, for_decode=True
+            )
         )
 
     def serialize_mamba_paged_into(
@@ -479,6 +524,15 @@ class _KVWeaveCodec:
         ssm_dtype = KVWeaveCodecConfig.mamba_dtype(ssm_layout.dtype_str)
         conv_segments = (split.key_dim, split.key_dim, split.value_dim)
 
+        def svd_ssm_payload(target: torch.Tensor) -> int:
+            """Spectral ssm: gathered from the pages and encoded on the device, framed GSP1 copied into ``target``."""
+            if mamba_options.ssm_layer_ids is None:
+                raise RuntimeError("ssm_codec='svd' needs MambaCodecOptions.ssm_layer_ids (set at register())")
+            return _svd_codec(mamba_options.ssm_svd).encode_framed_paged(
+                layer_ptrs, block_ids, num_blocks, page_stride_bytes, ssm_layout.byte_offset, ssm_dtype,
+                int(ssm_layout.shape[0]), mamba_options.ssm_layer_ids, target,
+            )
+
         dest = out.view(-1)
         if dest.dtype == torch.uint8 and dest.device.type == "cpu" and dest.is_contiguous():
             # Zero-copy assembly: every sub-state is written by the native call straight
@@ -518,14 +572,19 @@ class _KVWeaveCodec:
             length_pos = position
             reserve(position, 5)
             position += 4
-            frame[position] = 1  # ssm payload flag: quantized
-            position += 1
-            written = state_payload(
-                "ssm", ssm_dtype, tuple(ssm_layout.shape), ssm_layout.byte_offset,
-                int(ssm_layout.shape[-1]) * ssm_dtype.itemsize,
-                mamba_options.ssm_scaling_method, mamba_options.ssm_rh,
-                mamba_options.ssm_qbit, dest[position:],
-            )
+            if mamba_options.ssm_codec == "svd":
+                frame[position] = 3  # ssm payload flag: spectral (svd), framed GSP1
+                position += 1
+                written = svd_ssm_payload(dest[position:])
+            else:
+                frame[position] = 1  # ssm payload flag: quantized
+                position += 1
+                written = state_payload(
+                    "ssm", ssm_dtype, tuple(ssm_layout.shape), ssm_layout.byte_offset,
+                    int(ssm_layout.shape[-1]) * ssm_dtype.itemsize,
+                    mamba_options.ssm_scaling_method, mamba_options.ssm_rh,
+                    mamba_options.ssm_qbit, dest[position:],
+                )
             struct.pack_into(">I", frame, length_pos, written + 1)
             return position + written
 
@@ -542,14 +601,24 @@ class _KVWeaveCodec:
                 )
             )
             segment_start += width
-        ssm_payload = state_payload(
-            "ssm", ssm_dtype, tuple(ssm_layout.shape), ssm_layout.byte_offset,
-            int(ssm_layout.shape[-1]) * ssm_dtype.itemsize,
-            mamba_options.ssm_scaling_method, mamba_options.ssm_rh,
-            mamba_options.ssm_qbit,
-        )
+        if mamba_options.ssm_codec == "svd":
+            from kvweave.gdn.format import framed_upper_bound
+
+            heads = int(ssm_layout.shape[0])
+            scratch = torch.empty(
+                framed_upper_bound(layers, blocks, heads, 128, 128, mamba_options.ssm_svd.budget_bits),
+                dtype=torch.uint8,
+            )
+            ssm_flag, ssm_payload = b"\x03", bytes(memoryview(scratch.numpy())[: svd_ssm_payload(scratch)])
+        else:
+            ssm_flag, ssm_payload = b"\x01", state_payload(
+                "ssm", ssm_dtype, tuple(ssm_layout.shape), ssm_layout.byte_offset,
+                int(ssm_layout.shape[-1]) * ssm_dtype.itemsize,
+                mamba_options.ssm_scaling_method, mamba_options.ssm_rh,
+                mamba_options.ssm_qbit,
+            )
         payload = self.pack_mamba_payloads(
-            b"\x01" + self.pack_conv_qkv_payloads(*conv_parts), b"\x01" + ssm_payload
+            b"\x01" + self.pack_conv_qkv_payloads(*conv_parts), ssm_flag + ssm_payload
         )
         return self._copy_payload_into(payload, out)
 
@@ -589,7 +658,8 @@ class _KVWeaveCodec:
         else:
             blob = self._tensor_bytes(src)
         conv_payload, ssm_payload = self.unpack_mamba_payloads(blob)
-        if conv_payload[0] != 1 or ssm_payload[0] != 1:
+        svd_ssm = ssm_payload[0] == 3   # spectral ssm: framed GSP1, decoded by the spectral kernel
+        if conv_payload[0] != 1 or ssm_payload[0] not in (1, 3):
             raise ValueError("paged Mamba decode needs both sub-states quantized")
         conv_layout, ssm_layout = mamba_layout
         layers = int(layer_ptrs.numel())
@@ -636,6 +706,16 @@ class _KVWeaveCodec:
                 f"conv segments cover {segment_start} of {conv_dim} columns"
             )
         ssm_itemsize = KVWeaveCodecConfig.mamba_dtype(ssm_layout.dtype_str).itemsize
+        if svd_ssm:
+            if not hasattr(self.native, "spectral_decode_chunk_paged") or tuple(ssm_layout.shape[1:]) != (128, 128):
+                raise ValueError("paged svd ssm decode needs the spectral paged kernel and 128 x 128 heads")
+            _svd_codec(
+                _SVD_LAST_OPTIONS[0] if _SVD_LAST_OPTIONS else SvdOptions.from_env()
+            ).decode_framed_paged(
+                ssm_payload[1:], layer_ptrs, block_ids, num_blocks, page_stride_bytes, ssm_layout.byte_offset,
+                KVWeaveCodecConfig.mamba_dtype(ssm_layout.dtype_str), int(ssm_layout.shape[0]), skip_blocks,
+            )
+            return
         decode(
             ssm_payload[1:],
             ssm_layout.byte_offset,
@@ -1992,6 +2072,14 @@ class _KVWeaveCodec:
             return torch.frombuffer(payload, dtype=torch.float16).reshape(
                 layers, blocks, *layout.shape
             ).to(dtype=KVWeaveCodecConfig.mamba_dtype(layout.dtype_str))
+        if flag == 3:   # spectral (svd) ssm: framed GSP1, self-describing
+            # decode needs only the weight tables: those of the codec encoding here, else from the environment
+            ssm = _svd_codec(_SVD_LAST_OPTIONS[0] if _SVD_LAST_OPTIONS else SvdOptions.from_env()).decode_framed(payload)
+            if tuple(ssm.shape) != (layers, blocks, *layout.shape):
+                raise RuntimeError(
+                    f"svd ssm payload decoded to {tuple(ssm.shape)}, expected {(layers, blocks, *layout.shape)}"
+                )
+            return ssm.to(device=device, dtype=KVWeaveCodecConfig.mamba_dtype(layout.dtype_str))
         return _KVWeaveCodec.dequantize_mamba_substate_4bit(payload, device=device, num_threads=num_threads)
 
     @staticmethod
@@ -2326,6 +2414,7 @@ class _KVWeaveCodec:
         scaling_methods: tuple[str, str] = ("per_channel", "per_channel"),
         qbits: tuple[int, int] = (4, 8),
         quant_enabled: tuple[bool, bool] = (True, True),
+        ssm_svd: SvdOptions | None = None,
     ) -> int:
         """Estimate the upper bound needed for one packed conv+ssm Mamba chunk.
 
@@ -2389,6 +2478,12 @@ class _KVWeaveCodec:
             )
 
         ssm_shape = (layers, blocks, *ssm_layout.shape)
+        if ssm_svd is not None and ssm_quant_enabled:
+            # spectral ssm: flag byte + framed GSP1 (kvweave.gdn.format.framed_upper_bound)
+            from kvweave.gdn.format import framed_upper_bound
+
+            heads, v_dim, k_dim = ssm_layout.shape
+            return total + 1 + framed_upper_bound(layers, blocks, heads, k_dim, v_dim, ssm_svd.budget_bits)
         total += 1 + _KVWeaveCodec._estimate_substate_quantized_size(
             "ssm", ssm_shape, ssm_layout.dtype_str, ssm_scaling, ssm_qbit,
             quant_enabled=ssm_quant_enabled,
@@ -2619,13 +2714,15 @@ class _KVWeaveCodec:
             is_two_plane = raw_chunk.dim() == 4 and int(raw_chunk.shape[0]) == 2
             conv_enabled = getattr(mamba_options, "conv_quant_enabled", True)
             ssm_enabled = getattr(mamba_options, "ssm_quant_enabled", True)
-            ssm_raw_fallback = ssm_enabled and mamba_options.ssm_qbit == 16
+            ssm_svd = ssm_enabled and mamba_options.ssm_codec == "svd"
+            ssm_raw_fallback = ssm_enabled and not ssm_svd and mamba_options.ssm_qbit == 16
             eligible_direct = self.mamba_encode_direct_paths(
                 mamba_layout, tokens_per_block, mamba_options, raw_chunk
             )
             conv_direct, ssm_direct = (
                 eligible_direct if mamba_split is None else (False, False)
             )
+            ssm_direct = ssm_direct and not ssm_svd   # the spectral codec always works on the split ssm tensor
             layers = int(raw_chunk.shape[1] if is_two_plane else raw_chunk.shape[0])
             blocks = int(raw_chunk.shape[-2]) // tokens_per_block
 
@@ -2661,7 +2758,7 @@ class _KVWeaveCodec:
                         rh=mamba_options.conv_rh, asym=mamba_options.asym,
                         qbit=mamba_options.conv_qbit,
                     ))
-            if ssm_enabled and not ssm_raw_fallback and not ssm_direct:
+            if ssm_enabled and not ssm_raw_fallback and not ssm_direct and not ssm_svd:
                 jobs.append(dict(
                     tensor=split.ssm, substate="ssm",
                     scaling_method=mamba_options.ssm_scaling_method,
@@ -2689,7 +2786,13 @@ class _KVWeaveCodec:
                 conv_payload = b"\x00" + self._tensor_bytes(split.conv)
 
             if ssm_enabled:
-                if ssm_raw_fallback:
+                if ssm_svd:
+                    if mamba_options.ssm_layer_ids is None:
+                        raise RuntimeError("ssm_codec='svd' needs MambaCodecOptions.ssm_layer_ids (set at register())")
+                    ssm_payload = b"\x03" + _svd_codec(mamba_options.ssm_svd).encode_framed(
+                        split.ssm.to(torch.float32), mamba_options.ssm_layer_ids
+                    )
+                elif ssm_raw_fallback:
                     ssm_payload = b"\x02" + self._tensor_bytes(
                         split.ssm.to(dtype=torch.float16)
                     )

@@ -24,6 +24,7 @@ from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
     KVWeaveCodecConfig,
     KVWeaveRuntimeConfig,
     MambaCodecOptions,
+    model_layer_types,
 )
 from lmcache.v1.distributed.serde.kvweave.kvweave_serde import (
     KVWeaveCodec,
@@ -1075,6 +1076,7 @@ def _decide_group_quantization(
                     mamba_options.conv_quant_enabled,
                     mamba_options.ssm_quant_enabled,
                 ),
+                ssm_svd=mamba_options.ssm_svd if mamba_options.ssm_codec == "svd" else None,
             )
         except ValueError:
             # The configured conv Q/K/V split does not match the registered
@@ -1244,6 +1246,16 @@ def _build_group_transfer_plans(
             kvweave_config,
             codec,
         )
+        if mamba_options is not None and mamba_options.ssm_codec == "svd":
+            # the spectral codec's weight tables are indexed by the layer's rank among the linear-attention layers
+            from kvweave.gdn.layers import linear_layer_ordinals
+
+            mamba_options = replace(
+                mamba_options,
+                ssm_layer_ids=tuple(
+                    linear_layer_ordinals(list(group_kv_caches), model_layer_types())
+                ),
+            )
         plans.append(
             GroupTransferPlan(
                 group_info=group_info,
@@ -2154,6 +2166,34 @@ class EngineDrivenTransferContext(TransferContext):
             )
         self._log_kvweave_routes(kv_caches, supported_transfer_mode)
 
+    def _describe_group_quantization(self, plan: GroupTransferPlan) -> str:
+        """One-line description of the quantization applied to a quantized group."""
+        codec = self._kvweave_codec
+        if group_kind(plan) is GroupKind.MAMBA and plan.mamba_options is not None:
+            o = plan.mamba_options
+            conv = (
+                f"q{o.conv_qbit} {o.conv_scaling_method} rh={int(o.conv_rh)} asym={int(o.asym)}"
+                if o.conv_quant_enabled
+                else "raw"
+            )
+            if not o.ssm_quant_enabled:
+                ssm = "raw"
+            elif o.ssm_codec == "svd" and o.ssm_svd is not None:
+                svd = o.ssm_svd
+                ssm = (
+                    f"svd (spectral mixed-precision) budget_bits={svd.budget_bits} "
+                    f"r_max={svd.r_max} weights={svd.weights}"
+                )
+            else:
+                ssm = f"q{o.ssm_qbit} {o.ssm_scaling_method} rh={int(o.ssm_rh)} asym={int(o.asym)}"
+            return f"conv=[{conv}] ssm=[{ssm}]"
+        if codec is not None:
+            return (
+                f"q{codec.qbit} {codec.scaling_method} rh={int(codec.rh)} "
+                f"asym={int(codec.asym)} precond={int(codec.precond)}"
+            )
+        return "unknown"
+
     def _log_kvweave_routes(
         self, kv_caches: dict[str, torch.Tensor], transfer_mode: str
     ) -> None:
@@ -2191,6 +2231,12 @@ class EngineDrivenTransferContext(TransferContext):
                 self._store_route(plan, store_ok).value,
                 self._retrieve_route(plan, retrieve_ok).value,
             )
+            if plan.quantized:
+                logger.info(
+                    "KVWeave group %d quantization: %s",
+                    group_idx,
+                    self._describe_group_quantization(plan),
+                )
             if (
                 self._quant_device is not QuantDevice.XPU
                 or not plan.quantized
