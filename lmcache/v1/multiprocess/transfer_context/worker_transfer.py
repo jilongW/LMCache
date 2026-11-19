@@ -2814,6 +2814,20 @@ class EngineDrivenTransferContext(TransferContext):
             lambda *args: self._kvweave_codec.supports_paged_mamba_decode(*args),  # type: ignore[union-attr]
         )
 
+    @staticmethod
+    def _paged_retrieve_allowed(
+        plan: GroupTransferPlan, group_mask: tuple[bool, ...] | None
+    ) -> bool:
+        """Whether a group's retrieve may be dequantized straight into paged KV.
+
+        Without a null-chunk mask always. With one (hybrid models: every group
+        carries a mask tuple, Mamba's drops all but the last chunk) only Mamba
+        groups: their live chunks are decoded at their true chunk positions,
+        while full-attention groups keep the dense decode + scatter, which is
+        faster than the in-place fused kernel on XPU.
+        """
+        return group_mask is None or group_kind(plan) is GroupKind.MAMBA
+
     def _paged_decode_source(
         self,
         plan: GroupTransferPlan,
@@ -2847,12 +2861,18 @@ class EngineDrivenTransferContext(TransferContext):
         scatter_block_ids: list[int],
         group_chunks: list[torch.Tensor],
         skip_first_n_tokens: int,
+        chunk_positions: list[int] | None = None,
     ) -> None:
         """Dequantize each retrieved chunk straight into its paged KV blocks.
 
         ``skip_first_n_tokens`` is a block-aligned prefix of the group's blocks
         that already holds valid KV; blocks inside it are left untouched. Each
         native call blocks until its kernel has written paged KV.
+
+        ``chunk_positions`` gives each retrieved chunk's index among the group's
+        chunks (null-masked chunks are not retrieved, so a live chunk's position
+        can exceed its index in ``group_chunks``); the skipped prefix is measured
+        against that position. Default: the chunks are consecutive from 0.
         """
         codec = self._kvweave_codec
         if codec is None:
@@ -2868,6 +2888,10 @@ class EngineDrivenTransferContext(TransferContext):
                 source.block_size,
                 skip_first_n_tokens // source.block_size,
             )
+        if chunk_positions is None:
+            chunk_positions = list(range(len(group_chunks)))
+        elif len(chunk_positions) != len(group_chunks):
+            raise ValueError("paged decode needs one position per retrieved chunk")
         skip_blocks_total = skip_first_n_tokens // source.block_size
         for index, chunk in enumerate(group_chunks):
             chunk_block_ids = scatter_block_ids[
@@ -2879,7 +2903,8 @@ class EngineDrivenTransferContext(TransferContext):
                     f"[0, {source.num_blocks})"
                 )
             skip_blocks = min(
-                max(skip_blocks_total - index * blocks_per_chunk, 0), blocks_per_chunk
+                max(skip_blocks_total - chunk_positions[index] * blocks_per_chunk, 0),
+                blocks_per_chunk,
             )
             if skip_blocks == blocks_per_chunk:
                 continue
@@ -3416,6 +3441,8 @@ class EngineDrivenTransferContext(TransferContext):
             # groups that are dequantized in place.
             group_routes: list[RetrieveRoute] = []
             paged_decode_sources: dict[int, PagedFusedSource | PagedMambaSource] = {}
+            # group_id -> each live chunk's index among the group's chunks.
+            paged_chunk_positions: dict[int, list[int]] = {}
             try:
                 # ``src_buffers`` is flat, group-major, minus any null
                 # chunks the server excluded -- those were never stored, so
@@ -3439,7 +3466,7 @@ class EngineDrivenTransferContext(TransferContext):
                     ]
                     paged_source = (
                         self._paged_decode_source(plan, group_kv_caches)
-                        if group_mask is None
+                        if self._paged_retrieve_allowed(plan, group_mask)
                         and isinstance(
                             self._engine_driven_context, EngineDrivenContextShm
                         )
@@ -3451,6 +3478,15 @@ class EngineDrivenTransferContext(TransferContext):
                         # Encoded chunks stay in SHM; they are dequantized
                         # straight into paged KV in the scatter phase below.
                         paged_decode_sources[group_id] = paged_source
+                        paged_chunk_positions[group_id] = [
+                            i
+                            for i in range(
+                                len(group_block_ids) // plan.blocks_per_chunk
+                            )
+                            if not (
+                                group_mask and i < len(group_mask) and group_mask[i]
+                            )
+                        ]
                         decoded_groups.append(
                             (plan, group_kv_caches, scatter_block_ids, group_chunks)
                         )
@@ -3534,6 +3570,7 @@ class EngineDrivenTransferContext(TransferContext):
                             scatter_block_ids,
                             group_chunks,
                             skip_first_n_tokens,
+                            paged_chunk_positions[group_id],
                         )
                         continue
                     scatter_cpu_to_paged_kv(

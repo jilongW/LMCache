@@ -257,3 +257,47 @@ def test_mamba_page_layout_must_fit_the_page(ctx, monkeypatch: pytest.MonkeyPatc
         worker_transfer, "prepare_paged_mamba_source", lambda *_a, **_k: small
     )
     assert ctx._paged_decode_source(_mamba_plan(), {"k": torch.zeros(1)}) is None  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("skip_blocks_total", "expected_skip"),
+    [
+        (0, 0),
+        (6, 0),  # prefix ends exactly where chunk 3 (blocks 6-7) starts
+        (7, 1),
+        (8, None),  # whole chunk 3 is inside the prefix: no native call
+    ],
+)
+def test_masked_mamba_chunk_skip_uses_its_true_position(
+    ctx, skip_blocks_total: int, expected_skip: int | None
+) -> None:
+    """Hybrid models retrieve only the last Mamba chunk (chunks 0-2 are null-masked): its skip is measured
+    from chunk position 3, not from its index 0 in the (live-only) chunk list."""
+    ctx._kvweave_codec = _MambaCodec()  # type: ignore[assignment]
+    chunk = torch.ones(8, dtype=torch.uint8)
+    ctx._decode_group_into_paged_kv(  # noqa: SLF001
+        _mamba_plan(), _mamba_source(), [7, 9], [chunk], skip_blocks_total * _BLOCK_SIZE, [3]
+    )
+    calls = ctx._kvweave_codec.calls  # type: ignore[union-attr]
+    if expected_skip is None:
+        assert calls == []
+    else:
+        assert [(c["block_ids"], c["skip_blocks"]) for c in calls] == [([7, 9], expected_skip)]
+
+
+def test_chunk_positions_must_match_the_chunks(ctx) -> None:
+    ctx._kvweave_codec = _MambaCodec()  # type: ignore[assignment]
+    with pytest.raises(ValueError, match="one position per"):
+        ctx._decode_group_into_paged_kv(  # noqa: SLF001
+            _mamba_plan(), _mamba_source(), [7, 9], [torch.ones(8, dtype=torch.uint8)], 0, [2, 3]
+        )
+    assert ctx._kvweave_codec.calls == []  # type: ignore[union-attr]
+
+
+def test_paged_retrieve_with_a_null_mask_is_mamba_only() -> None:
+    """A mask tuple is present for every group of a hybrid model; only Mamba groups may still decode in place."""
+    mask = (True, True, True, False)
+    allowed = EngineDrivenTransferContext._paged_retrieve_allowed  # noqa: SLF001
+    assert allowed(_mamba_plan(), None) and allowed(_plan(), None)
+    assert allowed(_mamba_plan(), mask)
+    assert not allowed(_plan(), (False,) * 4)  # full attention keeps the dense decode + scatter

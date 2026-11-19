@@ -152,7 +152,8 @@ def decide_retrieve_route(
         plan: The group's registration-time plan; ``plan.quantized`` is the
             fourth level (this group type's quantization switch is on).
         paged_ok: Whether the codec can dequantize this group straight into
-            paged KV (and nothing else rules it out, e.g. a null-chunk mask).
+            paged KV (and nothing else rules it out, e.g. a null-chunk mask on a
+            full-attention group).
             Only consulted on XPU when a Mamba or fused-K/V group's switch is on
             (other attention layouts have no in-place kernel).
 
