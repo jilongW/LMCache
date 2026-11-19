@@ -463,6 +463,9 @@ def _decide_group_quantization(
                     mamba_options.conv_quant_enabled,
                     mamba_options.ssm_quant_enabled,
                 ),
+                ssm_svd=mamba_options.ssm_svd
+                if mamba_options.ssm_codec == "svd"
+                else None,
             )
         except ValueError:
             # The configured conv Q/K/V split does not match the registered

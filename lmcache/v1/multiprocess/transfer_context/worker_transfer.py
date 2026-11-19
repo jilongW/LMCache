@@ -4,7 +4,7 @@
 # Standard
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import lcm
 from typing import Any, Callable, Protocol, cast
 import os
@@ -17,7 +17,10 @@ import torch
 from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
-from lmcache.v1.distributed.serde.kvweave.kvweave_config import KVWeaveRuntimeConfig
+from lmcache.v1.distributed.serde.kvweave.kvweave_config import (
+    KVWeaveRuntimeConfig,
+    model_layer_types,
+)
 from lmcache.v1.distributed.serde.kvweave.kvweave_serde import KVWeaveCodec
 from lmcache.v1.gpu_connector.utils import (
     LayoutHints,
@@ -1340,6 +1343,38 @@ class EngineDrivenTransferContext(TransferContext):
             state.paged_source = source
         return encode_ok, decode_ok
 
+    @staticmethod
+    def _describe_group_quantization(
+        plan: GroupTransferPlan, codec: KVWeaveCodec
+    ) -> str:
+        """One-line description of the quantization applied to a quantized group."""
+        if group_kind(plan) is GroupKind.MAMBA and plan.mamba_options is not None:
+            o = plan.mamba_options
+            conv = (
+                f"q{o.conv_qbit} {o.conv_scaling_method} rh={int(o.conv_rh)} "
+                f"asym={int(o.asym)}"
+                if o.conv_quant_enabled
+                else "raw"
+            )
+            if not o.ssm_quant_enabled:
+                ssm = "raw"
+            elif o.ssm_codec == "svd" and o.ssm_svd is not None:
+                svd = o.ssm_svd
+                ssm = (
+                    f"svd (spectral mixed-precision) budget_bits={svd.budget_bits} "
+                    f"r_max={svd.r_max} weights={svd.weights}"
+                )
+            else:
+                ssm = (
+                    f"q{o.ssm_qbit} {o.ssm_scaling_method} rh={int(o.ssm_rh)} "
+                    f"asym={int(o.asym)}"
+                )
+            return f"conv=[{conv}] ssm=[{ssm}]"
+        return (
+            f"q{codec.qbit} {codec.scaling_method} rh={int(codec.rh)} "
+            f"asym={int(codec.asym)} precond={int(codec.precond)}"
+        )
+
     def _plan_kvweave_groups(
         self,
         manager: KVLayerGroupsManager,
@@ -1396,6 +1431,25 @@ class EngineDrivenTransferContext(TransferContext):
                 codec=codec,
             )
             state = group_states[gid]
+            if (
+                plan.mamba_options is not None
+                and plan.mamba_options.ssm_codec == "svd"
+            ):
+                # The spectral codec's weight tables are indexed by the layer's
+                # rank among the linear-attention layers.
+                from kvweave.gdn.layers import linear_layer_ordinals
+
+                plan = replace(
+                    plan,
+                    mamba_options=replace(
+                        plan.mamba_options,
+                        ssm_layer_ids=tuple(
+                            linear_layer_ordinals(
+                                state.layer_names, model_layer_types()
+                            )
+                        ),
+                    ),
+                )
             state.plan = plan
             if plan.quantized:
                 assert plan.quant_layout_desc is not None
@@ -1404,6 +1458,12 @@ class EngineDrivenTransferContext(TransferContext):
                 )
             self._plan_paged_routes(state, kvweave_config.enabled, codec, kv_caches)
             info = infos[gid]
+            if plan.quantized:
+                logger.info(
+                    "KVWeave group %d quantization: %s",
+                    gid,
+                    self._describe_group_quantization(plan, codec),
+                )
             logger.info(
                 "KVWeave group %d: engine_group_id=%s category=%s format=%s "
                 "attention_layout=%s raw_shape=%s quantized=%s store_route=%s "
