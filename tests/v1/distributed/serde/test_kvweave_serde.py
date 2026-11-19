@@ -778,3 +778,60 @@ def test_estimate_mamba_serialized_size_compression_ratio_qwen35_9b():
         f"KVWeave mamba estimate ({estimate}) is not meaningfully smaller "
         f"than the true unquantized content ({true_content_size})"
     )
+
+
+def _qwen35_mamba_geometry():
+    layers, block_size = 8, 1024
+    layouts = (
+        MambaSubStateWireLayout(0, 0, str(torch.float16), (3, 8192)),
+        MambaSubStateWireLayout(0, 0, str(torch.float32), (32, 128, 128)),
+    )
+    raw_layout = MemoryLayoutDesc([torch.Size([layers, block_size, 1])], [torch.float16])
+    return raw_layout, layouts, block_size, ConvQKVSplit(key_dim=2048, value_dim=4096)
+
+
+def test_mamba_codec_options_select_svd_from_env(monkeypatch):
+    from lmcache.v1.distributed.serde.kvweave.kvweave_config import SvdOptions
+
+    for name in ("CODEC", "SVD_WEIGHTS", "SVD_WEIGHTS_PATH", "SVD_BUDGET_BITS", "SVD_R_MAX", "SVD_EPS_ABS", "SVD_MAX_SWEEPS"):
+        monkeypatch.delenv(f"LMCACHE_MP_KVWEAVE_SSM_{name}", raising=False)
+    options = MambaCodecOptions.from_env()
+    assert options.ssm_codec == "default" and options.ssm_svd is None and options.ssm_layer_ids is None
+
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_SSM_CODEC", "svd")
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_SSM_SVD_WEIGHTS", "none")
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_SSM_SVD_BUDGET_BITS", "2.3")
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_SSM_SVD_R_MAX", "64")
+    options = MambaCodecOptions.from_env()
+    assert options.ssm_codec == "svd"
+    assert options.ssm_svd == SvdOptions(budget_bits=2.3, r_max=64, weights="none")
+
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_SSM_SVD_WEIGHTS", "diag")   # empty path = the table bundled with kvweave
+    assert MambaCodecOptions.from_env().ssm_svd.weights_path == ""
+    monkeypatch.setenv("LMCACHE_MP_KVWEAVE_SSM_CODEC", "bogus")
+    with pytest.raises(ValueError, match="SSM_CODEC"):
+        MambaCodecOptions.from_env()
+
+
+def test_estimate_mamba_serialized_size_svd_follows_the_budget():
+    """The spectral ssm payload never exceeds its bit budget, so the estimate scales with the budget and (at the default
+    3.15 bit) stays below the q4 estimate; the q4 estimate is unchanged by the new parameter."""
+    pytest.importorskip("kvweave.gdn")   # the estimate uses kvweave.gdn.format.framed_upper_bound
+    from lmcache.v1.distributed.serde.kvweave.kvweave_config import SvdOptions
+
+    raw_layout, layouts, block_size, split = _qwen35_mamba_geometry()
+    common = dict(conv_qkv_split=split, scaling_methods=("per_token", "per_token"), qbits=(4, 4))
+    q4 = _KVWeaveCodec.estimate_mamba_serialized_size(raw_layout, layouts, block_size, **common)
+    assert q4 == _KVWeaveCodec.estimate_mamba_serialized_size(raw_layout, layouts, block_size, ssm_svd=None, **common)
+    low = _KVWeaveCodec.estimate_mamba_serialized_size(
+        raw_layout, layouts, block_size, ssm_svd=SvdOptions(budget_bits=2.3, weights="none"), **common)
+    mid = _KVWeaveCodec.estimate_mamba_serialized_size(
+        raw_layout, layouts, block_size, ssm_svd=SvdOptions(budget_bits=3.15, weights="none"), **common)
+    assert low < mid < q4
+    ssm_elements = 8 * 32 * 128 * 128
+    assert mid >= ssm_elements * 3.15 / 8                      # covers the budget itself
+    # ssm_quant_enabled=False sizes the raw branch, whatever the codec
+    off = _KVWeaveCodec.estimate_mamba_serialized_size(
+        raw_layout, layouts, block_size, quant_enabled=(True, False),
+        ssm_svd=SvdOptions(budget_bits=3.15, weights="none"), **common)
+    assert off > q4
