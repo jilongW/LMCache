@@ -41,7 +41,7 @@ import lmcache.lmcache_native as lmcache_native
 
 if TYPE_CHECKING:
     # First Party
-    pass
+    from lmcache.v1.common.group_view import PartContentDesc
 
 logger = init_logger(__name__)
 
@@ -83,6 +83,9 @@ class EngineDrivenContextMetadata:
             ``group_layouts`` (``-1`` = full attention). A retrieve serves
             only each group's in-window suffix. ``None`` means every group is
             full attention.
+        group_contents: Per-group content descriptors parallel to
+            ``group_layouts``; an entry is ``None`` when the worker sent none.
+            ``None`` means single-group.
     """
 
     layout_desc: MemoryLayoutDesc
@@ -90,6 +93,7 @@ class EngineDrivenContextMetadata:
     use_mla: bool
     group_layouts: "list[MemoryLayoutDesc] | None" = None
     group_windows: "list[int] | None" = None
+    group_contents: "list[PartContentDesc | None] | None" = None
 
 
 class ContextClosedError(RuntimeError):

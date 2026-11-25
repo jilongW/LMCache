@@ -456,6 +456,11 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             use_mla=payload.use_mla,
             group_layouts=group_layouts,
             group_windows=group_windows,
+            group_contents=(
+                [gl.content for gl in payload.group_layouts]
+                if payload.group_layouts
+                else None
+            ),
         )
         # Build the entry and strategy outside the lock, then insert the pair
         # atomically so a concurrent reap can never strand one without the

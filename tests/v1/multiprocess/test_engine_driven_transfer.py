@@ -30,9 +30,16 @@ from lmcache.v1.client.transfer_context.tensor_wire import (
 )
 from lmcache.v1.common.custom_types import (
     EngineType,
+    GroupLayout,
     PrepareRetrieveResponse,
     PrepareStoreResponse,
+    RegisterEngineDrivenContextPayload,
     RegisterEngineDrivenContextResponse,
+)
+from lmcache.v1.common.group_view import (
+    CacheCategory,
+    PartContentDesc,
+    StateComponentDesc,
 )
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.mp_observability.event import Event, EventType
@@ -47,10 +54,7 @@ import lmcache.lmcache_native as lmcache_native
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.v1.common.custom_types import (
-        IPCCacheServerKey,
-        RegisterEngineDrivenContextPayload,
-    )
+    from lmcache.v1.common.custom_types import IPCCacheServerKey
     from lmcache.v1.common.utils import LayoutHints
     from lmcache.v1.distributed.config import StorageManagerConfig
     from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
@@ -1896,6 +1900,47 @@ def test_register_multigroup_registers_group_windows_and_kinds(
     assert attn_desc.num_chunks_in_sw == [-1, 2, 1]
     assert attn_desc.group_kinds == ("attention", "attention", "recurrent")
     assert response.null_block_id == 7
+
+
+def test_register_keeps_each_group_content(
+    stub_lmcache_native: Any,
+    server_module_factory: ServerModuleFactory,
+) -> None:
+    """The registration context keeps each group's content descriptor beside
+    its layout; a group from a worker that sent none keeps ``None``."""
+    content = PartContentDesc(
+        CacheCategory.RECURRENT, (StateComponentDesc(0, 16, "float32", (4,)),), 64
+    )
+
+    def _group(group_content: PartContentDesc | None) -> GroupLayout:
+        return GroupLayout(
+            num_layers=1,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            tokens_per_block=4,
+            num_physical_slots=16,
+            content=group_content,
+        )
+
+    module, _, _, _ = server_module_factory(chunk_size=16)
+    module.register_kv_cache_engine_driven_context(
+        RegisterEngineDrivenContextPayload(
+            instance_id=1,
+            model_name="m",
+            world_size=1,
+            block_size=4,
+            num_layers=2,
+            hidden_dim_size=16,
+            dtype_str="float32",
+            use_mla=False,
+            chunk_size=16,
+            num_physical_slots=16,
+            group_layouts=[_group(content), _group(None)],
+        )
+    )
+
+    metadata = module._engine_driven_contexts[1].metadata
+    assert metadata.group_contents == [content, None]
 
 
 @pytest.mark.parametrize(
