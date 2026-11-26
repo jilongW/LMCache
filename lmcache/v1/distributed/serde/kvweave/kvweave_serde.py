@@ -191,9 +191,10 @@ class _KVWeaveCodec:
 
         XPU, per_token or per_channel scaling, per-K/V-plane heads, an
         RH-compatible transform length, and a native kernel whose SLM path fits one
-        quantization chunk. A chunk is one head row (per_token) or one channel
-        column over the chunk's ``tokens`` (per_channel), so per_channel also needs
-        the chunk's token count.
+        quantization chunk. A chunk is one head row (per_token, or per_channel with
+        RH, which rotates along the channel axis) or one channel column over the
+        chunk's ``tokens`` (per_channel without RH), so the latter also needs the
+        chunk's token count.
         """
         if self.device != "xpu" or self.scaling_method not in {"per_token", "per_channel"}:
             return False
@@ -201,7 +202,7 @@ class _KVWeaveCodec:
         head_dim = self._fused_head_dim(hidden)
         if head_num <= 1:
             return False
-        if self.scaling_method == "per_channel":
+        if self.scaling_method == "per_channel" and not self.rh:
             if tokens is None or tokens <= 0:
                 return False
             transform_len = tokens
@@ -1262,14 +1263,12 @@ class _KVWeaveCodec:
         method: str,
         per_head_scales: bool = False,
     ) -> int:
-        if per_head_scales:
-            return head_dim if method == "per_token" else tokens
+        # The Hadamard runs along the channel axis: one head_dim row for per_channel (its scales then run over the
+        # rotated rows) and for per-head per_token, one full row for per_token without per-head scales.
+        if method == "per_channel" or (per_head_scales and method == "per_token"):
+            return head_dim
         if method == "per_token":
             return hidden
-        if method == "per_channel":
-            if hidden % head_dim:
-                raise ValueError("fused hidden size must divide by head_dim")
-            return tokens * (hidden // head_dim)
         return tokens * hidden
 
     def _normalize(self, tensor: torch.Tensor) -> _KVShape:
@@ -1610,7 +1609,7 @@ class _KVWeaveCodec:
         signs = perm = None
         if rh:
             signs, perm = _KVWeaveCodec._mamba_precond_pair(
-                max(int(np.prod(shape)) // shape[0] // chunks, 1)
+                chunks if scaling_method == "per_channel" else max(int(np.prod(shape)) // shape[0] // chunks, 1)
             )
         return blocks_num, heads, head_dim, signs, perm
 

@@ -549,8 +549,8 @@ class KVWeaveCodecConfig:
     precond_seed: int = 42
     precond_path: Optional[str] = None
     MAGIC_RAW: ClassVar[bytes] = b"KVW0"
-    MAGIC_QUANT: ClassVar[bytes] = b"KVW3"
-    MAGIC_QUANT_FUSED: ClassVar[bytes] = b"KVW4"
+    MAGIC_QUANT: ClassVar[bytes] = b"KVW5"
+    MAGIC_QUANT_FUSED: ClassVar[bytes] = b"KVW6"
     MAMBA_MAGIC: ClassVar[bytes] = b"MQ01"
     MAMBA_QBIT: ClassVar[int] = 4
     MAMBA_FLAG_RH: ClassVar[int] = 1

@@ -63,7 +63,7 @@ def test_quantized_four_dimensional_round_trip():
 
     codec.deserialize_tensor(torch.tensor(list(payload), dtype=torch.uint8), restored)
 
-    assert payload[:4] == b"KVW3"
+    assert payload[:4] == b"KVW5"
     assert restored.shape == source.shape
     assert torch.max(torch.abs(source.float() - restored.float())) < 0.5
 
@@ -115,7 +115,7 @@ def test_qwen35_fused_attention_estimate_covers_payload():
 
     payload = codec.serialize_fused_tensor(source)
 
-    assert payload[:4] == b"KVW4"
+    assert payload[:4] == b"KVW6"
     assert codec.estimate_fused_serialized_size(layout) >= len(payload)
 
 
@@ -237,7 +237,7 @@ def test_xpu_quantized_four_dimensional_round_trip():
 
     codec.deserialize_tensor(torch.tensor(list(payload), dtype=torch.uint8), restored)
 
-    assert payload[:4] == b"KVW3"
+    assert payload[:4] == b"KVW5"
     assert restored.shape == source.shape
     assert torch.max(torch.abs(source.float() - restored.float())) < 0.5
     assert codec.estimate_serialized_size(layout) >= len(payload)
@@ -266,7 +266,7 @@ def test_xpu_qwen35_fused_attention_estimate_covers_payload():
     restored = torch.empty_like(source)
     codec.deserialize_fused_tensor(torch.tensor(list(payload), dtype=torch.uint8), restored)
 
-    assert payload[:4] == b"KVW4"
+    assert payload[:4] == b"KVW6"
     assert codec.estimate_fused_serialized_size(layout) >= len(payload)
     assert torch.max(torch.abs(source.float() - restored.float())) < 0.5
 

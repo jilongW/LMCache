@@ -229,7 +229,7 @@ def _mamba_rh_transform_length(
         numel_per_layer *= int(dim)
     shape = (layers, blocks, *sub_layout.shape)
     _, _, _, chunks = KVWeaveCodecConfig.mamba_layout(substate, shape, scaling_method)
-    return max(numel_per_layer // chunks, 1)
+    return chunks if scaling_method == "per_channel" else max(numel_per_layer // chunks, 1)
 
 
 def _resolve_mamba_options_for_group(
